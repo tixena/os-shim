@@ -1,0 +1,22 @@
+[package]
+name = "os-shim"
+version = "0.1.0"
+edition = "2024"
+authors = ["Eduardo Burgos <eduardo@tixena.com>"]
+description = "Mockable abstraction layer over OS and git operations for testable Rust code"
+license = "MIT"
+repository = "https://github.com/tixena/os-shim"
+keywords = ["testing", "mock", "filesystem", "abstraction"]
+categories = ["development-tools::testing", "filesystem"]
+readme = "README.md"
+
+[dependencies]
+# Real filesystem implementation
+tempfile = "3"
+ignore = "0.4"
+
+# Mock implementation logging
+tracing = "0.1"
+
+[features]
+default = []
