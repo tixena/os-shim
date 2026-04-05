@@ -1,7 +1,8 @@
 {
   "database": "dolt",
   "backend": "dolt",
-  "dolt_mode": "embedded",
-  "dolt_database": "shim",
+  "dolt_mode": "server",
+  "dolt_server_host": "euclid",
+  "dolt_database": "beads-os-shim",
   "project_id": "68808c8a-e61b-48ca-b427-4511b8f38d5d"
 }
