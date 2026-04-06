@@ -32,9 +32,9 @@ pub mod mock;
 pub mod real;
 
 use std::env::VarError;
-use std::fs::Metadata;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// Entry from directory walking.
 #[derive(Debug, Clone)]
@@ -46,6 +46,23 @@ pub struct WalkEntry {
     pub is_file: bool,
     /// The path of the entry.
     pub path: PathBuf,
+}
+
+/// File metadata -- os-shim's own type, fully constructable by `MockSystem`.
+///
+/// Replaces `std::fs::Metadata` which is opaque and cannot be
+/// meaningfully constructed in mock implementations.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct FileMetadata {
+    /// Whether the path is a directory.
+    pub is_dir: bool,
+    /// Whether the path is a regular file.
+    pub is_file: bool,
+    /// File size in bytes (0 for directories).
+    pub len: u64,
+    /// Last modification time.
+    pub modified: SystemTime,
 }
 
 /// Temporary directory handle that cleans up on drop.
@@ -127,6 +144,14 @@ pub trait System: Send + Sync {
     /// - The current working directory cannot be retrieved.
     fn current_dir(&self) -> io::Result<PathBuf>;
 
+    /// Get the path to the current executable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The executable path cannot be determined.
+    fn current_exe(&self) -> io::Result<PathBuf>;
+
     /// Get an environment variable.
     ///
     /// # Errors
@@ -159,13 +184,17 @@ pub trait System: Send + Sync {
     /// - The path cannot be checked.
     fn is_file(&self, path: &Path) -> io::Result<bool>;
 
+    /// Check if a process with the given PID is alive.
+    #[cfg(feature = "process")]
+    fn is_pid_alive(&self, pid: u32) -> bool;
+
     /// Get metadata for a path.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The path cannot be read.
-    fn metadata(&self, path: &Path) -> io::Result<Metadata>;
+    fn metadata(&self, path: &Path) -> io::Result<FileMetadata>;
 
     /// Open a file for reading (returns a readable stream).
     ///
@@ -174,6 +203,14 @@ pub trait System: Send + Sync {
     /// Returns an error if:
     /// - The file cannot be opened.
     fn open(&self, path: &Path) -> io::Result<Box<dyn Read + '_>>;
+
+    /// Open a file for appending (create if it does not exist).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The file cannot be opened for appending.
+    fn open_append(&self, path: &Path) -> io::Result<Box<dyn Write + '_>>;
 
     /// Read directory entries, returning paths of all entries.
     ///
@@ -206,6 +243,18 @@ pub trait System: Send + Sync {
     /// Returns an error if:
     /// - The file cannot be removed.
     fn remove_file(&self, path: &Path) -> io::Result<()>;
+
+    /// Rename or move a file or directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The source path does not exist.
+    /// - The rename operation fails.
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
+
+    /// Set an environment variable.
+    fn set_env_var(&self, key: &str, value: &str);
 
     /// Recursively walk a directory, returning all entries.
     ///

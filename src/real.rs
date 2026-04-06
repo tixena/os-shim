@@ -1,10 +1,10 @@
 //! Real system implementation using `std::env` and `std::fs`.
 
-use crate::{System, TempDirHandle, WalkEntry};
+use crate::{FileMetadata, System, TempDirHandle, WalkEntry};
 use ignore::WalkBuilder;
 use std::env;
 use std::env::VarError;
-use std::fs::{self, Metadata};
+use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
@@ -68,6 +68,11 @@ impl System for RealSystem {
     }
 
     #[inline]
+    fn current_exe(&self) -> io::Result<PathBuf> {
+        env::current_exe()
+    }
+
+    #[inline]
     fn env_var(&self, key: &str) -> Result<String, VarError> {
         env::var(key)
     }
@@ -87,14 +92,37 @@ impl System for RealSystem {
         Ok(path.is_file())
     }
 
+    #[cfg(feature = "process")]
     #[inline]
-    fn metadata(&self, path: &Path) -> io::Result<Metadata> {
-        fs::metadata(path)
+    fn is_pid_alive(&self, pid: u32) -> bool {
+        // SAFETY: Sending signal 0 to a process does not affect the process;
+        // it only checks whether the process exists.
+        unsafe { libc::kill(pid.cast_signed(), 0) == 0 }
+    }
+
+    #[inline]
+    fn metadata(&self, path: &Path) -> io::Result<FileMetadata> {
+        let meta = fs::metadata(path)?;
+        Ok(FileMetadata {
+            is_dir: meta.is_dir(),
+            is_file: meta.is_file(),
+            len: meta.len(),
+            modified: meta.modified()?,
+        })
     }
 
     #[inline]
     fn open(&self, path: &Path) -> io::Result<Box<dyn Read + '_>> {
         let file = fs::File::open(path)?;
+        Ok(Box::new(file))
+    }
+
+    #[inline]
+    fn open_append(&self, path: &Path) -> io::Result<Box<dyn Write + '_>> {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
         Ok(Box::new(file))
     }
 
@@ -118,6 +146,20 @@ impl System for RealSystem {
     #[inline]
     fn remove_file(&self, path: &Path) -> io::Result<()> {
         fs::remove_file(path)
+    }
+
+    #[inline]
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        fs::rename(from, to)
+    }
+
+    #[inline]
+    fn set_env_var(&self, key: &str, value: &str) {
+        // SAFETY: This is safe when called from a single-threaded context or when
+        // the caller ensures no other threads are reading environment variables.
+        unsafe {
+            env::set_var(key, value);
+        }
     }
 
     #[inline]

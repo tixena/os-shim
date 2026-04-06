@@ -15,14 +15,14 @@
 
 use tracing::error;
 
-use crate::{System, TempDirHandle, WalkEntry};
+use crate::{FileMetadata, System, TempDirHandle, WalkEntry};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env::VarError;
-use std::fs::{self, Metadata};
 use std::io::{self, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::SystemTime;
 
 /// Global counter for generating unique temp directory IDs.
 static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -55,12 +55,19 @@ pub struct MockSystem {
 struct MockSystemState {
     /// Current working directory path.
     current_dir: PathBuf,
+    /// Path returned by `current_exe()`.
+    current_exe: PathBuf,
     /// Set of directories that exist in the mock filesystem.
     dirs: BTreeSet<PathBuf>,
     /// Map of environment variable names to values.
     env_vars: BTreeMap<String, String>,
     /// Map of file paths to their byte contents.
     files: BTreeMap<PathBuf, Vec<u8>>,
+    /// Per-file last-modification timestamps.
+    modified: BTreeMap<PathBuf, SystemTime>,
+    /// Set of PIDs considered alive (for `is_pid_alive` mock).
+    #[cfg(feature = "process")]
+    pids_alive: BTreeSet<u32>,
 }
 
 impl MockSystem {
@@ -93,9 +100,13 @@ impl MockSystem {
         Self {
             state: Arc::new(RwLock::new(MockSystemState {
                 current_dir: PathBuf::from("/"),
+                current_exe: PathBuf::from("/mock/exe"),
                 dirs: BTreeSet::from([PathBuf::from("/")]),
                 env_vars: BTreeMap::new(),
                 files: BTreeMap::new(),
+                modified: BTreeMap::new(),
+                #[cfg(feature = "process")]
+                pids_alive: BTreeSet::new(),
             })),
         }
     }
@@ -113,6 +124,23 @@ impl MockSystem {
             .write()
             .map_err(|err| io::Error::other(err.to_string()))?;
         state.current_dir = dir.as_ref().to_path_buf();
+        drop(state);
+        Ok(self)
+    }
+
+    /// Set the path returned by `current_exe()` (builder pattern).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The internal lock cannot be acquired
+    #[inline]
+    pub fn with_current_exe<P: AsRef<Path>>(self, path: P) -> io::Result<Self> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        state.current_exe = path.as_ref().to_path_buf();
         drop(state);
         Ok(self)
     }
@@ -172,7 +200,26 @@ impl MockSystem {
             Self::ensure_parent_dirs(&mut state.dirs, parent);
         }
 
+        state.modified.insert(path_buf.clone(), SystemTime::now());
         state.files.insert(path_buf, contents.to_vec());
+        drop(state);
+        Ok(self)
+    }
+
+    /// Add a PID to the set of alive processes (builder pattern).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The internal lock cannot be acquired
+    #[cfg(feature = "process")]
+    #[inline]
+    pub fn with_pid(self, pid: u32) -> io::Result<Self> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        state.pids_alive.insert(pid);
         drop(state);
         Ok(self)
     }
@@ -271,6 +318,15 @@ impl System for MockSystem {
     }
 
     #[inline]
+    fn current_exe(&self) -> io::Result<PathBuf> {
+        let state = self
+            .state
+            .read()
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        Ok(state.current_exe.clone())
+    }
+
+    #[inline]
     #[expect(clippy::map_err_ignore, reason = "This is for VarError")]
     fn env_var(&self, key: &str) -> Result<String, VarError> {
         let state = self.state.read().map_err(|_| VarError::NotPresent)?;
@@ -304,22 +360,55 @@ impl System for MockSystem {
         Ok(state.files.contains_key(path))
     }
 
+    #[cfg(feature = "process")]
     #[inline]
-    fn metadata(&self, path: &Path) -> io::Result<Metadata> {
-        // For mock, we need to use a real file's metadata as a template
-        // This is a limitation - we'll use a temporary file
-        if self.exists(path)? {
-            // Create a real temporary file to get its metadata
-            let temp_dir = tempfile::TempDir::new().map_err(io::Error::other)?;
-            let temp_file = temp_dir.path().join("temp");
-            fs::write(&temp_file, b"")?;
-            fs::metadata(&temp_file)
-        } else {
-            Err(io::Error::new(
+    fn is_pid_alive(&self, pid: u32) -> bool {
+        #[expect(
+            clippy::expect_used,
+            reason = "Lock poisoning in mock is unrecoverable"
+        )]
+        let state = self
+            .state
+            .read()
+            .expect("MockSystem lock poisoned in is_pid_alive");
+        state.pids_alive.contains(&pid)
+    }
+
+    #[inline]
+    #[expect(
+        clippy::as_conversions,
+        reason = "usize to u64 conversion for file length"
+    )]
+    fn metadata(&self, path: &Path) -> io::Result<FileMetadata> {
+        let state = self
+            .state
+            .read()
+            .map_err(|err| io::Error::other(err.to_string()))?;
+
+        let is_dir = state.dirs.contains(path);
+        let is_file = state.files.contains_key(path);
+
+        if !is_dir && !is_file {
+            return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("Path not found: {}", path.display()),
-            ))
+            ));
         }
+
+        let len = state.files.get(path).map_or(0, |bytes| bytes.len() as u64);
+        let modified = state
+            .modified
+            .get(path)
+            .copied()
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        drop(state);
+
+        Ok(FileMetadata {
+            is_dir,
+            is_file,
+            len,
+            modified,
+        })
     }
 
     #[inline]
@@ -337,6 +426,15 @@ impl System for MockSystem {
         let result = bytes.clone();
         drop(state);
         Ok(Box::new(Cursor::new(result)))
+    }
+
+    #[inline]
+    fn open_append(&self, path: &Path) -> io::Result<Box<dyn Write + '_>> {
+        Ok(Box::new(MockAppendWriter {
+            buffer: Vec::new(),
+            path: path.to_path_buf(),
+            system: self.clone(),
+        }))
     }
 
     #[inline]
@@ -407,9 +505,12 @@ impl System for MockSystem {
         // Remove the directory
         state.dirs.remove(path);
 
-        // Remove all files and subdirectories under this path
+        // Remove all files, subdirectories, and timestamps under this path
         state
             .files
+            .retain(|file_path, _| !file_path.starts_with(path));
+        state
+            .modified
             .retain(|file_path, _| !file_path.starts_with(path));
         state
             .dirs
@@ -433,8 +534,95 @@ impl System for MockSystem {
         }
 
         state.files.remove(path);
+        state.modified.remove(path);
         drop(state);
         Ok(())
+    }
+
+    #[inline]
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|err| io::Error::other(err.to_string()))?;
+
+        // Handle file rename
+        if let Some(contents) = state.files.remove(from) {
+            // Ensure parent directories for destination exist
+            if let Some(parent) = to.parent()
+                && !state.dirs.contains(parent)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("Parent directory does not exist: {}", parent.display()),
+                ));
+            }
+            state.files.insert(to.to_path_buf(), contents);
+            state.modified.remove(from);
+            state.modified.insert(to.to_path_buf(), SystemTime::now());
+            return Ok(());
+        }
+
+        // Handle directory rename
+        if state.dirs.remove(from) {
+            state.dirs.insert(to.to_path_buf());
+
+            // Move all files and subdirectories under the old path
+            let files_to_move: Vec<(PathBuf, Vec<u8>)> = state
+                .files
+                .iter()
+                .filter(|&(path, _)| path.starts_with(from))
+                .map(|(path, contents)| (path.clone(), contents.clone()))
+                .collect();
+
+            for (old_path, contents) in files_to_move {
+                state.files.remove(&old_path);
+                state.modified.remove(&old_path);
+                let relative = old_path
+                    .strip_prefix(from)
+                    .map_err(|err| io::Error::other(err.to_string()))?;
+                let new_path = to.join(relative);
+                state.modified.insert(new_path.clone(), SystemTime::now());
+                state.files.insert(new_path, contents);
+            }
+
+            let dirs_to_move: Vec<PathBuf> = state
+                .dirs
+                .iter()
+                .filter(|path| path.starts_with(from))
+                .cloned()
+                .collect();
+
+            for old_dir in dirs_to_move {
+                state.dirs.remove(&old_dir);
+                let relative = old_dir
+                    .strip_prefix(from)
+                    .map_err(|err| io::Error::other(err.to_string()))?;
+                state.dirs.insert(to.join(relative));
+            }
+
+            drop(state);
+            return Ok(());
+        }
+
+        drop(state);
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Path not found: {}", from.display()),
+        ))
+    }
+
+    #[inline]
+    fn set_env_var(&self, key: &str, value: &str) {
+        #[expect(
+            clippy::expect_used,
+            reason = "Lock poisoning in mock is unrecoverable"
+        )]
+        let mut state = self
+            .state
+            .write()
+            .expect("MockSystem lock poisoned in set_env_var");
+        state.env_vars.insert(key.to_owned(), value.to_owned());
     }
 
     #[inline]
@@ -520,6 +708,7 @@ impl System for MockSystem {
             ));
         }
 
+        state.modified.insert(path.to_path_buf(), SystemTime::now());
         state.files.insert(path.to_path_buf(), contents.to_vec());
         drop(state);
         Ok(())
@@ -564,6 +753,67 @@ impl Drop for MockWriter {
     }
 }
 
+/// Append writer for `MockSystem` that extends existing file contents on flush.
+struct MockAppendWriter {
+    /// Accumulated bytes waiting to be appended.
+    buffer: Vec<u8>,
+    /// Target file path in the mock filesystem.
+    path: PathBuf,
+    /// Reference to the parent mock system for writing.
+    system: MockSystem,
+}
+
+#[expect(
+    clippy::missing_trait_methods,
+    reason = "Only implementing what I need"
+)]
+impl Write for MockAppendWriter {
+    #[inline]
+    fn flush(&mut self) -> io::Result<()> {
+        let mut state = self
+            .system
+            .state
+            .write()
+            .map_err(|err| io::Error::other(err.to_string()))?;
+
+        // Ensure parent directory exists
+        if let Some(parent) = self.path.parent()
+            && !state.dirs.contains(parent)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Parent directory does not exist: {}", parent.display()),
+            ));
+        }
+
+        let entry = state
+            .files
+            .entry(self.path.clone())
+            .or_insert_with(Vec::new);
+        entry.extend_from_slice(&self.buffer);
+        self.buffer.clear();
+        state.modified.insert(self.path.clone(), SystemTime::now());
+        drop(state);
+        Ok(())
+    }
+
+    #[inline]
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.buffer.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+}
+
+impl Drop for MockAppendWriter {
+    #[inline]
+    fn drop(&mut self) {
+        match self.flush() {
+            Ok(()) => (),
+            Err(err) => error!("Failed to flush mock append writer: {err}"),
+        }
+    }
+}
+
 /// Mock temporary directory handle that cleans up on drop.
 #[non_exhaustive]
 pub struct MockTempDir {
@@ -588,5 +838,159 @@ impl Drop for MockTempDir {
             Ok(()) => (),
             Err(err) => error!("Failed to remove temporary directory: {err}"),
         }
+    }
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "Tests use unwrap for brevity; panics indicate test failure"
+)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn metadata_returns_correct_len_for_file() {
+        let system = MockSystem::new()
+            .with_file("/test/file.txt", b"hello")
+            .unwrap();
+
+        let meta = system.metadata(Path::new("/test/file.txt")).unwrap();
+        assert!(meta.is_file);
+        assert!(!meta.is_dir);
+        assert_eq!(meta.len, 5);
+    }
+
+    #[test]
+    fn metadata_returns_dir_info() {
+        let system = MockSystem::new().with_dir("/mydir").unwrap();
+
+        let meta = system.metadata(Path::new("/mydir")).unwrap();
+        assert!(meta.is_dir);
+        assert!(!meta.is_file);
+        assert_eq!(meta.len, 0);
+    }
+
+    #[test]
+    fn metadata_not_found() {
+        let system = MockSystem::new();
+        let result = system.metadata(Path::new("/missing"));
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn metadata_modified_updates_on_write() {
+        let system = MockSystem::new().with_dir("/test").unwrap();
+
+        system.write(Path::new("/test/file.txt"), b"first").unwrap();
+        let mtime1 = system
+            .metadata(Path::new("/test/file.txt"))
+            .unwrap()
+            .modified;
+
+        // Write again to update the modification time
+        system
+            .write(Path::new("/test/file.txt"), b"second")
+            .unwrap();
+        let mtime2 = system
+            .metadata(Path::new("/test/file.txt"))
+            .unwrap()
+            .modified;
+
+        assert!(mtime2 >= mtime1);
+    }
+
+    #[test]
+    fn rename_file_moves_content() {
+        let system = MockSystem::new()
+            .with_file("/test/a.txt", b"content")
+            .unwrap();
+
+        system
+            .rename(Path::new("/test/a.txt"), Path::new("/test/b.txt"))
+            .unwrap();
+
+        assert!(!system.exists(Path::new("/test/a.txt")).unwrap());
+        assert!(system.exists(Path::new("/test/b.txt")).unwrap());
+        assert_eq!(
+            system.read_to_string(Path::new("/test/b.txt")).unwrap(),
+            "content"
+        );
+    }
+
+    #[test]
+    fn rename_nonexistent_returns_error() {
+        let system = MockSystem::new();
+        let result = system.rename(Path::new("/missing"), Path::new("/other"));
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn open_append_creates_new_file() {
+        let system = MockSystem::new().with_dir("/test").unwrap();
+
+        let mut writer = system.open_append(Path::new("/test/new.txt")).unwrap();
+        writer.write_all(b"hello").unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        assert_eq!(
+            system.read_to_string(Path::new("/test/new.txt")).unwrap(),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn open_append_extends_existing() {
+        let system = MockSystem::new()
+            .with_file("/test/file.txt", b"hello")
+            .unwrap();
+
+        let mut writer = system.open_append(Path::new("/test/file.txt")).unwrap();
+        writer.write_all(b" world").unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        assert_eq!(
+            system.read_to_string(Path::new("/test/file.txt")).unwrap(),
+            "hello world"
+        );
+    }
+
+    #[test]
+    fn current_exe_returns_configured_path() {
+        let system = MockSystem::new()
+            .with_current_exe("/usr/bin/vigil")
+            .unwrap();
+
+        assert_eq!(
+            system.current_exe().unwrap(),
+            PathBuf::from("/usr/bin/vigil")
+        );
+    }
+
+    #[test]
+    fn current_exe_returns_default() {
+        let system = MockSystem::new();
+        assert_eq!(system.current_exe().unwrap(), PathBuf::from("/mock/exe"));
+    }
+
+    #[test]
+    fn set_env_var_updates_env() {
+        let system = MockSystem::new();
+        system.set_env_var("MY_KEY", "my_value");
+        assert_eq!(system.env_var("MY_KEY").unwrap(), "my_value");
+    }
+
+    #[cfg(feature = "process")]
+    #[test]
+    fn is_pid_alive_checks_mock_pids() {
+        let system = MockSystem::new().with_pid(1234).unwrap();
+
+        assert!(system.is_pid_alive(1234));
+        assert!(!system.is_pid_alive(9999));
     }
 }

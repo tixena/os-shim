@@ -18,8 +18,12 @@ ignore = "0.4"
 # Mock implementation logging
 tracing = "0.1"
 
+# Process operations (optional)
+libc = { version = "0.2", optional = true }
+
 [features]
 default = []
+process = ["libc"]
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }
