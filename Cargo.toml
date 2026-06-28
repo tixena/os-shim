@@ -32,6 +32,8 @@ restriction = { level = "deny", priority = -1 }
 nursery = { level = "deny", priority = -1 }
 blanket_clippy_restriction_lints = "allow"
 implicit_return = "allow"
+# Default trait methods (Drop::pin_drop) cannot be implemented on the beta channel.
+missing_trait_methods = "allow"
 pub_with_shorthand = "allow"
 module_name_repetitions = "allow"
 question_mark_used = "allow"
