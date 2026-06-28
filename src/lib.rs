@@ -31,6 +31,13 @@
 pub mod mock;
 pub mod real;
 
+#[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "Tests use unwrap for brevity; panics indicate test failure"
+)]
+mod parity_tests;
+
 use std::env::VarError;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};

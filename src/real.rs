@@ -210,3 +210,10 @@ impl TempDirHandle for RealTempDir {
         self.inner.path()
     }
 }
+
+#[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "Tests use unwrap for brevity; panics indicate test failure"
+)]
+mod tests;
