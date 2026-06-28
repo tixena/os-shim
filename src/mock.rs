@@ -514,8 +514,13 @@ impl System for MockSystem {
             .write()
             .map_err(|err| io::Error::other(err.to_string()))?;
 
-        // Remove the directory
-        state.dirs.remove(path);
+        // Match RealSystem (fs::remove_dir_all): a missing path is NotFound.
+        if !state.dirs.remove(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Directory not found: {}", path.display()),
+            ));
+        }
 
         // Remove all files, subdirectories, and timestamps under this path
         state
@@ -641,19 +646,19 @@ impl System for MockSystem {
     fn walk_dir(
         &self,
         path: &Path,
+        // `follow_links` is a no-op: the mock has no symlinks. Kept to match the trait.
         _follow_links: bool,
-        _hidden: bool,
+        hidden: bool,
     ) -> io::Result<Vec<WalkEntry>> {
         let state = self
             .state
             .read()
             .map_err(|err| io::Error::other(err.to_string()))?;
 
+        // Match RealSystem (ignore::WalkBuilder): walking a missing path yields no
+        // entries rather than erroring.
         if !state.dirs.contains(path) {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Directory not found: {}", path.display()),
-            ));
+            return Ok(Vec::new());
         }
 
         let mut entries = Vec::new();
@@ -661,8 +666,10 @@ impl System for MockSystem {
         let mut visited: BTreeSet<PathBuf> = BTreeSet::new();
 
         while let Some(current) = to_visit.pop() {
+            // Cycle guard: unreachable in practice since the mock has no symlinks,
+            // so the directory graph is always a tree. Kept as a safety net.
             if !visited.insert(current.clone()) {
-                continue; // Already visited
+                continue;
             }
 
             // Skip the root directory itself
@@ -695,6 +702,17 @@ impl System for MockSystem {
                     });
                 }
             }
+        }
+
+        // Match RealSystem's `hidden` semantics (ignore::WalkBuilder::hidden): when
+        // set, exclude any entry living under a dot-prefixed path component.
+        if hidden {
+            entries.retain(|entry| {
+                entry.path.strip_prefix(path).is_ok_and(|rel| {
+                    !rel.components()
+                        .any(|component| component.as_os_str().to_string_lossy().starts_with('.'))
+                })
+            });
         }
 
         // Sort entries by path for deterministic output

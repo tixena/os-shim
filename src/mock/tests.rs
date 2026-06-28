@@ -144,3 +144,57 @@ fn is_pid_alive_checks_mock_pids() {
     assert!(system.is_pid_alive(1234));
     assert!(!system.is_pid_alive(9999));
 }
+
+#[test]
+fn canonicalize_passes_absolute_through_and_joins_relative() {
+    let system = MockSystem::new().with_current_dir("/base").unwrap();
+
+    assert_eq!(
+        system.canonicalize(Path::new("/already/absolute")).unwrap(),
+        PathBuf::from("/already/absolute")
+    );
+    assert_eq!(
+        system.canonicalize(Path::new("rel/path")).unwrap(),
+        PathBuf::from("/base/rel/path")
+    );
+}
+
+#[test]
+fn create_temp_dir_exists_then_cleaned_up_on_drop() {
+    let system = MockSystem::new();
+    let temp = system.create_temp_dir().unwrap();
+    let path = temp.path().to_path_buf();
+
+    assert!(system.is_dir(&path).unwrap());
+    drop(temp);
+    assert!(!system.exists(&path).unwrap());
+}
+
+#[test]
+fn read_to_string_rejects_invalid_utf8() {
+    let system = MockSystem::new()
+        .with_file("/bad.bin", &[0xff, 0xfe, 0x00])
+        .unwrap();
+
+    let err = system.read_to_string(Path::new("/bad.bin")).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn with_current_dir_sets_current_dir() {
+    let system = MockSystem::new().with_current_dir("/custom/cwd").unwrap();
+    assert_eq!(system.current_dir().unwrap(), PathBuf::from("/custom/cwd"));
+}
+
+#[test]
+fn with_env_sets_env_var() {
+    let system = MockSystem::new().with_env("CONFIGURED", "yes").unwrap();
+    assert_eq!(system.env_var("CONFIGURED").unwrap(), "yes");
+}
+
+#[test]
+fn default_matches_new() {
+    let system = MockSystem::default();
+    assert_eq!(system.current_dir().unwrap(), PathBuf::from("/"));
+    assert!(system.is_dir(Path::new("/")).unwrap());
+}

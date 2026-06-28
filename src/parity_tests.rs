@@ -393,47 +393,225 @@ fn parity_walk_dir_visible_tree() {
     );
 }
 
-// ============================ Known divergences ============================
-// The following tests pin behavior where Mock and Real currently DISAGREE.
-// They assert each implementation's actual behavior so any future change is
-// caught, and each is tracked by a separate issue for a human to converge.
-
-/// `remove_dir_all` on a missing path: Real returns `NotFound`, Mock returns Ok.
 #[test]
-fn divergence_remove_dir_all_missing() {
+fn parity_create_writes_via_returned_stream() {
     let real = RealSystem::new();
     let tmp = real.create_temp_dir().unwrap();
-    let real_err = real
-        .remove_dir_all(&tmp.path().join("missing"))
-        .unwrap_err();
-    assert_eq!(real_err.kind(), io::ErrorKind::NotFound);
+    let real_file = tmp.path().join("made.txt");
+    let mut real_writer = real.create(&real_file).unwrap();
+    real_writer.write_all(b"streamed").unwrap();
+    real_writer.flush().unwrap();
+    drop(real_writer);
 
     let mock = MockSystem::new().with_dir("/work").unwrap();
-    mock.remove_dir_all(Path::new("/work/missing")).unwrap();
+    let mock_file = Path::new("/work/made.txt");
+    let mut mock_writer = mock.create(mock_file).unwrap();
+    mock_writer.write_all(b"streamed").unwrap();
+    mock_writer.flush().unwrap();
+    drop(mock_writer);
+
+    assert_eq!(
+        real.read_to_string(&real_file).unwrap(),
+        mock.read_to_string(mock_file).unwrap()
+    );
 }
 
-/// `walk_dir` on a missing path: Real yields an empty list, Mock returns `NotFound`.
 #[test]
-fn divergence_walk_dir_missing() {
+fn parity_copy_missing_source_is_not_found() {
     let real = RealSystem::new();
     let tmp = real.create_temp_dir().unwrap();
+    let mock = MockSystem::new().with_dir("/work").unwrap();
+
+    assert_both_err_kind(
+        real.copy(
+            &tmp.path().join("missing.txt"),
+            &tmp.path().join("dest.txt"),
+        ),
+        mock.copy(Path::new("/work/missing.txt"), Path::new("/work/dest.txt")),
+        io::ErrorKind::NotFound,
+    );
+}
+
+#[test]
+fn parity_open_missing_file_is_not_found() {
+    let real = RealSystem::new();
+    let tmp = real.create_temp_dir().unwrap();
+    let mock = MockSystem::new().with_dir("/work").unwrap();
+
+    assert_both_err_kind(
+        real.open(&tmp.path().join("missing.txt")),
+        mock.open(Path::new("/work/missing.txt")),
+        io::ErrorKind::NotFound,
+    );
+}
+
+#[test]
+fn parity_read_dir_missing_is_not_found() {
+    let real = RealSystem::new();
+    let tmp = real.create_temp_dir().unwrap();
+    let mock = MockSystem::new().with_dir("/work").unwrap();
+
+    assert_both_err_kind(
+        real.read_dir(&tmp.path().join("missing")),
+        mock.read_dir(Path::new("/work/missing")),
+        io::ErrorKind::NotFound,
+    );
+}
+
+#[test]
+fn parity_rename_dest_parent_missing_is_not_found() {
+    let real = RealSystem::new();
+    let tmp = real.create_temp_dir().unwrap();
+    real.write(&tmp.path().join("src.txt"), b"x").unwrap();
+
+    let mock = MockSystem::new().with_file("/work/src.txt", b"x").unwrap();
+
+    assert_both_err_kind(
+        real.rename(
+            &tmp.path().join("src.txt"),
+            &tmp.path().join("no").join("dest.txt"),
+        ),
+        mock.rename(Path::new("/work/src.txt"), Path::new("/work/no/dest.txt")),
+        io::ErrorKind::NotFound,
+    );
+}
+
+#[test]
+fn parity_open_append_parent_missing_is_not_found() {
+    // Real surfaces the missing parent on open; Mock surfaces it on flush. Both
+    // fail with NotFound before any bytes land -- that is the observable parity.
+    let real = RealSystem::new();
+    let tmp = real.create_temp_dir().unwrap();
+    let real_result = real
+        .open_append(&tmp.path().join("no").join("log.txt"))
+        .and_then(|mut writer| {
+            writer.write_all(b"x")?;
+            writer.flush()
+        });
+
+    let mock = MockSystem::new().with_dir("/work").unwrap();
+    let mock_result = mock
+        .open_append(Path::new("/work/no/log.txt"))
+        .and_then(|mut writer| {
+            writer.write_all(b"x")?;
+            writer.flush()
+        });
+
+    assert_both_err_kind(real_result, mock_result, io::ErrorKind::NotFound);
+}
+
+#[test]
+fn parity_remove_file_success_then_missing() {
+    let real = RealSystem::new();
+    let tmp = real.create_temp_dir().unwrap();
+    real.write(&tmp.path().join("doomed.txt"), b"x").unwrap();
+    real.remove_file(&tmp.path().join("doomed.txt")).unwrap();
+
+    let mock = MockSystem::new()
+        .with_file("/work/doomed.txt", b"x")
+        .unwrap();
+    mock.remove_file(Path::new("/work/doomed.txt")).unwrap();
+
+    assert_eq!(
+        real.exists(&tmp.path().join("doomed.txt")).unwrap(),
+        mock.exists(Path::new("/work/doomed.txt")).unwrap()
+    );
+    assert_both_err_kind(
+        real.remove_file(&tmp.path().join("doomed.txt")),
+        mock.remove_file(Path::new("/work/doomed.txt")),
+        io::ErrorKind::NotFound,
+    );
+}
+
+#[test]
+fn parity_rename_directory_moves_subtree() {
+    let real = RealSystem::new();
+    let tmp = real.create_temp_dir().unwrap();
+    real.create_dir_all(&tmp.path().join("from").join("nested"))
+        .unwrap();
+    real.write(&tmp.path().join("from").join("a.txt"), b"a")
+        .unwrap();
+    real.write(&tmp.path().join("from").join("nested").join("b.txt"), b"b")
+        .unwrap();
+    real.rename(&tmp.path().join("from"), &tmp.path().join("to"))
+        .unwrap();
+
+    let mock = MockSystem::new();
+    mock.create_dir_all(Path::new("/work/from/nested")).unwrap();
+    mock.write(Path::new("/work/from/a.txt"), b"a").unwrap();
+    mock.write(Path::new("/work/from/nested/b.txt"), b"b")
+        .unwrap();
+    mock.rename(Path::new("/work/from"), Path::new("/work/to"))
+        .unwrap();
+
+    // Old tree is gone, new tree carries the same relative contents on both.
+    assert_eq!(
+        real.exists(&tmp.path().join("from")).unwrap(),
+        mock.exists(Path::new("/work/from")).unwrap()
+    );
+    let real_walk: Vec<PathBuf> = real
+        .walk_dir(&tmp.path().join("to"), false, false)
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect();
+    let mock_walk: Vec<PathBuf> = mock
+        .walk_dir(Path::new("/work/to"), false, false)
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect();
+    assert_eq!(
+        relative_names(&real_walk, &tmp.path().join("to")),
+        relative_names(&mock_walk, Path::new("/work/to"))
+    );
+    assert_eq!(
+        real.read_to_string(&tmp.path().join("to").join("nested").join("b.txt"))
+            .unwrap(),
+        mock.read_to_string(Path::new("/work/to/nested/b.txt"))
+            .unwrap()
+    );
+}
+
+/// `remove_dir_all` on a missing path: both return `NotFound` (converged; was a
+/// divergence where Mock silently returned Ok -- shim-cyh).
+#[test]
+fn parity_remove_dir_all_missing_is_not_found() {
+    let real = RealSystem::new();
+    let tmp = real.create_temp_dir().unwrap();
+    let mock = MockSystem::new().with_dir("/work").unwrap();
+
+    assert_both_err_kind(
+        real.remove_dir_all(&tmp.path().join("missing")),
+        mock.remove_dir_all(Path::new("/work/missing")),
+        io::ErrorKind::NotFound,
+    );
+}
+
+/// `walk_dir` on a missing path: both yield an empty list (converged; Mock used
+/// to return `NotFound` -- shim-977).
+#[test]
+fn parity_walk_dir_missing_yields_empty() {
+    let real = RealSystem::new();
+    let tmp = real.create_temp_dir().unwrap();
+    let mock = MockSystem::new().with_dir("/work").unwrap();
+
     assert!(
         real.walk_dir(&tmp.path().join("missing"), false, false)
             .unwrap()
             .is_empty()
     );
-
-    let mock = MockSystem::new().with_dir("/work").unwrap();
-    let mock_err = mock
-        .walk_dir(Path::new("/work/missing"), false, false)
-        .unwrap_err();
-    assert_eq!(mock_err.kind(), io::ErrorKind::NotFound);
+    assert!(
+        mock.walk_dir(Path::new("/work/missing"), false, false)
+            .unwrap()
+            .is_empty()
+    );
 }
 
-/// The `hidden` flag is honored by Real (`hidden = true` excludes dotfiles) but
-/// ignored entirely by Mock (dotfiles are always included regardless).
+/// `hidden = true` excludes dotfiles on both (converged; Mock used to ignore the
+/// flag -- shim-977).
 #[test]
-fn divergence_walk_dir_hidden_flag() {
+fn parity_walk_dir_hidden_flag_excludes_dotfiles() {
     let real = RealSystem::new();
     let tmp = real.create_temp_dir().unwrap();
     real.write(&tmp.path().join("visible.txt"), b"v").unwrap();
@@ -447,7 +625,6 @@ fn divergence_walk_dir_hidden_flag() {
             .collect::<Vec<_>>(),
         tmp.path(),
     );
-    assert_eq!(real_names, vec!["visible.txt"]);
 
     let mock = MockSystem::new().with_dir("/work").unwrap();
     mock.write(Path::new("/work/visible.txt"), b"v").unwrap();
@@ -461,5 +638,7 @@ fn divergence_walk_dir_hidden_flag() {
             .collect::<Vec<_>>(),
         Path::new("/work"),
     );
-    assert_eq!(mock_names, vec![".secret", "visible.txt"]);
+
+    assert_eq!(real_names, mock_names);
+    assert_eq!(real_names, vec!["visible.txt"]);
 }
