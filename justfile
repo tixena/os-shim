@@ -24,10 +24,10 @@ lint:
     @echo "Running clippy lints..."
     cargo clippy --all-targets --all-features -- -D warnings
 
-# Run all tests (every feature except the opt-in expensive ones)
+# Run all tests
 test:
     @echo "Running tests..."
-    cargo test --features zip,process
+    cargo test --all-features
 
 # Lint every feature combination that ships. `lint` alone only covers
 # --all-features, so a warning that appears only without a feature slips past it.
@@ -46,26 +46,33 @@ test-features:
     cargo test --features zip
     cargo test --features zip,process
 
-# Run the opt-in expensive tests. Wants a disk-backed TMPDIR and double-digit
-# gibibytes of headroom; takes minutes, not seconds.
+# The opt-in expensive tests compile only under `cfg(slow_tests)`, which no other
+# recipe sets.
+slow_tests := "--all-features --config 'build.rustflags=[\"--cfg\", \"slow_tests\"]'"
+
+# Lint, then run, the opt-in expensive tests under the same flags. Wants a
+# disk-backed TMPDIR and double-digit gibibytes of headroom; takes minutes, not
+# seconds.
 test-slow:
+    @echo "Linting expensive tests..."
+    cargo clippy --all-targets {{slow_tests}} -- -D warnings
     @echo "Running expensive tests..."
-    cargo test --features zip,process,zip-large-file -- --nocapture
+    cargo test {{slow_tests}} -- --nocapture
 
 # Run tests with output
 test-verbose:
     @echo "Running tests (verbose)..."
-    cargo test --features zip,process -- --nocapture
+    cargo test --all-features -- --nocapture
 
 # Generate code coverage report (requires cargo-llvm-cov)
 test-coverage:
     @echo "Generating code coverage report..."
-    cargo llvm-cov --workspace --features zip,process
+    cargo llvm-cov --workspace --all-features
 
 # Generate code coverage HTML report (requires cargo-llvm-cov)
 test-coverage-html:
     @echo "Generating code coverage HTML report..."
-    cargo llvm-cov --workspace --features zip,process --html
+    cargo llvm-cov --workspace --all-features --html
     @echo "Coverage report generated in target/llvm-cov/html/"
 
 # Build in debug mode

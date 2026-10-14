@@ -8,7 +8,7 @@ use std::env::VarError;
 use std::io::{self, Cursor, Read, Write, pipe};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-#[cfg(feature = "zip-large-file")]
+#[cfg(slow_tests)]
 use std::process::Stdio;
 use std::thread;
 use time::OffsetDateTime;
@@ -17,11 +17,11 @@ use zip::write::{SimpleFileOptions, ZipWriter};
 
 /// Bytes in the large entry the zip64 pin archives: four gibibytes and one byte,
 /// one past the largest length a non-zip64 ZIP header can express.
-#[cfg(feature = "zip-large-file")]
+#[cfg(slow_tests)]
 const LARGE_ENTRY_BYTES: u64 = 0x0001_0000_0001;
 
 /// Bytes moved per pass while the large fixture is generated.
-#[cfg(feature = "zip-large-file")]
+#[cfg(slow_tests)]
 const LARGE_ENTRY_CHUNK_BYTES: usize = 0x0010_0000;
 
 /// Bytes a local file header occupies ahead of its variable-length file name.
@@ -717,14 +717,14 @@ fn directory_entries_stay_off_the_zip64_path() {
 }
 
 /// The digest at the head of a `sha256sum` output line.
-#[cfg(feature = "zip-large-file")]
+#[cfg(slow_tests)]
 fn digest_of(output: &[u8]) -> String {
     let text = String::from_utf8(output.to_vec()).unwrap();
     text.split_whitespace().next().unwrap().to_owned()
 }
 
 /// SHA-256 of the entry `name` as Info-ZIP's `unzip -p` streams it out.
-#[cfg(feature = "zip-large-file")]
+#[cfg(slow_tests)]
 fn sha256_of_extracted_entry(archive: &Path, name: &str) -> String {
     let mut extractor = Command::new("unzip")
         .arg("-p")
@@ -750,7 +750,7 @@ fn sha256_of_extracted_entry(archive: &Path, name: &str) -> String {
 }
 
 /// SHA-256 of the file at `path`, as `sha256sum` computes it.
-#[cfg(feature = "zip-large-file")]
+#[cfg(slow_tests)]
 fn sha256_of_file(path: &Path) -> String {
     let output = Command::new("sha256sum").arg(path).output().unwrap();
     assert!(
@@ -765,7 +765,7 @@ fn sha256_of_file(path: &Path) -> String {
 ///
 /// Random data, because deflate must not be able to hide four gibibytes behind a
 /// small compressed length: that would leave the zip64 path untouched.
-#[cfg(feature = "zip-large-file")]
+#[cfg(slow_tests)]
 fn write_incompressible_file(system: RealSystem, path: &Path, bytes: u64) {
     let mut entropy = system.open(Path::new("/dev/urandom")).unwrap();
     let mut sink = system.create(path).unwrap();
@@ -791,10 +791,9 @@ fn write_incompressible_file(system: RealSystem, path: &Path, bytes: u64) {
 /// disk-backed `TMPDIR` and double-digit gibibytes of headroom:
 ///
 /// ```text
-/// TMPDIR=/var/tmp cargo test --features zip-large-file \
-///     an_entry_above_four_gibibytes_archives_and_extracts
+/// TMPDIR=/var/tmp just test-slow
 /// ```
-#[cfg(feature = "zip-large-file")]
+#[cfg(slow_tests)]
 #[test]
 fn an_entry_above_four_gibibytes_archives_and_extracts() {
     let real = RealSystem::new();
