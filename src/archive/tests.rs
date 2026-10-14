@@ -13,7 +13,7 @@ use std::process::Stdio;
 use std::thread;
 use time::OffsetDateTime;
 use zip::ZipArchive;
-use zip::write::{SimpleFileOptions, ZipWriter};
+use zip::write::{SimpleFileOptions, StreamWriter, ZipWriter};
 
 /// Bytes in the large entry the zip64 pin archives: four gibibytes and one byte,
 /// one past the largest length a non-zip64 ZIP header can express.
@@ -651,6 +651,111 @@ fn an_entry_escaping_the_destination_is_refused() {
     let message = result.err().map(|error| error.to_string()).unwrap();
     assert!(message.contains("escapes the destination"));
     assert!(message.contains("../escape.txt"));
+}
+
+/// An archive written to a sink that cannot seek: every entry's sizes follow
+/// its data in a data descriptor, as in files from streaming exporters.
+fn data_descriptor_archive() -> Vec<u8> {
+    let mut writer = ZipWriter::new_stream(Vec::<u8>::new());
+    writer
+        .add_directory("word/", SimpleFileOptions::default())
+        .unwrap();
+    writer
+        .start_file("word/document.xml", SimpleFileOptions::default())
+        .unwrap();
+    writer.write_all(b"<w:document/>").unwrap();
+    writer
+        .start_file("[Content_Types].xml", SimpleFileOptions::default())
+        .unwrap();
+    writer.write_all(b"<Types/>").unwrap();
+    StreamWriter::into_inner(writer.finish().unwrap())
+}
+
+#[test]
+fn a_data_descriptor_archive_is_refused_by_the_stream_reader() {
+    let archive = data_descriptor_archive();
+    // Byte 6 is the low byte of the first local header's flags; bit 3 defers the sizes.
+    let flags = archive.get(6).copied().unwrap();
+    assert_eq!(
+        flags & 0b1000,
+        0b1000,
+        "the fixture's first entry must defer its sizes"
+    );
+
+    let message = MemorySystem::from_zip_stream(&mut Cursor::new(archive))
+        .err()
+        .map(|error| error.to_string())
+        .unwrap();
+
+    assert!(message.contains("The file length is not available in the local header"));
+}
+
+#[test]
+fn a_data_descriptor_archive_loads_from_a_seekable_reader() {
+    let loaded = MemorySystem::from_zip_reader(Cursor::new(data_descriptor_archive())).unwrap();
+
+    assert_eq!(
+        loaded
+            .read_to_string(Path::new("/word/document.xml"))
+            .unwrap(),
+        "<w:document/>"
+    );
+    assert_eq!(
+        loaded
+            .read_to_string(Path::new("/[Content_Types].xml"))
+            .unwrap(),
+        "<Types/>"
+    );
+    assert!(loaded.is_dir(Path::new("/word")).unwrap());
+}
+
+#[test]
+fn the_seekable_reader_loads_what_the_writer_produces() {
+    let archive = memory_project().to_zip_vec(Path::new("/proj")).unwrap();
+
+    let from_reader = MemorySystem::from_zip_reader(Cursor::new(archive.clone()))
+        .unwrap()
+        .to_zip_vec(Path::new("/"))
+        .unwrap();
+    let from_stream = MemorySystem::from_zip_stream(&mut Cursor::new(archive.clone()))
+        .unwrap()
+        .to_zip_vec(Path::new("/"))
+        .unwrap();
+
+    // Names and contents, not whole bytes: a loaded file is stamped with the time
+    // it was written, so two loads can differ in their timestamps alone.
+    for reloaded in [&from_reader, &from_stream] {
+        assert_eq!(entry_names(reloaded), entry_names(&archive));
+        for name in entry_names(&archive) {
+            assert_eq!(entry_bytes(reloaded, &name), entry_bytes(&archive, &name));
+        }
+    }
+}
+
+#[test]
+fn the_seekable_reader_refuses_an_entry_escaping_the_destination() {
+    let mut buffer = Cursor::new(Vec::<u8>::new());
+    let mut writer = ZipWriter::new(&mut buffer);
+    writer
+        .start_file("../escape.txt", SimpleFileOptions::default())
+        .unwrap();
+    writer.write_all(b"nope").unwrap();
+    writer.finish().unwrap();
+
+    let message = MemorySystem::from_zip_reader(Cursor::new(buffer.into_inner()))
+        .err()
+        .map(|error| error.to_string())
+        .unwrap();
+
+    assert!(message.contains("escapes the destination"));
+    assert!(message.contains("../escape.txt"));
+}
+
+#[test]
+fn bytes_that_are_not_an_archive_report_an_error_from_a_seekable_reader() {
+    let source = Cursor::new(b"this is not a zip archive at all".to_vec());
+
+    assert!(MemorySystem::from_zip_reader(source).is_err());
 }
 
 #[test]

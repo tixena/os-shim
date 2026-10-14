@@ -2,12 +2,12 @@
 
 use crate::System;
 use alloc::collections::BTreeSet;
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, Cursor, Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 use time::{OffsetDateTime, PrimitiveDateTime};
-use zip::DateTime;
-use zip::read::read_zipfile_from_stream;
+use zip::read::{ZipFile, read_zipfile_from_stream};
 use zip::write::{SimpleFileOptions, ZipWriter};
+use zip::{DateTime, ZipArchive};
 
 /// Bytes held by the copy buffer (64 KiB), heap-allocated because a stack array
 /// this size trips `clippy::large_stack_arrays`.
@@ -150,7 +150,9 @@ fn is_hidden(path: &Path) -> bool {
 
 /// Read a zip archive from `source` and materialise its entries under `destination`.
 ///
-/// The reader need not be seekable, so a pipe is a valid source.
+/// The reader need not be seekable, so a pipe is a valid source. An entry whose
+/// sizes follow its data in a data descriptor cannot be sized from a stream and is
+/// refused; [`load_zip_seekable`] reads such archives.
 ///
 /// # Errors
 ///
@@ -162,34 +164,68 @@ where
     S: System + ?Sized,
 {
     system.create_dir_all(destination)?;
-    loop {
-        let Some(mut entry) = read_zipfile_from_stream(&mut source).map_err(io::Error::other)?
-        else {
-            break;
-        };
-        let Some(relative) = entry.enclosed_name() else {
-            return Err(io::Error::other(format!(
-                "Archive entry escapes the destination: {}",
-                entry.name()
-            )));
-        };
-        let target = destination.join(relative);
-        if entry.is_dir() {
-            system.create_dir_all(&target)?;
-            continue;
-        }
-        if let Some(parent) = target.parent() {
-            system.create_dir_all(parent)?;
-        }
-        // Streamed rather than read whole: `read_to_end` would hold the entry's
-        // full *uncompressed* length, which for a real filesystem is a gigabyte
-        // of resident memory to write a gigabyte file. `create` hands back a
-        // sink, so the entry moves through a fixed buffer instead.
-        let mut sink = system.create(&target)?;
-        io::copy(&mut entry, &mut sink)?;
-        sink.flush()?;
+    while let Some(mut entry) = read_zipfile_from_stream(&mut source).map_err(io::Error::other)? {
+        materialise_entry(system, &mut entry, destination)?;
     }
     Ok(())
+}
+
+/// Read a zip archive from a seekable `source` and materialise its entries under `destination`.
+///
+/// Entries are found through the central directory at the end of the archive,
+/// so an entry whose sizes follow its data in a data descriptor loads too;
+/// [`load_zip`] refuses those, because a stream offers nothing past the local
+/// header to size the entry by.
+///
+/// # Errors
+///
+/// Returns an error if the archive is malformed, an entry name escapes the
+/// destination, or an entry cannot be written.
+#[inline]
+pub fn load_zip_seekable<S, R>(system: &S, source: R, destination: &Path) -> io::Result<()>
+where
+    S: System + ?Sized,
+    R: Read + Seek,
+{
+    let mut archive = ZipArchive::new(source).map_err(io::Error::other)?;
+    system.create_dir_all(destination)?;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(io::Error::other)?;
+        materialise_entry(system, &mut entry, destination)?;
+    }
+    Ok(())
+}
+
+/// Write one archive entry under `destination`: a directory, or a file and its parents.
+fn materialise_entry<S, R>(
+    system: &S,
+    entry: &mut ZipFile<'_, R>,
+    destination: &Path,
+) -> io::Result<()>
+where
+    S: System + ?Sized,
+    R: Read + ?Sized,
+{
+    let Some(relative) = entry.enclosed_name() else {
+        return Err(io::Error::other(format!(
+            "Archive entry escapes the destination: {}",
+            entry.name()
+        )));
+    };
+    let target = destination.join(relative);
+    if entry.is_dir() {
+        return system.create_dir_all(&target);
+    }
+    if let Some(parent) = target.parent() {
+        system.create_dir_all(parent)?;
+    }
+    // Streamed rather than read whole: `read_to_end` would hold the entry's
+    // full *uncompressed* length, which for a real filesystem is a gigabyte
+    // of resident memory to write a gigabyte file. `create` hands back a
+    // sink, so the entry moves through a fixed buffer instead.
+    let mut sink = system.create(&target)?;
+    io::copy(entry, &mut sink)?;
+    sink.flush()
 }
 
 /// Write `source` into `sink` as a zip archive.

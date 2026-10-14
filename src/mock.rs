@@ -12,10 +12,12 @@
 use tracing::error;
 
 #[cfg(feature = "zip")]
-use crate::archive::load_zip;
+use crate::archive::{load_zip, load_zip_seekable};
 use crate::{FileMetadata, System, TempDirHandle, WalkEntry};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env::VarError;
+#[cfg(feature = "zip")]
+use std::io::Seek;
 use std::io::{self, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -121,11 +123,34 @@ impl MemorySystem {
         dirs.insert(path.to_path_buf());
     }
 
+    /// Build a `MemorySystem` whose filesystem is the contents of a zip archive read
+    /// from a seekable source.
+    ///
+    /// Entries land under `/`, as with [`from_zip_stream`](Self::from_zip_stream).
+    /// They are found through the archive's central directory, so an archive whose
+    /// entries carry data descriptors loads too.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The archive is malformed, or an entry cannot be written.
+    #[cfg(feature = "zip")]
+    #[inline]
+    pub fn from_zip_reader<R>(source: R) -> io::Result<Self>
+    where
+        R: Read + Seek,
+    {
+        let system = Self::new();
+        load_zip_seekable(&system, source, Path::new("/"))?;
+        Ok(system)
+    }
+
     /// Build a `MemorySystem` whose filesystem is the contents of a zip archive.
     ///
     /// Entries land under `/`, so archiving a folder and loading it back gives an
     /// in-memory filesystem holding that folder's contents at the root. The reader
-    /// need not be seekable.
+    /// need not be seekable. An archive whose entries carry data descriptors is
+    /// refused; [`from_zip_reader`](Self::from_zip_reader) reads it.
     ///
     /// # Errors
     ///
