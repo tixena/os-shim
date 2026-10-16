@@ -1,6 +1,6 @@
 //! Tests for zip archive production and loading.
 
-use super::{ZipOptions, to_zip_writer};
+use super::{ZipOptions, ZipStreamWriter, to_zip_writer};
 use crate::mock::MemorySystem;
 use crate::real::RealSystem;
 use crate::{FileMetadata, System, TempDirHandle, WalkEntry};
@@ -30,6 +30,12 @@ const LOCAL_HEADER_FIXED_BYTES: usize = 30;
 /// The four bytes opening a zip64 extended information extra field: header id
 /// `0x0001` and a sixteen-byte payload length, each little-endian.
 const ZIP64_EXTRA_FIELD_HEADER: [u8; 4] = [0x01, 0x00, 0x10, 0x00];
+
+/// A sink that can only be written to, counting what it receives.
+struct CountingSink {
+    /// Bytes received so far.
+    count: usize,
+}
 
 /// A `System` implementor writing only the methods the trait required before the
 /// zip methods arrived, proving an out-of-crate implementor gains them for free.
@@ -142,6 +148,17 @@ impl System for MinimalSystem {
 
     fn write(&self, path: &Path, contents: &[u8]) -> io::Result<()> {
         self.inner.write(path, contents)
+    }
+}
+
+impl Write for CountingSink {
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.count = self.count.checked_add(buf.len()).unwrap();
+        Ok(buf.len())
     }
 }
 
@@ -707,6 +724,104 @@ fn a_data_descriptor_archive_loads_from_a_seekable_reader() {
         "<Types/>"
     );
     assert!(loaded.is_dir(Path::new("/word")).unwrap());
+}
+
+/// The repeated text of the large entry in the streamed archive.
+fn streamed_large_entry() -> String {
+    "<w:p>row</w:p>".repeat(0x1_0000)
+}
+
+/// Three entries, one empty, one of about a mebibyte and one small, written through
+/// a `ZipStreamWriter`.
+fn streamed_archive() -> Vec<u8> {
+    let mut zip = ZipStreamWriter::new(Vec::<u8>::new());
+    zip.start_entry("empty.xml").unwrap();
+    zip.start_entry("word/large.xml").unwrap();
+    zip.write_all(streamed_large_entry().as_bytes()).unwrap();
+    zip.start_entry("[Content_Types].xml").unwrap();
+    zip.write_all(b"<Types/>").unwrap();
+    zip.finish().unwrap()
+}
+
+/// The two bytes at `offset` in the local header of every entry.
+fn local_header_bytes(archive: &[u8], offset: usize) -> Vec<Vec<u8>> {
+    let mut reader = ZipArchive::new(Cursor::new(archive.to_vec())).unwrap();
+    (0..reader.len())
+        .map(|index| {
+            let start = usize::try_from(reader.by_index(index).unwrap().header_start())
+                .unwrap()
+                .checked_add(offset)
+                .unwrap();
+            archive
+                .get(start..start.checked_add(2).unwrap())
+                .map(<[u8]>::to_vec)
+                .unwrap()
+        })
+        .collect()
+}
+
+#[test]
+fn a_streamed_archive_loads_with_every_entry_intact() {
+    let loaded = MemorySystem::from_zip_reader(Cursor::new(streamed_archive())).unwrap();
+
+    assert_eq!(loaded.read_to_string(Path::new("/empty.xml")).unwrap(), "");
+    assert_eq!(
+        loaded.read_to_string(Path::new("/word/large.xml")).unwrap(),
+        streamed_large_entry()
+    );
+    assert_eq!(
+        loaded
+            .read_to_string(Path::new("/[Content_Types].xml"))
+            .unwrap(),
+        "<Types/>"
+    );
+}
+
+#[test]
+fn every_streamed_entry_defers_its_sizes_to_a_data_descriptor() {
+    let flags = local_header_bytes(&streamed_archive(), 6);
+
+    assert_eq!(flags.len(), 3);
+    for word in flags {
+        assert_eq!(word.first().copied().unwrap() & 0b1000, 0b1000);
+    }
+}
+
+#[test]
+fn every_streamed_entry_is_deflated() {
+    let methods = local_header_bytes(&streamed_archive(), 8);
+
+    assert_eq!(methods, [[8, 0], [8, 0], [8, 0]]);
+}
+
+#[test]
+fn a_streamed_archive_is_refused_by_the_stream_reader() {
+    let message = MemorySystem::from_zip_stream(&mut Cursor::new(streamed_archive()))
+        .err()
+        .map(|error| error.to_string())
+        .unwrap();
+
+    assert!(message.contains("The file length is not available in the local header"));
+}
+
+#[test]
+fn a_streamed_archive_is_written_to_a_sink_that_only_writes() {
+    let mut zip = ZipStreamWriter::new(CountingSink { count: 0 });
+    zip.start_entry("word/document.xml").unwrap();
+    zip.write_all(b"<w:document/>").unwrap();
+
+    let sink = zip.finish().unwrap();
+
+    assert!(sink.count > b"<w:document/>".len());
+}
+
+#[test]
+fn a_streamed_archive_with_no_entries_loads_as_empty() {
+    let bytes = ZipStreamWriter::new(Vec::<u8>::new()).finish().unwrap();
+
+    let loaded = MemorySystem::from_zip_reader(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(loaded.read_dir(Path::new("/")).unwrap().len(), 0);
 }
 
 #[test]

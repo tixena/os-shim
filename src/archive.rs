@@ -6,8 +6,8 @@ use std::io::{self, Cursor, Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 use time::{OffsetDateTime, PrimitiveDateTime};
 use zip::read::{ZipFile, read_zipfile_from_stream};
-use zip::write::{SimpleFileOptions, ZipWriter};
-use zip::{DateTime, ZipArchive};
+use zip::write::{SimpleFileOptions, StreamWriter, ZipWriter};
+use zip::{CompressionMethod, DateTime, ZipArchive};
 
 /// Bytes held by the copy buffer (64 KiB), heap-allocated because a stack array
 /// this size trips `clippy::large_stack_arrays`.
@@ -40,6 +40,64 @@ impl Default for ZipOptions {
         Self {
             include_hidden: true,
         }
+    }
+}
+
+/// A zip writer that writes one entry at a time into a sink that cannot seek.
+///
+/// Each entry is deflated and its sizes follow its data in a data descriptor,
+/// so the archive loads through [`load_zip_seekable`] and not through
+/// [`load_zip`], which needs the sizes in the local header.
+pub struct ZipStreamWriter<W: Write> {
+    /// The zip writer over the sink.
+    zip: ZipWriter<StreamWriter<W>>,
+}
+
+impl<W: Write> ZipStreamWriter<W> {
+    /// Write the central directory and give the sink back.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the sink fails.
+    #[inline]
+    pub fn finish(self) -> io::Result<W> {
+        self.zip
+            .finish()
+            .map(StreamWriter::into_inner)
+            .map_err(io::Error::other)
+    }
+
+    /// A writer over `sink`, with no entry started.
+    #[must_use]
+    #[inline]
+    pub fn new(sink: W) -> Self {
+        Self {
+            zip: ZipWriter::new_stream(sink),
+        }
+    }
+
+    /// End the entry being written, if any, and start the next; the bytes
+    /// written next are its content.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the name has no zip representation or the sink fails.
+    #[inline]
+    pub fn start_entry(&mut self, name: &str) -> io::Result<()> {
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        self.zip.start_file(name, options).map_err(io::Error::other)
+    }
+}
+
+impl<W: Write> Write for ZipStreamWriter<W> {
+    #[inline]
+    fn flush(&mut self) -> io::Result<()> {
+        self.zip.flush()
+    }
+
+    #[inline]
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.zip.write(buf)
     }
 }
 
