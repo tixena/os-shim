@@ -181,7 +181,7 @@ fn entry_bytes(archive: &[u8], name: &str) -> Vec<u8> {
 fn entry_names(archive: &[u8]) -> Vec<String> {
     let mut reader = ZipArchive::new(Cursor::new(archive.to_vec())).unwrap();
     (0..reader.len())
-        .map(|index| reader.by_index(index).unwrap().name().to_owned())
+        .map(|index| reader.by_index(index).unwrap().name().unwrap().into_owned())
         .collect()
 }
 
@@ -670,8 +670,8 @@ fn an_entry_escaping_the_destination_is_refused() {
     assert!(message.contains("../escape.txt"));
 }
 
-/// An archive written to a sink that cannot seek: every entry's sizes follow
-/// its data in a data descriptor, as in files from streaming exporters.
+/// An archive written to a sink that cannot seek: every file entry's sizes
+/// follow its data in a data descriptor, as in files from streaming exporters.
 fn data_descriptor_archive() -> Vec<u8> {
     let mut writer = ZipWriter::new_stream(Vec::<u8>::new());
     writer
@@ -691,12 +691,22 @@ fn data_descriptor_archive() -> Vec<u8> {
 #[test]
 fn a_data_descriptor_archive_is_refused_by_the_stream_reader() {
     let archive = data_descriptor_archive();
-    // Byte 6 is the low byte of the first local header's flags; bit 3 defers the sizes.
-    let flags = archive.get(6).copied().unwrap();
+    // Byte 6 of a local header is the low byte of its flags; bit 3 defers the sizes. A directory
+    // entry has no data to defer, so the check reads the first file's header.
+    let header = ZipArchive::new(Cursor::new(archive.as_slice()))
+        .unwrap()
+        .by_name("word/document.xml")
+        .unwrap()
+        .header_start();
+    let flags = usize::try_from(header)
+        .ok()
+        .and_then(|start| start.checked_add(6))
+        .and_then(|index| archive.get(index).copied())
+        .unwrap();
     assert_eq!(
         flags & 0b1000,
         0b1000,
-        "the fixture's first entry must defer its sizes"
+        "the fixture's first file must defer its sizes"
     );
 
     let message = MemorySystem::from_zip_stream(&mut Cursor::new(archive))

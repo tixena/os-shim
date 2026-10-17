@@ -19,7 +19,7 @@ ignore = "0.4"
 tracing = "0.1"
 
 # Zip archive streaming (optional)
-zip = { version = "8", default-features = false, features = [
+zip = { version = "9.0.4", default-features = false, features = [
     "deflate-flate2-zlib-rs",
     "time",
 ], optional = true }
