@@ -267,7 +267,7 @@ where
     let Some(relative) = entry.enclosed_name() else {
         return Err(io::Error::other(format!(
             "Archive entry escapes the destination: {}",
-            entry.name()
+            String::from_utf8_lossy(entry.name_raw())
         )));
     };
     let target = destination.join(relative);
