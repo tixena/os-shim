@@ -31,13 +31,19 @@ libc = { version = "0.2", optional = true }
 # Bucket clients (optional): BlockingBucket's runtime
 tokio = { version = "1.53.3", features = ["rt"], optional = true }
 
+# Bucket clients (optional): AWS's S3 SDK, for MinIO-compatible servers and for AWS S3
+aws-sdk-s3 = { version = "1.152.0", default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+], optional = true }
+
 [dev-dependencies]
 tokio = { version = "1.53.3", features = ["rt", "macros"] }
 
 [features]
 default = []
 async = []
-minio = ["dep:tokio"]
+minio = ["dep:tokio", "dep:aws-sdk-s3"]
 process = ["libc"]
 s3 = ["dep:tokio"]
 zip = ["dep:zip", "dep:time"]
