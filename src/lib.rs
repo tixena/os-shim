@@ -32,6 +32,8 @@ extern crate alloc;
 
 #[cfg(feature = "zip")]
 pub mod archive;
+#[cfg(any(feature = "minio", feature = "s3"))]
+pub mod bucket;
 pub mod mock;
 pub mod real;
 

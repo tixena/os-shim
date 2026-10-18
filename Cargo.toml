@@ -28,9 +28,18 @@ time = { version = "0.3.55", optional = true }
 # Process operations (optional)
 libc = { version = "0.2", optional = true }
 
+# Bucket clients (optional): BlockingBucket's runtime
+tokio = { version = "1.53.3", features = ["rt"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1.53.3", features = ["rt", "macros"] }
+
 [features]
 default = []
+async = []
+minio = ["dep:tokio"]
 process = ["libc"]
+s3 = ["dep:tokio"]
 zip = ["dep:zip", "dep:time"]
 
 [lints.clippy]
