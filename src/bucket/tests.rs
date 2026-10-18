@@ -1,8 +1,19 @@
-//! Tests for the in-memory bucket, the blocking wrapper and the bucket error.
+//! Tests for the in-memory bucket, the blocking wrapper, the bucket error and the `MinIO` client.
 
 use super::{BlockingBucket, Bucket as _, Condition, MemoryBucket, ObjectError, ObjectErrorKind};
+#[cfg(feature = "minio")]
+use super::{MinioBucket, MinioConfig};
+#[cfg(feature = "minio")]
+use alloc::sync::Arc;
 use core::error::Error as _;
 use std::io;
+#[cfg(feature = "minio")]
+use std::{
+    io::{BufRead as _, BufReader, Read as _, Write as _},
+    net::{TcpListener, TcpStream},
+    sync::Mutex,
+    thread,
+};
 
 fn blocking() -> BlockingBucket<MemoryBucket> {
     BlockingBucket::new(MemoryBucket::default()).unwrap()
@@ -204,4 +215,249 @@ fn error_text_and_source() {
 async fn blocking_inside_a_runtime_panics() {
     let bucket = blocking();
     drop(bucket.get("vault/a.md"));
+}
+
+/// Serve `answers` in order, one per request, and record each request's method and conditional headers.
+#[cfg(feature = "minio")]
+fn canned(answers: Vec<String>) -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    thread::spawn(move || serve(&listener, answers, &log));
+    (endpoint, seen)
+}
+
+/// Answer each request on every connection with the next answer, until none is left.
+#[cfg(feature = "minio")]
+fn serve(listener: &TcpListener, answers: Vec<String>, log: &Mutex<Vec<String>>) {
+    let mut pending = answers.into_iter();
+    for incoming in listener.incoming() {
+        let mut stream = incoming.unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut request_line = String::new();
+        while reader.read_line(&mut request_line).unwrap() > 0 {
+            log.lock()
+                .unwrap()
+                .push(read_request(&request_line, &mut reader));
+            request_line.clear();
+            let Some(answer) = pending.next() else {
+                return;
+            };
+            stream.write_all(answer.as_bytes()).unwrap();
+        }
+    }
+}
+
+/// The rest of the request that starts with `request_line`, read off `reader`, as its method and conditional headers.
+#[cfg(feature = "minio")]
+fn read_request(request_line: &str, reader: &mut BufReader<TcpStream>) -> String {
+    let mut length = 0_u64;
+    let mut if_match = String::from("-");
+    let mut if_none_match = None;
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let Some((name, value)) = line.trim_end().split_once(':') else {
+            break;
+        };
+        match name.to_ascii_lowercase().as_str() {
+            "content-length" => length = value.trim().parse().unwrap(),
+            "if-match" => value.trim().clone_into(&mut if_match),
+            "if-none-match" => if_none_match = Some(value.trim().to_owned()),
+            _ => {}
+        }
+    }
+    io::copy(&mut reader.take(length), &mut io::sink()).unwrap();
+    let method = request_line.split(' ').next().unwrap();
+    if_none_match.map_or_else(
+        || format!("{method} if-match={if_match}"),
+        |value| format!("{method} if-match={if_match} if-none-match={value}"),
+    )
+}
+
+/// An HTTP answer with `status`, the header lines in `headers` and `body`.
+#[cfg(feature = "minio")]
+fn answer(status: &str, headers: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// A `ListObjectsV2` answer with `key`, truncated with the token `next` when it is given.
+#[cfg(feature = "minio")]
+fn page(key: &str, next: Option<&str>) -> String {
+    let truncation = next.map_or_else(
+        || "<IsTruncated>false</IsTruncated>".to_owned(),
+        |token| {
+            format!(
+                "<IsTruncated>true</IsTruncated><NextContinuationToken>{token}</NextContinuationToken>"
+            )
+        },
+    );
+    let body = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult><Name>archie</Name><Prefix>vault/</Prefix>{truncation}<Contents><Key>{key}</Key></Contents></ListBucketResult>"
+    );
+    answer("200 OK", "Content-Type: application/xml\r\n", &body)
+}
+
+/// The requests the canned server has seen so far.
+#[cfg(feature = "minio")]
+fn requests(seen: &Mutex<Vec<String>>) -> Vec<String> {
+    seen.lock().unwrap().clone()
+}
+
+/// The configuration every scenario uses, against `endpoint`.
+#[cfg(feature = "minio")]
+fn minio_config(endpoint: String) -> MinioConfig {
+    MinioConfig::new(
+        endpoint,
+        "us-east-1".to_owned(),
+        "archie".to_owned(),
+        "os-shim".to_owned(),
+        "os-shim-secret".to_owned(),
+    )
+}
+
+/// A blocking `MinIO` client for `endpoint`.
+#[cfg(feature = "minio")]
+fn minio(endpoint: String) -> BlockingBucket<MinioBucket> {
+    BlockingBucket::new(MinioBucket::new(minio_config(endpoint))).unwrap()
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_get_answered_404_is_not_found() {
+    let (endpoint, seen) = canned(vec![answer("404 Not Found", "", "")]);
+    let error = minio(endpoint).get("task.md").unwrap_err();
+    assert_eq!(error.kind(), ObjectErrorKind::NotFound);
+    assert_eq!(requests(&seen), ["GET if-match=-"]);
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_put_with_a_stale_tag_answered_412_is_precondition_failed() {
+    let (endpoint, seen) = canned(vec![answer("412 Precondition Failed", "", "")]);
+    let error = minio(endpoint)
+        .put("task.md", b"x", &Condition::ETag("\"a\"".to_owned()))
+        .unwrap_err();
+    assert_eq!(error.kind(), ObjectErrorKind::PreconditionFailed);
+    assert_eq!(requests(&seen), ["PUT if-match=\"a\""]);
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_put_with_absent_sends_if_none_match_star() {
+    let (endpoint, seen) = canned(vec![answer("412 Precondition Failed", "", "")]);
+    let error = minio(endpoint)
+        .put("task.md", b"x", &Condition::Absent)
+        .unwrap_err();
+    assert_eq!(error.kind(), ObjectErrorKind::PreconditionFailed);
+    assert_eq!(requests(&seen), ["PUT if-match=- if-none-match=*"]);
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_put_gives_the_tag_the_server_answered() {
+    let (endpoint, _seen) = canned(vec![answer("200 OK", "ETag: \"b\"\r\n", "")]);
+    let tag = minio(endpoint)
+        .put("task.md", b"x", &Condition::None)
+        .unwrap();
+    assert_eq!(tag, "\"b\"");
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_get_gives_the_bytes_and_the_tag() {
+    let (endpoint, _seen) = canned(vec![answer("200 OK", "ETag: \"b\"\r\n", "x")]);
+    let object = minio(endpoint).get("task.md").unwrap();
+    assert_eq!(object.bytes, b"x");
+    assert_eq!(object.etag, "\"b\"");
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_delete_with_a_stale_tag_fails_without_deleting() {
+    let (endpoint, seen) = canned(vec![answer("200 OK", "ETag: \"b\"\r\n", "")]);
+    let error = minio(endpoint)
+        .delete("task.md", &Condition::ETag("\"a\"".to_owned()))
+        .unwrap_err();
+    assert_eq!(error.kind(), ObjectErrorKind::PreconditionFailed);
+    assert_eq!(requests(&seen), ["HEAD if-match=-"]);
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_delete_with_the_current_tag_sends_if_match() {
+    let (endpoint, seen) = canned(vec![
+        answer("200 OK", "ETag: \"a\"\r\n", ""),
+        answer("204 No Content", "", ""),
+    ]);
+    minio(endpoint)
+        .delete("task.md", &Condition::ETag("\"a\"".to_owned()))
+        .unwrap();
+    assert_eq!(
+        requests(&seen),
+        ["HEAD if-match=-", "DELETE if-match=\"a\""]
+    );
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_delete_with_a_tag_of_a_missing_object_fails_without_deleting() {
+    let (endpoint, seen) = canned(vec![answer("404 Not Found", "", "")]);
+    let error = minio(endpoint)
+        .delete("task.md", &Condition::ETag("\"a\"".to_owned()))
+        .unwrap_err();
+    assert_eq!(error.kind(), ObjectErrorKind::PreconditionFailed);
+    assert_eq!(requests(&seen), ["HEAD if-match=-"]);
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_delete_with_no_condition_sends_one_delete() {
+    let (endpoint, seen) = canned(vec![answer("204 No Content", "", "")]);
+    minio(endpoint).delete("task.md", &Condition::None).unwrap();
+    assert_eq!(requests(&seen), ["DELETE if-match=-"]);
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_get_answered_503_is_other_after_one_request() {
+    let unavailable = answer("503 Service Unavailable", "", "");
+    let (endpoint, seen) = canned(vec![unavailable.clone(), unavailable.clone(), unavailable]);
+    let error = minio(endpoint).get("task.md").unwrap_err();
+    assert_eq!(error.kind(), ObjectErrorKind::Other);
+    assert_eq!(requests(&seen), ["GET if-match=-"]);
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_list_reads_every_page() {
+    let (endpoint, seen) = canned(vec![
+        page("vault/a.md", Some("next")),
+        page("vault/b.md", None),
+    ]);
+    let keys = minio(endpoint).list("vault/").unwrap();
+    assert_eq!(keys, ["vault/a.md", "vault/b.md"]);
+    assert_eq!(requests(&seen), ["GET if-match=-", "GET if-match=-"]);
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_config_debug_keeps_the_secret_key_out() {
+    let config = minio_config("http://127.0.0.1:9000".to_owned());
+    let shown = format!("{config:?}");
+    assert!(shown.contains("<redacted>"));
+    assert!(!shown.contains("os-shim-secret"));
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_get_with_nothing_listening_is_other() {
+    let error = minio("http://127.0.0.1:9".to_owned())
+        .get("task.md")
+        .unwrap_err();
+    assert_eq!(error.kind(), ObjectErrorKind::Other);
 }
