@@ -68,4 +68,5 @@ print_stderr = "allow"
 [lints.rust]
 # `slow_tests` gates the opt-in expensive tests; `just test-slow` sets it.
 # `minio_tests` gates the tests against a MinIO-compatible server; `just test-minio` sets it.
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(slow_tests)", "cfg(minio_tests)"] }
+# `s3_tests` gates the tests against an AWS bucket; `just test-s3` sets it.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(slow_tests)", "cfg(minio_tests)", "cfg(s3_tests)"] }

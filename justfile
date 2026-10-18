@@ -140,6 +140,28 @@ test-minio:
     OS_SHIM_MINIO_SECRET_KEY=os-shim-secret \
         cargo test {{minio_tests}} bucket::parity_tests -- --nocapture
 
+# The `s3` client's tests compile only under `cfg(s3_tests)`, which no other
+# recipe sets.
+s3_tests := "--features s3 --config 'build.rustflags=[\"--cfg\", \"s3_tests\"]'"
+
+# Lint, then run, the `s3` client's tests against the AWS bucket the environment
+# names. Writes under a prefix of its own and removes what it wrote.
+test-s3:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    missing=()
+    for name in OS_SHIM_S3_REGION OS_SHIM_S3_BUCKET AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+        [ -n "${!name:-}" ] || missing+=("$name")
+    done
+    if [ "${#missing[@]}" -gt 0 ]; then
+        echo "test-s3 needs: ${missing[*]}" >&2
+        exit 1
+    fi
+    echo "Linting S3 tests..."
+    cargo clippy --all-targets {{s3_tests}} -- -D warnings
+    echo "Running S3 tests against AWS..."
+    cargo test {{s3_tests}} bucket::parity_tests -- --nocapture
+
 # Run tests with output
 test-verbose:
     @echo "Running tests (verbose)..."
