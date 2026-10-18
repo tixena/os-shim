@@ -1,20 +1,29 @@
-//! Parity of `MemoryBucket` and `MinioBucket` on a real server: each sequence
-//! runs against both and the two transcripts must be equal.
+//! Parity of `MemoryBucket` with a real server: each sequence runs against both
+//! and the two transcripts must be equal. `minio_tests` runs them against a
+//! MinIO-compatible server, `s3_tests` against an AWS bucket.
 
 use super::{
-    BlockingBucket, Bucket, Condition, MemoryBucket, MinioBucket, MinioConfig, Object, ObjectError,
-    ObjectErrorKind,
+    BlockingBucket, Bucket, Condition, MemoryBucket, Object, ObjectError, ObjectErrorKind,
 };
+#[cfg(minio_tests)]
+use super::{MinioBucket, MinioConfig};
+#[cfg(s3_tests)]
+use super::{S3Bucket, S3Config};
+#[cfg(minio_tests)]
+use aws_sdk_s3::operation::create_bucket::CreateBucketError;
 use aws_sdk_s3::{
     Client, Config,
     config::{BehaviorVersion, Credentials, Region, retry::RetryConfig},
     error::SdkError,
-    operation::create_bucket::CreateBucketError,
 };
 use std::env;
+#[cfg(s3_tests)]
+use std::process;
+#[cfg(minio_tests)]
 use std::sync::OnceLock;
 use tokio::runtime::{Builder, Runtime};
 
+#[cfg(minio_tests)]
 /// The server's address and keys from the environment, for the bucket `os-shim-tests`.
 fn config() -> MinioConfig {
     MinioConfig::new(
@@ -26,6 +35,7 @@ fn config() -> MinioConfig {
     )
 }
 
+#[cfg(minio_tests)]
 /// An SDK client configured the way `MinioBucket::new` configures its own.
 fn client(config: &MinioConfig) -> Client {
     let credentials = Credentials::new(
@@ -51,6 +61,7 @@ fn runtime() -> Runtime {
     Builder::new_current_thread().enable_all().build().unwrap()
 }
 
+#[cfg(minio_tests)]
 /// The configuration of a server whose bucket exists, created once per test binary.
 fn ready_config() -> MinioConfig {
     static CREATED: OnceLock<()> = OnceLock::new();
@@ -79,6 +90,7 @@ fn memory() -> BlockingBucket<MemoryBucket> {
     BlockingBucket::new(MemoryBucket::default()).unwrap()
 }
 
+#[cfg(minio_tests)]
 /// The server side of a parity test.
 fn server() -> BlockingBucket<MinioBucket> {
     BlockingBucket::new(MinioBucket::new(ready_config())).unwrap()
@@ -236,6 +248,7 @@ fn status<T, E>(answer: &Result<T, SdkError<E>>) -> String {
     }
 }
 
+#[cfg(minio_tests)]
 #[test]
 fn put_and_get_agree_with_the_server() {
     assert_agree(
@@ -245,6 +258,7 @@ fn put_and_get_agree_with_the_server() {
     );
 }
 
+#[cfg(minio_tests)]
 #[test]
 fn conditional_writes_agree_with_the_server() {
     assert_agree(
@@ -254,6 +268,7 @@ fn conditional_writes_agree_with_the_server() {
     );
 }
 
+#[cfg(minio_tests)]
 #[test]
 fn missing_key_deletes_agree_with_the_server() {
     assert_agree(
@@ -263,6 +278,7 @@ fn missing_key_deletes_agree_with_the_server() {
     );
 }
 
+#[cfg(minio_tests)]
 #[test]
 fn same_bytes_tags_agree_with_the_server() {
     assert_agree(
@@ -272,6 +288,7 @@ fn same_bytes_tags_agree_with_the_server() {
     );
 }
 
+#[cfg(minio_tests)]
 #[test]
 fn long_listing_agrees_with_the_server() {
     assert_agree(
@@ -281,6 +298,7 @@ fn long_listing_agrees_with_the_server() {
     );
 }
 
+#[cfg(minio_tests)]
 #[test]
 fn empty_listing_agrees_with_the_server() {
     assert_agree(
@@ -290,6 +308,7 @@ fn empty_listing_agrees_with_the_server() {
     );
 }
 
+#[cfg(minio_tests)]
 #[test]
 fn observe_a_raw_delete_with_a_wrong_if_match() {
     let config = ready_config();
@@ -308,6 +327,7 @@ fn observe_a_raw_delete_with_a_wrong_if_match() {
     eprintln!("object afterwards: {}", get_line(&bucket.get(key)));
 }
 
+#[cfg(minio_tests)]
 #[test]
 fn observe_a_put_with_the_tag_stripped_of_its_quotes() {
     let bucket = server();
@@ -320,4 +340,165 @@ fn observe_a_put_with_the_tag_stripped_of_its_quotes() {
     );
     eprintln!("put with an unquoted tag: {}", put_line(&answer));
     eprintln!("object afterwards: {}", get_line(&bucket.get(key)));
+}
+
+/// The value of an environment variable the S3 tests need.
+#[cfg(s3_tests)]
+fn aws_variable(name: &str) -> String {
+    env::var(name).unwrap()
+}
+
+/// The AWS bucket the environment names.
+#[cfg(s3_tests)]
+fn aws() -> BlockingBucket<S3Bucket> {
+    BlockingBucket::new(S3Bucket::new(S3Config::new(
+        aws_variable("OS_SHIM_S3_REGION"),
+        aws_variable("OS_SHIM_S3_BUCKET"),
+        aws_variable("AWS_ACCESS_KEY_ID"),
+        aws_variable("AWS_SECRET_ACCESS_KEY"),
+    )))
+    .unwrap()
+}
+
+/// An SDK client for the AWS bucket the environment names.
+#[cfg(s3_tests)]
+fn aws_client() -> Client {
+    let credentials = Credentials::new(
+        aws_variable("AWS_ACCESS_KEY_ID"),
+        aws_variable("AWS_SECRET_ACCESS_KEY"),
+        None,
+        None,
+        "os-shim",
+    );
+    let sdk = Config::builder()
+        .behavior_version(BehaviorVersion::latest())
+        .region(Region::new(aws_variable("OS_SHIM_S3_REGION")))
+        .credentials_provider(credentials)
+        .retry_config(RetryConfig::disabled())
+        .build();
+    Client::from_conf(sdk)
+}
+
+/// A key prefix no other run or sequence shares.
+#[cfg(s3_tests)]
+fn run_prefix(name: &str) -> String {
+    format!("os-shim-tests/{}-{name}/", process::id())
+}
+
+/// Delete every key under `prefix`.
+#[cfg(s3_tests)]
+fn remove_prefix(bucket: &BlockingBucket<S3Bucket>, prefix: &str) {
+    for key in bucket.list(prefix).unwrap() {
+        bucket.delete(&key, &Condition::None).unwrap();
+    }
+}
+
+/// The transcript of `sequence` on AWS under a prefix of its own, removed before this returns.
+#[cfg(s3_tests)]
+fn aws_transcript(
+    name: &str,
+    sequence: impl Fn(&BlockingBucket<S3Bucket>, &str) -> Vec<String>,
+) -> Vec<String> {
+    let bucket = aws();
+    let prefix = run_prefix(name);
+    let transcript = sequence(&bucket, &prefix);
+    remove_prefix(&bucket, &prefix);
+    transcript
+}
+
+#[cfg(s3_tests)]
+#[test]
+fn put_and_get_agree_with_aws() {
+    assert_agree(
+        "put and get",
+        &put_and_get(&memory(), "a/"),
+        &aws_transcript("put-and-get", put_and_get),
+    );
+}
+
+#[cfg(s3_tests)]
+#[test]
+fn conditional_writes_agree_with_aws() {
+    assert_agree(
+        "conditional writes",
+        &conditional_writes(&memory(), "a/"),
+        &aws_transcript("conditional-writes", conditional_writes),
+    );
+}
+
+#[cfg(s3_tests)]
+#[test]
+fn missing_key_deletes_agree_with_aws() {
+    assert_agree(
+        "missing key deletes",
+        &missing_key_deletes(&memory(), "a/"),
+        &aws_transcript("missing-key-deletes", missing_key_deletes),
+    );
+}
+
+#[cfg(s3_tests)]
+#[test]
+fn same_bytes_tags_agree_with_aws() {
+    assert_agree(
+        "same bytes tags",
+        &same_bytes_tags(&memory(), "a/"),
+        &aws_transcript("same-bytes-tags", same_bytes_tags),
+    );
+}
+
+#[cfg(s3_tests)]
+#[test]
+fn long_listing_agrees_with_aws() {
+    assert_agree(
+        "long listing",
+        &long_listing(&memory(), "a/"),
+        &aws_transcript("long-listing", long_listing),
+    );
+}
+
+#[cfg(s3_tests)]
+#[test]
+fn empty_listing_agrees_with_aws() {
+    assert_agree(
+        "empty listing",
+        &empty_listing(&memory(), "a/"),
+        &aws_transcript("empty-listing", empty_listing),
+    );
+}
+
+#[cfg(s3_tests)]
+#[test]
+fn observe_a_raw_delete_with_a_wrong_if_match_on_aws() {
+    let bucket = aws();
+    let prefix = run_prefix("observe-raw-delete");
+    let key = format!("{prefix}note.md");
+    bucket.put(&key, b"kept", &Condition::None).unwrap();
+    let answer = runtime().block_on(
+        aws_client()
+            .delete_object()
+            .bucket(aws_variable("OS_SHIM_S3_BUCKET"))
+            .key(&key)
+            .if_match("\"0123456789abcdef0123456789abcdef\"")
+            .send(),
+    );
+    eprintln!("raw delete with a wrong If-Match: {}", status(&answer));
+    eprintln!("object afterwards: {}", get_line(&bucket.get(&key)));
+    remove_prefix(&bucket, &prefix);
+}
+
+#[cfg(s3_tests)]
+#[test]
+fn observe_a_put_with_the_tag_stripped_of_its_quotes_on_aws() {
+    let bucket = aws();
+    let prefix = run_prefix("observe-unquoted-tag");
+    let key = format!("{prefix}note.md");
+    let tag = bucket.put(&key, b"first", &Condition::None).unwrap();
+    let answer = bucket.put(
+        &key,
+        b"second",
+        &Condition::ETag(tag.trim_matches('"').to_owned()),
+    );
+    eprintln!("put with an unquoted tag: {}", put_line(&answer));
+    eprintln!("object afterwards: {}", get_line(&bucket.get(&key)));
+    remove_prefix(&bucket, &prefix);
 }

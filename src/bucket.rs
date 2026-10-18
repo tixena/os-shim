@@ -704,7 +704,7 @@ fn tag_of(bytes: &[u8]) -> String {
 )]
 mod tests;
 
-#[cfg(minio_tests)]
+#[cfg(any(minio_tests, s3_tests))]
 #[cfg(test)]
 #[expect(
     clippy::unwrap_used,
