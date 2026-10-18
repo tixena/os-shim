@@ -45,7 +45,7 @@ default = []
 async = []
 minio = ["dep:tokio", "dep:aws-sdk-s3"]
 process = ["libc"]
-s3 = ["dep:tokio"]
+s3 = ["dep:tokio", "dep:aws-sdk-s3"]
 zip = ["dep:zip", "dep:time"]
 
 [lints.clippy]

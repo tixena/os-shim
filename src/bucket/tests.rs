@@ -1,13 +1,15 @@
-//! Tests for the in-memory bucket, the blocking wrapper, the bucket error and the `MinIO` client.
+//! Tests for the in-memory bucket, the blocking wrapper, the bucket error and the `MinIO` and AWS S3 clients.
 
 use super::{BlockingBucket, Bucket as _, Condition, MemoryBucket, ObjectError, ObjectErrorKind};
 #[cfg(feature = "minio")]
 use super::{MinioBucket, MinioConfig};
-#[cfg(feature = "minio")]
+#[cfg(feature = "s3")]
+use super::{S3Bucket, S3Config};
+#[cfg(any(feature = "minio", feature = "s3"))]
 use alloc::sync::Arc;
 use core::error::Error as _;
 use std::io;
-#[cfg(feature = "minio")]
+#[cfg(any(feature = "minio", feature = "s3"))]
 use std::{
     io::{BufRead as _, BufReader, Read as _, Write as _},
     net::{TcpListener, TcpStream},
@@ -218,7 +220,7 @@ async fn blocking_inside_a_runtime_panics() {
 }
 
 /// Serve `answers` in order, one per request, and record each request's method and conditional headers.
-#[cfg(feature = "minio")]
+#[cfg(any(feature = "minio", feature = "s3"))]
 fn canned(answers: Vec<String>) -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -229,7 +231,7 @@ fn canned(answers: Vec<String>) -> (String, Arc<Mutex<Vec<String>>>) {
 }
 
 /// Answer each request on every connection with the next answer, until none is left.
-#[cfg(feature = "minio")]
+#[cfg(any(feature = "minio", feature = "s3"))]
 fn serve(listener: &TcpListener, answers: Vec<String>, log: &Mutex<Vec<String>>) {
     let mut pending = answers.into_iter();
     for incoming in listener.incoming() {
@@ -250,7 +252,7 @@ fn serve(listener: &TcpListener, answers: Vec<String>, log: &Mutex<Vec<String>>)
 }
 
 /// The rest of the request that starts with `request_line`, read off `reader`, as its method and conditional headers.
-#[cfg(feature = "minio")]
+#[cfg(any(feature = "minio", feature = "s3"))]
 fn read_request(request_line: &str, reader: &mut BufReader<TcpStream>) -> String {
     let mut length = 0_u64;
     let mut if_match = String::from("-");
@@ -277,7 +279,7 @@ fn read_request(request_line: &str, reader: &mut BufReader<TcpStream>) -> String
 }
 
 /// An HTTP answer with `status`, the header lines in `headers` and `body`.
-#[cfg(feature = "minio")]
+#[cfg(any(feature = "minio", feature = "s3"))]
 fn answer(status: &str, headers: &str, body: &str) -> String {
     format!(
         "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\n\r\n{body}",
@@ -303,7 +305,7 @@ fn page(key: &str, next: Option<&str>) -> String {
 }
 
 /// The requests the canned server has seen so far.
-#[cfg(feature = "minio")]
+#[cfg(any(feature = "minio", feature = "s3"))]
 fn requests(seen: &Mutex<Vec<String>>) -> Vec<String> {
     seen.lock().unwrap().clone()
 }
@@ -460,4 +462,101 @@ fn minio_get_with_nothing_listening_is_other() {
         .get("task.md")
         .unwrap_err();
     assert_eq!(error.kind(), ObjectErrorKind::Other);
+}
+
+/// The configuration every AWS S3 scenario uses.
+#[cfg(feature = "s3")]
+fn s3_config() -> S3Config {
+    S3Config::new(
+        "us-east-1".to_owned(),
+        "archie".to_owned(),
+        "os-shim".to_owned(),
+        "os-shim-secret".to_owned(),
+    )
+}
+
+/// A blocking AWS S3 client that reaches the canned server at `endpoint`.
+#[cfg(feature = "s3")]
+fn s3(endpoint: &str) -> BlockingBucket<S3Bucket> {
+    let sdk = S3Bucket::sdk_config(s3_config())
+        .endpoint_url(endpoint)
+        .force_path_style(true)
+        .build();
+    BlockingBucket::new(S3Bucket::with_sdk_config("archie".to_owned(), sdk)).unwrap()
+}
+
+#[cfg(feature = "s3")]
+#[test]
+fn s3_delete_with_the_current_tag_sends_one_delete_with_if_match() {
+    let (endpoint, seen) = canned(vec![answer("204 No Content", "", "")]);
+    s3(&endpoint)
+        .delete("task.md", &Condition::ETag("\"a\"".to_owned()))
+        .unwrap();
+    assert_eq!(requests(&seen), ["DELETE if-match=\"a\""]);
+}
+
+#[cfg(feature = "s3")]
+#[test]
+fn s3_delete_with_a_stale_tag_answered_412_is_precondition_failed() {
+    let (endpoint, seen) = canned(vec![answer("412 Precondition Failed", "", "")]);
+    let error = s3(&endpoint)
+        .delete("task.md", &Condition::ETag("\"a\"".to_owned()))
+        .unwrap_err();
+    assert_eq!(error.kind(), ObjectErrorKind::PreconditionFailed);
+    assert_eq!(requests(&seen), ["DELETE if-match=\"a\""]);
+}
+
+#[cfg(feature = "s3")]
+#[test]
+fn s3_delete_with_a_tag_of_a_missing_object_is_precondition_failed() {
+    let (endpoint, seen) = canned(vec![answer("404 Not Found", "", "")]);
+    let error = s3(&endpoint)
+        .delete("task.md", &Condition::ETag("\"a\"".to_owned()))
+        .unwrap_err();
+    assert_eq!(error.kind(), ObjectErrorKind::PreconditionFailed);
+    assert_eq!(requests(&seen), ["DELETE if-match=\"a\""]);
+}
+
+#[cfg(feature = "s3")]
+#[test]
+fn s3_delete_with_no_condition_sends_one_delete() {
+    let (endpoint, seen) = canned(vec![answer("204 No Content", "", "")]);
+    s3(&endpoint).delete("task.md", &Condition::None).unwrap();
+    assert_eq!(requests(&seen), ["DELETE if-match=-"]);
+}
+
+#[cfg(feature = "s3")]
+#[test]
+fn s3_get_answered_404_is_not_found() {
+    let (endpoint, _seen) = canned(vec![answer("404 Not Found", "", "")]);
+    let error = s3(&endpoint).get("task.md").unwrap_err();
+    assert_eq!(error.kind(), ObjectErrorKind::NotFound);
+}
+
+#[cfg(feature = "s3")]
+#[test]
+fn s3_put_with_absent_answered_412_is_precondition_failed() {
+    let (endpoint, _seen) = canned(vec![answer("412 Precondition Failed", "", "")]);
+    let error = s3(&endpoint)
+        .put("task.md", b"x", &Condition::Absent)
+        .unwrap_err();
+    assert_eq!(error.kind(), ObjectErrorKind::PreconditionFailed);
+}
+
+#[cfg(feature = "s3")]
+#[test]
+fn s3_get_answered_503_is_other_after_one_request() {
+    let unavailable = answer("503 Service Unavailable", "", "");
+    let (endpoint, seen) = canned(vec![unavailable.clone(), unavailable.clone(), unavailable]);
+    let error = s3(&endpoint).get("task.md").unwrap_err();
+    assert_eq!(error.kind(), ObjectErrorKind::Other);
+    assert_eq!(requests(&seen), ["GET if-match=-"]);
+}
+
+#[cfg(feature = "s3")]
+#[test]
+fn s3_config_debug_keeps_the_secret_key_out() {
+    let shown = format!("{:?}", s3_config());
+    assert!(shown.contains("<redacted>"));
+    assert!(!shown.contains("os-shim-secret"));
 }
