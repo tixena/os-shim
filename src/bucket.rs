@@ -703,3 +703,11 @@ fn tag_of(bytes: &[u8]) -> String {
     reason = "Tests use unwrap for brevity; panics indicate test failure"
 )]
 mod tests;
+
+#[cfg(minio_tests)]
+#[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "Tests use unwrap for brevity; panics indicate test failure"
+)]
+mod parity_tests;

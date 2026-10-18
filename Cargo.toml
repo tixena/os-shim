@@ -67,4 +67,5 @@ print_stderr = "allow"
 
 [lints.rust]
 # `slow_tests` gates the opt-in expensive tests; `just test-slow` sets it.
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(slow_tests)"] }
+# `minio_tests` gates the tests against a MinIO-compatible server; `just test-minio` sets it.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(slow_tests)", "cfg(minio_tests)"] }

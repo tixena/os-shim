@@ -115,6 +115,31 @@ test-slow:
     @echo "Running expensive tests..."
     cargo test {{slow_tests}} -- --nocapture
 
+# The `minio` client's tests compile only under `cfg(minio_tests)`, which no other
+# recipe sets.
+minio_tests := "--features minio --config 'build.rustflags=[\"--cfg\", \"minio_tests\"]'"
+
+# Lint, then run, the `minio` client's tests against a RustFS server in a
+# container of their own on port 9100, removed afterwards. Needs docker.
+test-minio:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "Linting MinIO tests..."
+    cargo clippy --all-targets {{minio_tests}} -- -D warnings
+    docker run -d --rm --name os-shim-rustfs -p 9100:9000 \
+        -e RUSTFS_ACCESS_KEY=os-shim -e RUSTFS_SECRET_KEY=os-shim-secret \
+        rustfs/rustfs:1.0.0-beta.8 > /dev/null
+    trap 'docker stop os-shim-rustfs > /dev/null' EXIT
+    for _ in $(seq 1 50); do
+        curl -s -o /dev/null http://127.0.0.1:9100/ && break
+        sleep 0.2
+    done
+    echo "Running MinIO tests against RustFS..."
+    OS_SHIM_MINIO_ENDPOINT=http://127.0.0.1:9100 \
+    OS_SHIM_MINIO_ACCESS_KEY=os-shim \
+    OS_SHIM_MINIO_SECRET_KEY=os-shim-secret \
+        cargo test {{minio_tests}} bucket::parity_tests -- --nocapture
+
 # Run tests with output
 test-verbose:
     @echo "Running tests (verbose)..."
