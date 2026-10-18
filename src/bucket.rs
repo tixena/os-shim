@@ -6,7 +6,9 @@ mod interface;
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
-#[cfg(feature = "minio")]
+#[cfg(feature = "s3")]
+use aws_sdk_s3::config::Builder as ConfigBuilder;
+#[cfg(any(feature = "minio", feature = "s3"))]
 use aws_sdk_s3::{
     Client, Config,
     config::{BehaviorVersion, Credentials, Region, retry::RetryConfig},
@@ -290,8 +292,8 @@ impl<B: Bucket> BlockingBucket<B> {
     }
 }
 
-/// A bucket reached through AWS's S3 SDK, which `MinioBucket` wraps.
-#[cfg(feature = "minio")]
+/// A bucket reached through AWS's S3 SDK, which `MinioBucket` and `S3Bucket` wrap.
+#[cfg(any(feature = "minio", feature = "s3"))]
 #[derive(Debug)]
 struct SdkBucket {
     /// The bucket every operation reaches.
@@ -302,7 +304,7 @@ struct SdkBucket {
     client: Client,
 }
 
-#[cfg(feature = "minio")]
+#[cfg(any(feature = "minio", feature = "s3"))]
 impl SdkBucket {
     /// The entity tag of the object at `key`, or `None` when no object is there.
     async fn current_tag(&self, key: &str) -> Result<Option<String>, ObjectError> {
@@ -537,8 +539,128 @@ impl Bucket for MinioBucket {
     }
 }
 
+/// The AWS S3 bucket to reach, and the keys that sign every request.
+#[cfg(feature = "s3")]
+#[derive(Clone)]
+#[non_exhaustive]
+pub struct S3Config {
+    /// The access key.
+    pub access_key: String,
+    /// The bucket every operation reaches.
+    pub bucket: String,
+    /// The bucket's region, such as `us-east-1`.
+    pub region: String,
+    /// The secret key; `Debug` prints it as `<redacted>`.
+    pub secret_key: String,
+}
+
+#[cfg(feature = "s3")]
+impl S3Config {
+    /// A configuration from its four parts.
+    #[inline]
+    #[must_use]
+    pub const fn new(
+        region: String,
+        bucket: String,
+        access_key: String,
+        secret_key: String,
+    ) -> Self {
+        Self {
+            access_key,
+            bucket,
+            region,
+            secret_key,
+        }
+    }
+}
+
+#[cfg(feature = "s3")]
+impl fmt::Debug for S3Config {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("S3Config")
+            .field("access_key", &self.access_key)
+            .field("bucket", &self.bucket)
+            .field("region", &self.region)
+            .field("secret_key", &"<redacted>")
+            .finish()
+    }
+}
+
+/// A client for an AWS S3 bucket, over AWS's SDK.
+///
+/// A delete with an entity-tag condition sends `If-Match` and lets AWS check it.
+#[cfg(feature = "s3")]
+#[derive(Debug)]
+pub struct S3Bucket(
+    /// The SDK bucket every call goes through.
+    SdkBucket,
+);
+
+#[cfg(feature = "s3")]
+impl S3Bucket {
+    /// A client for `config.bucket` in `config.region`, with no retries.
+    #[inline]
+    #[must_use]
+    pub fn new(config: S3Config) -> Self {
+        Self::with_sdk_config(config.bucket.clone(), Self::sdk_config(config).build())
+    }
+
+    /// The SDK configuration for `config`, before any endpoint is set.
+    fn sdk_config(config: S3Config) -> ConfigBuilder {
+        let credentials =
+            Credentials::new(config.access_key, config.secret_key, None, None, "os-shim");
+        Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new(config.region))
+            .credentials_provider(credentials)
+            .retry_config(RetryConfig::disabled())
+    }
+
+    /// A client for `bucket` over the SDK configuration `sdk`.
+    fn with_sdk_config(bucket: String, sdk: Config) -> Self {
+        Self(SdkBucket {
+            bucket,
+            check_before_delete: false,
+            client: Client::from_conf(sdk),
+        })
+    }
+}
+
+#[cfg(feature = "s3")]
+impl Bucket for S3Bucket {
+    #[inline]
+    fn delete(
+        &self,
+        key: &str,
+        condition: &Condition,
+    ) -> impl Future<Output = Result<(), ObjectError>> + Send {
+        self.0.delete(key, condition)
+    }
+
+    #[inline]
+    fn get(&self, key: &str) -> impl Future<Output = Result<Object, ObjectError>> + Send {
+        self.0.get(key)
+    }
+
+    #[inline]
+    fn list(&self, prefix: &str) -> impl Future<Output = Result<Vec<String>, ObjectError>> + Send {
+        self.0.list(prefix)
+    }
+
+    #[inline]
+    fn put(
+        &self,
+        key: &str,
+        bytes: &[u8],
+        condition: &Condition,
+    ) -> impl Future<Output = Result<String, ObjectError>> + Send {
+        self.0.put(key, bytes, condition)
+    }
+}
+
 /// The error for an SDK failure: 404 is `NotFound`, 412 is `PreconditionFailed`, anything else is `Other`.
-#[cfg(feature = "minio")]
+#[cfg(any(feature = "minio", feature = "s3"))]
 fn classify<E>(error: SdkError<E>) -> ObjectError
 where
     E: Error + Send + Sync + 'static,
@@ -563,7 +685,7 @@ fn holds(condition: &Condition, current: Option<&Vec<u8>>) -> bool {
 }
 
 /// The error for an answer that should carry an `ETag` header and does not.
-#[cfg(feature = "minio")]
+#[cfg(any(feature = "minio", feature = "s3"))]
 fn missing_etag() -> ObjectError {
     ObjectError::from(io::Error::other("the answer carries no ETag header"))
 }
