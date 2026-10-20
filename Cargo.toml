@@ -13,33 +13,33 @@ include = ["/src/**/*.rs", "/README.md", "/LICENSE"]
 
 [dependencies]
 # Real filesystem implementation
-tempfile = "3"
-ignore = "0.4"
+tempfile = "3.7.0"
+ignore = "0.4.17"
 
 # Mock implementation logging
-tracing = "0.1"
+tracing = "0.1.40"
 
 # Zip archive streaming (optional)
-zip = { version = "9.0.5", default-features = false, features = [
+zip = { version = "9.0.0", default-features = false, features = [
     "deflate-flate2-zlib-rs",
     "time",
 ], optional = true }
-time = { version = "0.3.55", optional = true }
+time = { version = "0.3.47", optional = true }
 
 # Process operations (optional)
 libc = { version = "0.2", optional = true }
 
 # Bucket clients (optional): BlockingBucket's runtime
-tokio = { version = "1.54.0", features = ["rt"], optional = true }
+tokio = { version = "1.44.2", features = ["rt"], optional = true }
 
 # Bucket clients (optional): AWS's S3 SDK, for MinIO-compatible servers and for AWS S3
-aws-sdk-s3 = { version = "1.152.0", default-features = false, features = [
+aws-sdk-s3 = { version = "1.144.0", default-features = false, features = [
     "default-https-client",
     "rt-tokio",
 ], optional = true }
 
 [dev-dependencies]
-tokio = { version = "1.54.0", features = ["rt", "macros"] }
+tokio = { version = "1.44.2", features = ["rt", "macros"] }
 
 [features]
 default = []
