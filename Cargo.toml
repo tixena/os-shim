@@ -9,6 +9,7 @@ repository = "https://github.com/tixena/os-shim"
 keywords = ["testing", "mock", "filesystem", "abstraction"]
 categories = ["development-tools::testing", "filesystem"]
 readme = "README.md"
+include = ["/src/**/*.rs", "/README.md", "/LICENSE"]
 
 [dependencies]
 # Real filesystem implementation
