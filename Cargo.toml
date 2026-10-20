@@ -28,9 +28,24 @@ time = { version = "0.3.55", optional = true }
 # Process operations (optional)
 libc = { version = "0.2", optional = true }
 
+# Bucket clients (optional): BlockingBucket's runtime
+tokio = { version = "1.53.3", features = ["rt"], optional = true }
+
+# Bucket clients (optional): AWS's S3 SDK, for MinIO-compatible servers and for AWS S3
+aws-sdk-s3 = { version = "1.152.0", default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1.53.3", features = ["rt", "macros"] }
+
 [features]
 default = []
+async = []
+minio = ["dep:tokio", "dep:aws-sdk-s3"]
 process = ["libc"]
+s3 = ["dep:tokio", "dep:aws-sdk-s3"]
 zip = ["dep:zip", "dep:time"]
 
 [lints.clippy]
@@ -52,4 +67,6 @@ print_stderr = "allow"
 
 [lints.rust]
 # `slow_tests` gates the opt-in expensive tests; `just test-slow` sets it.
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(slow_tests)"] }
+# `minio_tests` gates the tests against a MinIO-compatible server; `just test-minio` sets it.
+# `s3_tests` gates the tests against an AWS bucket; `just test-s3` sets it.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(slow_tests)", "cfg(minio_tests)", "cfg(s3_tests)"] }
