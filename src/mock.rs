@@ -731,8 +731,31 @@ impl System for MemorySystem {
         Self::check_no_file_above(&state.files, from)?;
         Self::check_no_file_above(&state.files, to)?;
 
+        if state.files.contains_key(from) && state.dirs.contains(to) {
+            return Err(io::Error::new(
+                io::ErrorKind::IsADirectory,
+                format!("Is a directory: {}", to.display()),
+            ));
+        }
+        if state.dirs.contains(from) {
+            if state.files.contains_key(to) {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotADirectory,
+                    format!("Not a directory: {}", to.display()),
+                ));
+            }
+            if let Some(parent) = to.parent()
+                && !state.dirs.contains(parent)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("Parent directory does not exist: {}", parent.display()),
+                ));
+            }
+        }
+
         // Handle file rename
-        if let Some(contents) = state.files.remove(from) {
+        if state.files.contains_key(from) {
             // Ensure parent directories for destination exist
             if let Some(parent) = to.parent()
                 && !state.dirs.contains(parent)
@@ -742,6 +765,7 @@ impl System for MemorySystem {
                     format!("Parent directory does not exist: {}", parent.display()),
                 ));
             }
+            let contents = state.files.remove(from).unwrap_or_default();
             state.files.insert(to.to_path_buf(), contents);
             state.modified.remove(from);
             let now = state.now;
