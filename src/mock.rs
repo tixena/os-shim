@@ -127,6 +127,20 @@ impl MemorySystem {
         Ok(())
     }
 
+    /// Fail with `NotADirectory` when a proper ancestor of `path` is a file, as
+    /// resolving `path` on disk does.
+    fn check_no_file_above(files: &BTreeMap<PathBuf, Vec<u8>>, path: &Path) -> io::Result<()> {
+        path.ancestors()
+            .skip(1)
+            .find(|ancestor| files.contains_key(*ancestor))
+            .map_or(Ok(()), |file| {
+                Err(io::Error::new(
+                    io::ErrorKind::NotADirectory,
+                    format!("Not a directory: {}", file.display()),
+                ))
+            })
+    }
+
     /// Ensure all ancestor directories exist for a given path.
     #[inline]
     fn ensure_parent_dirs(dirs: &mut BTreeSet<PathBuf>, path: &Path) {
@@ -380,6 +394,7 @@ impl System for MemorySystem {
                 .state
                 .read()
                 .map_err(|err| io::Error::other(err.to_string()))?;
+            Self::check_no_file_above(&state.files, from)?;
             state
                 .files
                 .get(from)
@@ -401,6 +416,13 @@ impl System for MemorySystem {
 
     #[inline]
     fn create(&self, path: &Path) -> io::Result<Box<dyn Write + '_>> {
+        let state = self
+            .state
+            .read()
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        Self::check_no_file_above(&state.files, path)?;
+        drop(state);
+
         // For create, we need a writer that updates the mock filesystem
         // We'll use a custom writer that captures bytes
         Ok(Box::new(MemoryWriter {
@@ -416,6 +438,13 @@ impl System for MemorySystem {
             .state
             .write()
             .map_err(|err| io::Error::other(err.to_string()))?;
+        if state.files.contains_key(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("File exists: {}", path.display()),
+            ));
+        }
+        Self::check_no_file_above(&state.files, path)?;
         Self::ensure_parent_dirs(&mut state.dirs, path);
         drop(state);
         Ok(())
@@ -512,6 +541,7 @@ impl System for MemorySystem {
             .state
             .read()
             .map_err(|err| io::Error::other(err.to_string()))?;
+        Self::check_no_file_above(&state.files, path)?;
 
         let is_dir = state.dirs.contains(path);
         let is_file = state.files.contains_key(path);
@@ -553,6 +583,7 @@ impl System for MemorySystem {
             .state
             .read()
             .map_err(|err| io::Error::other(err.to_string()))?;
+        Self::check_no_file_above(&state.files, path)?;
         let bytes = state.files.get(path).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -566,6 +597,13 @@ impl System for MemorySystem {
 
     #[inline]
     fn open_append(&self, path: &Path) -> io::Result<Box<dyn Write + '_>> {
+        let state = self
+            .state
+            .read()
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        Self::check_no_file_above(&state.files, path)?;
+        drop(state);
+
         Ok(Box::new(MemoryAppendWriter {
             buffer: Vec::new(),
             path: path.to_path_buf(),
@@ -579,6 +617,7 @@ impl System for MemorySystem {
             .state
             .read()
             .map_err(|err| io::Error::other(err.to_string()))?;
+        Self::check_no_file_above(&state.files, path)?;
 
         if !state.dirs.contains(path) {
             return Err(io::Error::new(
@@ -618,6 +657,7 @@ impl System for MemorySystem {
             .state
             .read()
             .map_err(|err| io::Error::other(err.to_string()))?;
+        Self::check_no_file_above(&state.files, path)?;
         let bytes = state.files.get(path).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -637,6 +677,7 @@ impl System for MemorySystem {
             .state
             .write()
             .map_err(|err| io::Error::other(err.to_string()))?;
+        Self::check_no_file_above(&state.files, path)?;
 
         // Match RealSystem (fs::remove_dir_all): a missing path is NotFound.
         if !state.dirs.remove(path) {
@@ -666,6 +707,7 @@ impl System for MemorySystem {
             .state
             .write()
             .map_err(|err| io::Error::other(err.to_string()))?;
+        Self::check_no_file_above(&state.files, path)?;
 
         if !state.files.contains_key(path) {
             return Err(io::Error::new(
@@ -686,6 +728,8 @@ impl System for MemorySystem {
             .state
             .write()
             .map_err(|err| io::Error::other(err.to_string()))?;
+        Self::check_no_file_above(&state.files, from)?;
+        Self::check_no_file_above(&state.files, to)?;
 
         // Handle file rename
         if let Some(contents) = state.files.remove(from) {
@@ -856,6 +900,7 @@ impl System for MemorySystem {
             .state
             .write()
             .map_err(|err| io::Error::other(err.to_string()))?;
+        Self::check_no_file_above(&state.files, path)?;
 
         // Ensure parent directories exist
         if let Some(parent) = path.parent()
@@ -873,6 +918,13 @@ impl System for MemorySystem {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!("File exists: {}", path.display()),
+            ));
+        }
+
+        if state.dirs.contains(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::IsADirectory,
+                format!("Is a directory: {}", path.display()),
             ));
         }
 
