@@ -6,6 +6,7 @@
 
 use super::RealSystem;
 use crate::System as _;
+use crate::WriteMode;
 use std::env::VarError;
 use std::io::{self, Read as _, Write as _};
 use std::path::Path;
@@ -17,7 +18,9 @@ fn write_then_read_to_string_roundtrips() {
     let tmp = system.create_temp_dir().unwrap();
     let file = tmp.path().join("hello.txt");
 
-    system.write(&file, b"hello world").unwrap();
+    system
+        .write(&file, b"hello world", WriteMode::Replace)
+        .unwrap();
     assert_eq!(system.read_to_string(&file).unwrap(), "hello world");
 }
 
@@ -27,8 +30,10 @@ fn write_truncates_existing_file() {
     let tmp = system.create_temp_dir().unwrap();
     let file = tmp.path().join("file.txt");
 
-    system.write(&file, b"first contents").unwrap();
-    system.write(&file, b"second").unwrap();
+    system
+        .write(&file, b"first contents", WriteMode::Replace)
+        .unwrap();
+    system.write(&file, b"second", WriteMode::Replace).unwrap();
     assert_eq!(system.read_to_string(&file).unwrap(), "second");
 }
 
@@ -39,7 +44,7 @@ fn copy_duplicates_file_and_returns_len() {
     let src = tmp.path().join("src.txt");
     let dest = tmp.path().join("dest.txt");
 
-    system.write(&src, b"payload").unwrap();
+    system.write(&src, b"payload", WriteMode::Replace).unwrap();
     let copied = system.copy(&src, &dest).unwrap();
 
     assert_eq!(copied, 7);
@@ -67,7 +72,9 @@ fn create_truncates_existing_file() {
     let tmp = system.create_temp_dir().unwrap();
     let file = tmp.path().join("file.txt");
 
-    system.write(&file, b"long original contents").unwrap();
+    system
+        .write(&file, b"long original contents", WriteMode::Replace)
+        .unwrap();
     let mut writer = system.create(&file).unwrap();
     writer.write_all(b"short").unwrap();
     writer.flush().unwrap();
@@ -140,7 +147,7 @@ fn exists_is_dir_is_file_classify_paths() {
     let dir = tmp.path().join("dir");
     let missing = tmp.path().join("missing");
 
-    system.write(&file, b"x").unwrap();
+    system.write(&file, b"x", WriteMode::Replace).unwrap();
     system.create_dir_all(&dir).unwrap();
 
     assert!(system.exists(&file).unwrap());
@@ -179,8 +186,8 @@ fn metadata_reports_len_for_known_and_empty_files() {
     let known = tmp.path().join("known.txt");
     let empty = tmp.path().join("empty.txt");
 
-    system.write(&known, b"12345").unwrap();
-    system.write(&empty, b"").unwrap();
+    system.write(&known, b"12345", WriteMode::Replace).unwrap();
+    system.write(&empty, b"", WriteMode::Replace).unwrap();
 
     let known_meta = system.metadata(&known).unwrap();
     assert!(known_meta.is_file);
@@ -213,7 +220,9 @@ fn open_reads_existing_contents() {
     let tmp = system.create_temp_dir().unwrap();
     let file = tmp.path().join("read.txt");
 
-    system.write(&file, b"readable").unwrap();
+    system
+        .write(&file, b"readable", WriteMode::Replace)
+        .unwrap();
     let mut reader = system.open(&file).unwrap();
     let mut contents = String::new();
     reader.read_to_string(&mut contents).unwrap();
@@ -258,8 +267,12 @@ fn read_dir_lists_direct_children() {
     let tmp = system.create_temp_dir().unwrap();
     let root = tmp.path();
 
-    system.write(&root.join("a.txt"), b"a").unwrap();
-    system.write(&root.join("b.txt"), b"b").unwrap();
+    system
+        .write(&root.join("a.txt"), b"a", WriteMode::Replace)
+        .unwrap();
+    system
+        .write(&root.join("b.txt"), b"b", WriteMode::Replace)
+        .unwrap();
     system.create_dir_all(&root.join("sub")).unwrap();
 
     let mut names: Vec<String> = system
@@ -284,7 +297,7 @@ fn remove_file_deletes_then_missing_is_not_found() {
     let tmp = system.create_temp_dir().unwrap();
     let file = tmp.path().join("doomed.txt");
 
-    system.write(&file, b"bye").unwrap();
+    system.write(&file, b"bye", WriteMode::Replace).unwrap();
     system.remove_file(&file).unwrap();
     assert!(!system.exists(&file).unwrap());
 
@@ -300,7 +313,11 @@ fn remove_dir_all_removes_tree_then_missing_is_not_found() {
 
     system.create_dir_all(&dir.join("nested")).unwrap();
     system
-        .write(&dir.join("nested").join("file.txt"), b"x")
+        .write(
+            &dir.join("nested").join("file.txt"),
+            b"x",
+            WriteMode::Replace,
+        )
         .unwrap();
 
     system.remove_dir_all(&dir).unwrap();
@@ -317,7 +334,7 @@ fn rename_moves_file() {
     let src = tmp.path().join("src.txt");
     let dest = tmp.path().join("dest.txt");
 
-    system.write(&src, b"content").unwrap();
+    system.write(&src, b"content", WriteMode::Replace).unwrap();
     system.rename(&src, &dest).unwrap();
 
     assert!(!system.exists(&src).unwrap());
@@ -331,8 +348,8 @@ fn rename_over_existing_target_overwrites() {
     let src = tmp.path().join("src.txt");
     let dest = tmp.path().join("dest.txt");
 
-    system.write(&src, b"new").unwrap();
-    system.write(&dest, b"old").unwrap();
+    system.write(&src, b"new", WriteMode::Replace).unwrap();
+    system.write(&dest, b"old", WriteMode::Replace).unwrap();
     system.rename(&src, &dest).unwrap();
 
     assert_eq!(system.read_to_string(&dest).unwrap(), "new");
@@ -354,7 +371,7 @@ fn canonicalize_resolves_existing_path() {
     let system = RealSystem::new();
     let tmp = system.create_temp_dir().unwrap();
     let file = tmp.path().join("real.txt");
-    system.write(&file, b"x").unwrap();
+    system.write(&file, b"x", WriteMode::Replace).unwrap();
 
     let canonical = system.canonicalize(&file).unwrap();
     assert!(canonical.is_absolute());
@@ -400,10 +417,16 @@ fn walk_dir_includes_nested_entries() {
     let tmp = system.create_temp_dir().unwrap();
     let root = tmp.path();
 
-    system.write(&root.join("top.txt"), b"t").unwrap();
+    system
+        .write(&root.join("top.txt"), b"t", WriteMode::Replace)
+        .unwrap();
     system.create_dir_all(&root.join("sub")).unwrap();
     system
-        .write(&root.join("sub").join("inner.txt"), b"i")
+        .write(
+            &root.join("sub").join("inner.txt"),
+            b"i",
+            WriteMode::Replace,
+        )
         .unwrap();
 
     let names = relative_walk_names(system, root, false, false);
@@ -419,8 +442,12 @@ fn walk_dir_hidden_true_includes_dotfiles() {
     let tmp = system.create_temp_dir().unwrap();
     let root = tmp.path();
 
-    system.write(&root.join("visible.txt"), b"v").unwrap();
-    system.write(&root.join(".secret"), b"s").unwrap();
+    system
+        .write(&root.join("visible.txt"), b"v", WriteMode::Replace)
+        .unwrap();
+    system
+        .write(&root.join(".secret"), b"s", WriteMode::Replace)
+        .unwrap();
 
     let names = relative_walk_names(system, root, false, true);
     assert_eq!(names, vec![".secret", "visible.txt"]);
@@ -432,8 +459,12 @@ fn walk_dir_hidden_false_excludes_dotfiles() {
     let tmp = system.create_temp_dir().unwrap();
     let root = tmp.path();
 
-    system.write(&root.join("visible.txt"), b"v").unwrap();
-    system.write(&root.join(".secret"), b"s").unwrap();
+    system
+        .write(&root.join("visible.txt"), b"v", WriteMode::Replace)
+        .unwrap();
+    system
+        .write(&root.join(".secret"), b"s", WriteMode::Replace)
+        .unwrap();
 
     let names = relative_walk_names(system, root, false, false);
     assert_eq!(names, vec!["visible.txt"]);
@@ -460,7 +491,9 @@ fn walk_dir_follow_links_true_descends_symlinked_dir() {
 
     let target = root.join("target");
     system.create_dir_all(&target).unwrap();
-    system.write(&target.join("inside.txt"), b"x").unwrap();
+    system
+        .write(&target.join("inside.txt"), b"x", WriteMode::Replace)
+        .unwrap();
 
     let walk_root = root.join("walk");
     system.create_dir_all(&walk_root).unwrap();
@@ -481,7 +514,9 @@ fn walk_dir_follow_links_false_does_not_descend_symlinked_dir() {
 
     let target = root.join("target");
     system.create_dir_all(&target).unwrap();
-    system.write(&target.join("inside.txt"), b"x").unwrap();
+    system
+        .write(&target.join("inside.txt"), b"x", WriteMode::Replace)
+        .unwrap();
 
     let walk_root = root.join("walk");
     system.create_dir_all(&walk_root).unwrap();

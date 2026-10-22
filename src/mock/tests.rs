@@ -42,7 +42,9 @@ fn metadata_modified_updates_on_write() {
         .with_now(start)
         .unwrap();
 
-    system.write(Path::new("/test/file.txt"), b"first").unwrap();
+    system
+        .write(Path::new("/test/file.txt"), b"first", WriteMode::Replace)
+        .unwrap();
     let mtime1 = system
         .metadata(Path::new("/test/file.txt"))
         .unwrap()
@@ -50,7 +52,7 @@ fn metadata_modified_updates_on_write() {
 
     system.advance(Duration::from_secs(1)).unwrap();
     system
-        .write(Path::new("/test/file.txt"), b"second")
+        .write(Path::new("/test/file.txt"), b"second", WriteMode::Replace)
         .unwrap();
     let mtime2 = system
         .metadata(Path::new("/test/file.txt"))
