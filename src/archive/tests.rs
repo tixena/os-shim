@@ -3,7 +3,7 @@
 use super::{ZipOptions, ZipStreamWriter, to_zip_writer};
 use crate::mock::MemorySystem;
 use crate::real::RealSystem;
-use crate::{FileMetadata, System, TempDirHandle, WalkEntry};
+use crate::{FileMetadata, System, TempDirHandle, WalkEntry, WriteMode};
 use std::env::VarError;
 use std::io::{self, Cursor, Read, Write, pipe};
 use std::path::{Path, PathBuf};
@@ -151,8 +151,8 @@ impl System for MinimalSystem {
         self.inner.walk_dir(path, follow_links, hidden)
     }
 
-    fn write(&self, path: &Path, contents: &[u8]) -> io::Result<()> {
-        self.inner.write(path, contents)
+    fn write(&self, path: &Path, contents: &[u8], mode: WriteMode) -> io::Result<()> {
+        self.inner.write(path, contents, mode)
     }
 }
 
@@ -370,7 +370,7 @@ fn entry_carries_the_source_modification_time() {
     let system = RealSystem::new();
     let temp = system.create_temp_dir().unwrap();
     let file = temp.path().join("fresh.txt");
-    system.write(&file, b"now").unwrap();
+    system.write(&file, b"now", WriteMode::Replace).unwrap();
 
     let mut archive = Vec::new();
     to_zip_writer(&system, &file, &mut archive, ZipOptions::default()).unwrap();
@@ -389,11 +389,15 @@ fn gitignored_file_inside_a_git_repository_is_archived() {
     let root = temp.path().join("repo");
     system.create_dir_all(&root.join(".git")).unwrap();
     system
-        .write(&root.join(".gitignore"), b"target/\n")
+        .write(&root.join(".gitignore"), b"target/\n", WriteMode::Replace)
         .unwrap();
     system.create_dir_all(&root.join("target")).unwrap();
     system
-        .write(&root.join("target/artifact.bin"), b"built")
+        .write(
+            &root.join("target/artifact.bin"),
+            b"built",
+            WriteMode::Replace,
+        )
         .unwrap();
 
     let mut archive = Vec::new();
@@ -432,10 +436,16 @@ fn real_and_memory_agree_on_names_and_contents() {
     let root = temp.path().join("proj");
     real.create_dir_all(&root.join("empty")).unwrap();
     real.create_dir_all(&root.join("src")).unwrap();
-    real.write(&root.join(".hidden"), b"dot").unwrap();
-    real.write(&root.join("README.md"), b"hi\n").unwrap();
-    real.write(&root.join("src/main.rs"), b"fn main() {}\n")
+    real.write(&root.join(".hidden"), b"dot", WriteMode::Replace)
         .unwrap();
+    real.write(&root.join("README.md"), b"hi\n", WriteMode::Replace)
+        .unwrap();
+    real.write(
+        &root.join("src/main.rs"),
+        b"fn main() {}\n",
+        WriteMode::Replace,
+    )
+    .unwrap();
 
     let memory = MemorySystem::new()
         .with_dir("/proj/empty")
@@ -474,9 +484,15 @@ fn info_zip_reports_a_clean_archive() {
     let root = temp.path().join("proj");
     system.create_dir_all(&root.join("empty")).unwrap();
     system.create_dir_all(&root.join("src")).unwrap();
-    system.write(&root.join("README.md"), b"hi\n").unwrap();
     system
-        .write(&root.join("src/main.rs"), b"fn main() {}\n")
+        .write(&root.join("README.md"), b"hi\n", WriteMode::Replace)
+        .unwrap();
+    system
+        .write(
+            &root.join("src/main.rs"),
+            b"fn main() {}\n",
+            WriteMode::Replace,
+        )
         .unwrap();
 
     let bundle = temp.path().join("proj.zip");
@@ -543,7 +559,7 @@ fn real_temp_dir_archives_its_own_contents() {
     let system = RealSystem::new();
     let temp = system.create_temp_dir().unwrap();
     system
-        .write(&temp.path().join("inside.txt"), b"kept")
+        .write(&temp.path().join("inside.txt"), b"kept", WriteMode::Replace)
         .unwrap();
 
     let mut archive = Vec::new();
@@ -561,7 +577,7 @@ fn memory_temp_dir_archives_its_own_contents() {
     let system = MemorySystem::new();
     let temp = system.create_temp_dir().unwrap();
     system
-        .write(&temp.path().join("inside.txt"), b"kept")
+        .write(&temp.path().join("inside.txt"), b"kept", WriteMode::Replace)
         .unwrap();
 
     let mut archive = Vec::new();
@@ -592,9 +608,14 @@ fn a_real_tree_round_trips_into_an_in_memory_filesystem() {
     let root = temp.path().join("proj");
     real.create_dir_all(&root.join("empty")).unwrap();
     real.create_dir_all(&root.join("src")).unwrap();
-    real.write(&root.join("README.md"), b"hi\n").unwrap();
-    real.write(&root.join("src/main.rs"), b"fn main() {}\n")
+    real.write(&root.join("README.md"), b"hi\n", WriteMode::Replace)
         .unwrap();
+    real.write(
+        &root.join("src/main.rs"),
+        b"fn main() {}\n",
+        WriteMode::Replace,
+    )
+    .unwrap();
 
     let mut stream = real.to_zip_stream(&root).unwrap();
     let loaded = MemorySystem::from_zip_stream(&mut stream).unwrap();
@@ -617,7 +638,9 @@ fn a_loaded_filesystem_can_be_edited_and_archived_again() {
     let loaded = MemorySystem::from_zip_stream(&mut stream).unwrap();
 
     loaded.remove_dir_all(Path::new("/target")).unwrap();
-    loaded.write(Path::new("/added.txt"), b"new").unwrap();
+    loaded
+        .write(Path::new("/added.txt"), b"new", WriteMode::Replace)
+        .unwrap();
 
     let republished = loaded.to_zip_vec(Path::new("/")).unwrap();
 
@@ -634,9 +657,14 @@ fn an_unseekable_pipe_is_a_valid_source() {
     let temp = real.create_temp_dir().unwrap();
     let root = temp.path().join("proj");
     real.create_dir_all(&root.join("src")).unwrap();
-    real.write(&root.join("README.md"), b"hi\n").unwrap();
-    real.write(&root.join("src/main.rs"), b"fn main() {}\n")
+    real.write(&root.join("README.md"), b"hi\n", WriteMode::Replace)
         .unwrap();
+    real.write(
+        &root.join("src/main.rs"),
+        b"fn main() {}\n",
+        WriteMode::Replace,
+    )
+    .unwrap();
 
     let (mut reader, mut writer) = pipe().unwrap();
     let producer = thread::spawn(move || {

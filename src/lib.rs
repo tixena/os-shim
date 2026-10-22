@@ -78,6 +78,18 @@ pub struct FileMetadata {
     pub modified: SystemTime,
 }
 
+/// How `System::write` treats a file already at the path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WriteMode {
+    /// Writes the file only when nothing is at the path: `AlreadyExists`
+    /// otherwise. The check and the creation are one step; the contents are
+    /// written after it, so a reader can see the new file empty for a moment.
+    CreateNew,
+    /// Writes the file, replacing one already at the path.
+    Replace,
+}
+
 /// Temporary directory handle that cleans up on drop.
 ///
 /// This trait provides a system-agnostic way to create temporary directories
@@ -389,11 +401,13 @@ pub trait System: Send + Sync {
     fn walk_dir(&self, path: &Path, follow_links: bool, hidden: bool)
     -> io::Result<Vec<WalkEntry>>;
 
-    /// Write bytes to a file, creating it if it doesn't exist.
+    /// Write bytes to a file, as `mode` says for a file already at the path.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The file cannot be written.
-    fn write(&self, path: &Path, contents: &[u8]) -> io::Result<()>;
+    /// - `mode` is `WriteMode::CreateNew` and something is at the path
+    ///   (`io::ErrorKind::AlreadyExists`).
+    fn write(&self, path: &Path, contents: &[u8], mode: WriteMode) -> io::Result<()>;
 }

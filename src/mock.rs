@@ -13,7 +13,7 @@ use tracing::error;
 
 #[cfg(feature = "zip")]
 use crate::archive::{load_zip, load_zip_seekable};
-use crate::{FileMetadata, System, TempDirHandle, WalkEntry};
+use crate::{FileMetadata, System, TempDirHandle, WalkEntry, WriteMode};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env::VarError;
 #[cfg(feature = "zip")]
@@ -395,7 +395,7 @@ impl System for MemorySystem {
         let size = contents.len() as u64;
 
         // Write to destination
-        self.write(to, &contents)?;
+        self.write(to, &contents, WriteMode::Replace)?;
         Ok(size)
     }
 
@@ -851,7 +851,7 @@ impl System for MemorySystem {
     }
 
     #[inline]
-    fn write(&self, path: &Path, contents: &[u8]) -> io::Result<()> {
+    fn write(&self, path: &Path, contents: &[u8], mode: WriteMode) -> io::Result<()> {
         let mut state = self
             .state
             .write()
@@ -864,6 +864,15 @@ impl System for MemorySystem {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("Parent directory does not exist: {}", parent.display()),
+            ));
+        }
+
+        if mode == WriteMode::CreateNew
+            && (state.files.contains_key(path) || state.dirs.contains(path))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("File exists: {}", path.display()),
             ));
         }
 

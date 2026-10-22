@@ -1,6 +1,6 @@
 //! Real system implementation using `std::env` and `std::fs`.
 
-use crate::{FileMetadata, System, TempDirHandle, WalkEntry};
+use crate::{FileMetadata, System, TempDirHandle, WalkEntry, WriteMode};
 use ignore::WalkBuilder;
 use std::env;
 use std::env::VarError;
@@ -201,8 +201,15 @@ impl System for RealSystem {
     }
 
     #[inline]
-    fn write(&self, path: &Path, contents: &[u8]) -> io::Result<()> {
-        fs::write(path, contents)
+    fn write(&self, path: &Path, contents: &[u8], mode: WriteMode) -> io::Result<()> {
+        match mode {
+            WriteMode::CreateNew => fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)?
+                .write_all(contents),
+            WriteMode::Replace => fs::write(path, contents),
+        }
     }
 }
 

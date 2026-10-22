@@ -10,9 +10,9 @@
 //! this file (see the `divergence_*` tests) and tracked as separate issues so a
 //! reviewer can decide whether to converge the behaviors.
 
-use crate::System;
 use crate::mock::MemorySystem;
 use crate::real::RealSystem;
+use crate::{System, WriteMode};
 use std::env::VarError;
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -26,11 +26,19 @@ fn assert_both_err_kind<L, R>(left: io::Result<L>, right: io::Result<R>, kind: i
 /// Build the same standard tree under `root` on a system.
 fn populate(system: &dyn System, root: &Path) {
     system.create_dir_all(root).unwrap();
-    system.write(&root.join("alpha.txt"), b"alpha").unwrap();
-    system.write(&root.join("empty.txt"), b"").unwrap();
+    system
+        .write(&root.join("alpha.txt"), b"alpha", WriteMode::Replace)
+        .unwrap();
+    system
+        .write(&root.join("empty.txt"), b"", WriteMode::Replace)
+        .unwrap();
     system.create_dir_all(&root.join("sub")).unwrap();
     system
-        .write(&root.join("sub").join("beta.txt"), b"beta")
+        .write(
+            &root.join("sub").join("beta.txt"),
+            b"beta",
+            WriteMode::Replace,
+        )
         .unwrap();
 }
 
@@ -54,11 +62,13 @@ fn parity_write_read_roundtrip() {
     let real = RealSystem::new();
     let tmp = real.create_temp_dir().unwrap();
     let real_file = tmp.path().join("file.txt");
-    real.write(&real_file, b"payload").unwrap();
+    real.write(&real_file, b"payload", WriteMode::Replace)
+        .unwrap();
 
     let mock = MemorySystem::new().with_dir("/work").unwrap();
     let mock_file = Path::new("/work/file.txt");
-    mock.write(mock_file, b"payload").unwrap();
+    mock.write(mock_file, b"payload", WriteMode::Replace)
+        .unwrap();
 
     assert_eq!(
         real.read_to_string(&real_file).unwrap(),
@@ -70,12 +80,16 @@ fn parity_write_read_roundtrip() {
 fn parity_metadata_len_for_known_and_empty_files() {
     let real = RealSystem::new();
     let tmp = real.create_temp_dir().unwrap();
-    real.write(&tmp.path().join("known.txt"), b"12345").unwrap();
-    real.write(&tmp.path().join("empty.txt"), b"").unwrap();
+    real.write(&tmp.path().join("known.txt"), b"12345", WriteMode::Replace)
+        .unwrap();
+    real.write(&tmp.path().join("empty.txt"), b"", WriteMode::Replace)
+        .unwrap();
 
     let mock = MemorySystem::new().with_dir("/work").unwrap();
-    mock.write(Path::new("/work/known.txt"), b"12345").unwrap();
-    mock.write(Path::new("/work/empty.txt"), b"").unwrap();
+    mock.write(Path::new("/work/known.txt"), b"12345", WriteMode::Replace)
+        .unwrap();
+    mock.write(Path::new("/work/empty.txt"), b"", WriteMode::Replace)
+        .unwrap();
 
     let real_known = real.metadata(&tmp.path().join("known.txt")).unwrap();
     let mock_known = mock.metadata(Path::new("/work/known.txt")).unwrap();
@@ -93,13 +107,15 @@ fn parity_metadata_len_for_known_and_empty_files() {
 fn parity_copy_returns_len_and_contents() {
     let real = RealSystem::new();
     let tmp = real.create_temp_dir().unwrap();
-    real.write(&tmp.path().join("src.txt"), b"payload").unwrap();
+    real.write(&tmp.path().join("src.txt"), b"payload", WriteMode::Replace)
+        .unwrap();
     let real_len = real
         .copy(&tmp.path().join("src.txt"), &tmp.path().join("dest.txt"))
         .unwrap();
 
     let mock = MemorySystem::new().with_dir("/work").unwrap();
-    mock.write(Path::new("/work/src.txt"), b"payload").unwrap();
+    mock.write(Path::new("/work/src.txt"), b"payload", WriteMode::Replace)
+        .unwrap();
     let mock_len = mock
         .copy(Path::new("/work/src.txt"), Path::new("/work/dest.txt"))
         .unwrap();
@@ -193,7 +209,8 @@ fn parity_rename_missing_source_is_not_found() {
 fn parity_copy_missing_parent_is_not_found() {
     let real = RealSystem::new();
     let tmp = real.create_temp_dir().unwrap();
-    real.write(&tmp.path().join("src.txt"), b"x").unwrap();
+    real.write(&tmp.path().join("src.txt"), b"x", WriteMode::Replace)
+        .unwrap();
 
     let mock = MemorySystem::new()
         .with_file("/work/src.txt", b"x")
@@ -216,14 +233,18 @@ fn parity_copy_missing_parent_is_not_found() {
 fn parity_rename_over_existing_overwrites() {
     let real = RealSystem::new();
     let tmp = real.create_temp_dir().unwrap();
-    real.write(&tmp.path().join("src.txt"), b"new").unwrap();
-    real.write(&tmp.path().join("dest.txt"), b"old").unwrap();
+    real.write(&tmp.path().join("src.txt"), b"new", WriteMode::Replace)
+        .unwrap();
+    real.write(&tmp.path().join("dest.txt"), b"old", WriteMode::Replace)
+        .unwrap();
     real.rename(&tmp.path().join("src.txt"), &tmp.path().join("dest.txt"))
         .unwrap();
 
     let mock = MemorySystem::new().with_dir("/work").unwrap();
-    mock.write(Path::new("/work/src.txt"), b"new").unwrap();
-    mock.write(Path::new("/work/dest.txt"), b"old").unwrap();
+    mock.write(Path::new("/work/src.txt"), b"new", WriteMode::Replace)
+        .unwrap();
+    mock.write(Path::new("/work/dest.txt"), b"old", WriteMode::Replace)
+        .unwrap();
     mock.rename(Path::new("/work/src.txt"), Path::new("/work/dest.txt"))
         .unwrap();
 
@@ -260,7 +281,8 @@ fn parity_read_dir_lists_same_children() {
 fn parity_open_append_appends() {
     let real = RealSystem::new();
     let tmp = real.create_temp_dir().unwrap();
-    real.write(&tmp.path().join("log.txt"), b"head").unwrap();
+    real.write(&tmp.path().join("log.txt"), b"head", WriteMode::Replace)
+        .unwrap();
     let mut real_writer = real.open_append(&tmp.path().join("log.txt")).unwrap();
     real_writer.write_all(b"-tail").unwrap();
     real_writer.flush().unwrap();
@@ -284,8 +306,12 @@ fn parity_open_append_appends() {
 fn parity_open_reads_same_contents() {
     let real = RealSystem::new();
     let tmp = real.create_temp_dir().unwrap();
-    real.write(&tmp.path().join("file.txt"), b"shared bytes")
-        .unwrap();
+    real.write(
+        &tmp.path().join("file.txt"),
+        b"shared bytes",
+        WriteMode::Replace,
+    )
+    .unwrap();
 
     let mock = MemorySystem::new()
         .with_file("/work/file.txt", b"shared bytes")
@@ -309,18 +335,102 @@ fn parity_open_reads_same_contents() {
 fn parity_write_truncates() {
     let real = RealSystem::new();
     let tmp = real.create_temp_dir().unwrap();
-    real.write(&tmp.path().join("file.txt"), b"long original")
+    real.write(
+        &tmp.path().join("file.txt"),
+        b"long original",
+        WriteMode::Replace,
+    )
+    .unwrap();
+    real.write(&tmp.path().join("file.txt"), b"short", WriteMode::Replace)
         .unwrap();
-    real.write(&tmp.path().join("file.txt"), b"short").unwrap();
 
     let mock = MemorySystem::new().with_dir("/work").unwrap();
-    mock.write(Path::new("/work/file.txt"), b"long original")
+    mock.write(
+        Path::new("/work/file.txt"),
+        b"long original",
+        WriteMode::Replace,
+    )
+    .unwrap();
+    mock.write(Path::new("/work/file.txt"), b"short", WriteMode::Replace)
         .unwrap();
-    mock.write(Path::new("/work/file.txt"), b"short").unwrap();
 
     assert_eq!(
         real.read_to_string(&tmp.path().join("file.txt")).unwrap(),
         mock.read_to_string(Path::new("/work/file.txt")).unwrap()
+    );
+}
+
+#[test]
+fn parity_write_create_new_writes_missing_file() {
+    let real = RealSystem::new();
+    let tmp = real.create_temp_dir().unwrap();
+    let real_file = tmp.path().join("file.lock");
+    real.write(&real_file, b"payload", WriteMode::CreateNew)
+        .unwrap();
+
+    let mock = MemorySystem::new().with_dir("/work").unwrap();
+    let mock_file = Path::new("/work/file.lock");
+    mock.write(mock_file, b"payload", WriteMode::CreateNew)
+        .unwrap();
+
+    assert_eq!(real.read_to_string(&real_file).unwrap(), "payload");
+    assert_eq!(mock.read_to_string(mock_file).unwrap(), "payload");
+}
+
+#[test]
+fn parity_write_create_new_over_file_is_already_exists() {
+    let real = RealSystem::new();
+    let tmp = real.create_temp_dir().unwrap();
+    let real_file = tmp.path().join("file.lock");
+    real.write(&real_file, b"first", WriteMode::Replace)
+        .unwrap();
+
+    let mock = MemorySystem::new().with_dir("/work").unwrap();
+    let mock_file = Path::new("/work/file.lock");
+    mock.write(mock_file, b"first", WriteMode::Replace).unwrap();
+
+    assert_both_err_kind(
+        real.write(&real_file, b"second", WriteMode::CreateNew),
+        mock.write(mock_file, b"second", WriteMode::CreateNew),
+        io::ErrorKind::AlreadyExists,
+    );
+    assert_eq!(real.read_to_string(&real_file).unwrap(), "first");
+    assert_eq!(mock.read_to_string(mock_file).unwrap(), "first");
+}
+
+#[test]
+fn parity_write_create_new_over_dir_is_already_exists() {
+    let real = RealSystem::new();
+    let tmp = real.create_temp_dir().unwrap();
+    let real_dir = tmp.path().join("sub");
+    real.create_dir_all(&real_dir).unwrap();
+
+    let mock = MemorySystem::new().with_dir("/work/sub").unwrap();
+    let mock_dir = Path::new("/work/sub");
+
+    assert_both_err_kind(
+        real.write(&real_dir, b"x", WriteMode::CreateNew),
+        mock.write(mock_dir, b"x", WriteMode::CreateNew),
+        io::ErrorKind::AlreadyExists,
+    );
+    assert!(real.is_dir(&real_dir).unwrap());
+    assert!(mock.is_dir(mock_dir).unwrap());
+}
+
+#[test]
+fn parity_write_create_new_missing_parent_is_not_found() {
+    let real = RealSystem::new();
+    let tmp = real.create_temp_dir().unwrap();
+    let mock = MemorySystem::new().with_dir("/work").unwrap();
+
+    assert_both_err_kind(
+        real.write(
+            &tmp.path().join("no").join("file.lock"),
+            b"x",
+            WriteMode::CreateNew,
+        ),
+        mock.write(Path::new("/work/no/file.lock"), b"x", WriteMode::CreateNew),
+        io::ErrorKind::NotFound,
     );
 }
 
@@ -464,7 +574,8 @@ fn parity_read_dir_missing_is_not_found() {
 fn parity_rename_dest_parent_missing_is_not_found() {
     let real = RealSystem::new();
     let tmp = real.create_temp_dir().unwrap();
-    real.write(&tmp.path().join("src.txt"), b"x").unwrap();
+    real.write(&tmp.path().join("src.txt"), b"x", WriteMode::Replace)
+        .unwrap();
 
     let mock = MemorySystem::new()
         .with_file("/work/src.txt", b"x")
@@ -508,7 +619,8 @@ fn parity_open_append_parent_missing_is_not_found() {
 fn parity_remove_file_success_then_missing() {
     let real = RealSystem::new();
     let tmp = real.create_temp_dir().unwrap();
-    real.write(&tmp.path().join("doomed.txt"), b"x").unwrap();
+    real.write(&tmp.path().join("doomed.txt"), b"x", WriteMode::Replace)
+        .unwrap();
     real.remove_file(&tmp.path().join("doomed.txt")).unwrap();
 
     let mock = MemorySystem::new()
@@ -533,18 +645,31 @@ fn parity_rename_directory_moves_subtree() {
     let tmp = real.create_temp_dir().unwrap();
     real.create_dir_all(&tmp.path().join("from").join("nested"))
         .unwrap();
-    real.write(&tmp.path().join("from").join("a.txt"), b"a")
-        .unwrap();
-    real.write(&tmp.path().join("from").join("nested").join("b.txt"), b"b")
-        .unwrap();
+    real.write(
+        &tmp.path().join("from").join("a.txt"),
+        b"a",
+        WriteMode::Replace,
+    )
+    .unwrap();
+    real.write(
+        &tmp.path().join("from").join("nested").join("b.txt"),
+        b"b",
+        WriteMode::Replace,
+    )
+    .unwrap();
     real.rename(&tmp.path().join("from"), &tmp.path().join("to"))
         .unwrap();
 
     let mock = MemorySystem::new();
     mock.create_dir_all(Path::new("/work/from/nested")).unwrap();
-    mock.write(Path::new("/work/from/a.txt"), b"a").unwrap();
-    mock.write(Path::new("/work/from/nested/b.txt"), b"b")
+    mock.write(Path::new("/work/from/a.txt"), b"a", WriteMode::Replace)
         .unwrap();
+    mock.write(
+        Path::new("/work/from/nested/b.txt"),
+        b"b",
+        WriteMode::Replace,
+    )
+    .unwrap();
     mock.rename(Path::new("/work/from"), Path::new("/work/to"))
         .unwrap();
 
@@ -648,12 +773,16 @@ fn parity_walk_dir_missing_yields_empty() {
 fn parity_walk_dir_hidden_flag_includes_dotfiles() {
     let real = RealSystem::new();
     let tmp = real.create_temp_dir().unwrap();
-    real.write(&tmp.path().join("visible.txt"), b"v").unwrap();
-    real.write(&tmp.path().join(".secret"), b"s").unwrap();
+    real.write(&tmp.path().join("visible.txt"), b"v", WriteMode::Replace)
+        .unwrap();
+    real.write(&tmp.path().join(".secret"), b"s", WriteMode::Replace)
+        .unwrap();
 
     let mock = MemorySystem::new().with_dir("/work").unwrap();
-    mock.write(Path::new("/work/visible.txt"), b"v").unwrap();
-    mock.write(Path::new("/work/.secret"), b"s").unwrap();
+    mock.write(Path::new("/work/visible.txt"), b"v", WriteMode::Replace)
+        .unwrap();
+    mock.write(Path::new("/work/.secret"), b"s", WriteMode::Replace)
+        .unwrap();
 
     let walk_names = |hidden: bool| {
         let real_names = relative_names(
