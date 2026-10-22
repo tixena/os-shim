@@ -438,6 +438,46 @@ fn parity_write_replace_over_dir_is_a_directory() {
 }
 
 #[test]
+fn parity_create_over_dir_is_a_directory() {
+    let real = RealSystem::new();
+    let tmp = real.create_temp_dir().unwrap();
+    let real_dir = tmp.path().join("sub");
+    real.create_dir_all(&real_dir).unwrap();
+
+    let mock = MemorySystem::new().with_dir("/work/sub").unwrap();
+    let mock_dir = Path::new("/work/sub");
+
+    assert_both_err_kind(
+        real.create(&real_dir),
+        mock.create(mock_dir),
+        io::ErrorKind::IsADirectory,
+    );
+    assert!(real.is_dir(&real_dir).unwrap());
+    assert!(mock.is_dir(mock_dir).unwrap());
+    assert!(!mock.is_file(mock_dir).unwrap());
+}
+
+#[test]
+fn parity_open_append_over_dir_is_a_directory() {
+    let real = RealSystem::new();
+    let tmp = real.create_temp_dir().unwrap();
+    let real_dir = tmp.path().join("sub");
+    real.create_dir_all(&real_dir).unwrap();
+
+    let mock = MemorySystem::new().with_dir("/work/sub").unwrap();
+    let mock_dir = Path::new("/work/sub");
+
+    assert_both_err_kind(
+        real.open_append(&real_dir),
+        mock.open_append(mock_dir),
+        io::ErrorKind::IsADirectory,
+    );
+    assert!(real.is_dir(&real_dir).unwrap());
+    assert!(mock.is_dir(mock_dir).unwrap());
+    assert!(!mock.is_file(mock_dir).unwrap());
+}
+
+#[test]
 fn parity_copy_onto_dir_is_a_directory() {
     let real = RealSystem::new();
     let tmp = real.create_temp_dir().unwrap();
@@ -579,6 +619,108 @@ fn parity_create_dir_all_over_a_file_already_exists() {
         io::ErrorKind::AlreadyExists,
     );
     assert!(!mock.is_dir(Path::new("/work/a.md")).unwrap());
+}
+
+#[test]
+fn parity_read_dir_of_a_file_is_not_a_directory() {
+    let real = RealSystem::new();
+    let tmp = real.create_temp_dir().unwrap();
+    let mock = MemorySystem::new().with_dir("/work").unwrap();
+    real.write(&tmp.path().join("a.md"), b"a", WriteMode::Replace)
+        .unwrap();
+    mock.write(Path::new("/work/a.md"), b"a", WriteMode::Replace)
+        .unwrap();
+
+    assert_both_err_kind(
+        real.read_dir(&tmp.path().join("a.md")),
+        mock.read_dir(Path::new("/work/a.md")),
+        io::ErrorKind::NotADirectory,
+    );
+    assert_eq!(real.read_to_string(&tmp.path().join("a.md")).unwrap(), "a");
+    assert_eq!(mock.read_to_string(Path::new("/work/a.md")).unwrap(), "a");
+    assert!(!mock.is_dir(Path::new("/work/a.md")).unwrap());
+}
+
+#[test]
+fn parity_remove_dir_all_of_a_file_is_not_a_directory() {
+    let real = RealSystem::new();
+    let tmp = real.create_temp_dir().unwrap();
+    let mock = MemorySystem::new().with_dir("/work").unwrap();
+    real.write(&tmp.path().join("a.md"), b"a", WriteMode::Replace)
+        .unwrap();
+    mock.write(Path::new("/work/a.md"), b"a", WriteMode::Replace)
+        .unwrap();
+
+    assert_both_err_kind(
+        real.remove_dir_all(&tmp.path().join("a.md")),
+        mock.remove_dir_all(Path::new("/work/a.md")),
+        io::ErrorKind::NotADirectory,
+    );
+    assert_eq!(real.read_to_string(&tmp.path().join("a.md")).unwrap(), "a");
+    assert_eq!(mock.read_to_string(Path::new("/work/a.md")).unwrap(), "a");
+    assert!(!mock.is_dir(Path::new("/work/a.md")).unwrap());
+}
+
+#[test]
+fn parity_remove_file_of_a_dir_is_a_directory() {
+    let real = RealSystem::new();
+    let tmp = real.create_temp_dir().unwrap();
+    let real_dir = tmp.path().join("d");
+    real.create_dir_all(&real_dir).unwrap();
+
+    let mock = MemorySystem::new().with_dir("/work/d").unwrap();
+    let mock_dir = Path::new("/work/d");
+
+    assert_both_err_kind(
+        real.remove_file(&real_dir),
+        mock.remove_file(mock_dir),
+        io::ErrorKind::IsADirectory,
+    );
+    assert!(real.is_dir(&real_dir).unwrap());
+    assert!(mock.is_dir(mock_dir).unwrap());
+    assert!(!mock.is_file(mock_dir).unwrap());
+}
+
+#[test]
+fn parity_read_to_string_of_a_dir_is_a_directory() {
+    let real = RealSystem::new();
+    let tmp = real.create_temp_dir().unwrap();
+    let real_dir = tmp.path().join("d");
+    real.create_dir_all(&real_dir).unwrap();
+
+    let mock = MemorySystem::new().with_dir("/work/d").unwrap();
+    let mock_dir = Path::new("/work/d");
+
+    assert_both_err_kind(
+        real.read_to_string(&real_dir),
+        mock.read_to_string(mock_dir),
+        io::ErrorKind::IsADirectory,
+    );
+    assert!(real.is_dir(&real_dir).unwrap());
+    assert!(mock.is_dir(mock_dir).unwrap());
+    assert!(!mock.is_file(mock_dir).unwrap());
+}
+
+#[test]
+fn parity_open_of_a_dir_fails_on_read_with_is_a_directory() {
+    let real = RealSystem::new();
+    let tmp = real.create_temp_dir().unwrap();
+    let real_dir = tmp.path().join("d");
+    real.create_dir_all(&real_dir).unwrap();
+
+    let mock = MemorySystem::new().with_dir("/work/d").unwrap();
+    let mock_dir = Path::new("/work/d");
+
+    let mut real_bytes = Vec::new();
+    let mut mock_bytes = Vec::new();
+    assert_both_err_kind(
+        real.open(&real_dir).unwrap().read_to_end(&mut real_bytes),
+        mock.open(mock_dir).unwrap().read_to_end(&mut mock_bytes),
+        io::ErrorKind::IsADirectory,
+    );
+    assert!(real.is_dir(&real_dir).unwrap());
+    assert!(mock.is_dir(mock_dir).unwrap());
+    assert!(!mock.is_file(mock_dir).unwrap());
 }
 
 #[test]

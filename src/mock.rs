@@ -421,6 +421,12 @@ impl System for MemorySystem {
             .read()
             .map_err(|err| io::Error::other(err.to_string()))?;
         Self::check_no_file_above(&state.files, path)?;
+        if state.dirs.contains(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::IsADirectory,
+                format!("Is a directory: {}", path.display()),
+            ));
+        }
         drop(state);
 
         // For create, we need a writer that updates the mock filesystem
@@ -584,6 +590,9 @@ impl System for MemorySystem {
             .read()
             .map_err(|err| io::Error::other(err.to_string()))?;
         Self::check_no_file_above(&state.files, path)?;
+        if state.dirs.contains(path) {
+            return Ok(Box::new(FolderReader));
+        }
         let bytes = state.files.get(path).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -602,6 +611,12 @@ impl System for MemorySystem {
             .read()
             .map_err(|err| io::Error::other(err.to_string()))?;
         Self::check_no_file_above(&state.files, path)?;
+        if state.dirs.contains(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::IsADirectory,
+                format!("Is a directory: {}", path.display()),
+            ));
+        }
         drop(state);
 
         Ok(Box::new(MemoryAppendWriter {
@@ -618,6 +633,13 @@ impl System for MemorySystem {
             .read()
             .map_err(|err| io::Error::other(err.to_string()))?;
         Self::check_no_file_above(&state.files, path)?;
+
+        if state.files.contains_key(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                format!("Not a directory: {}", path.display()),
+            ));
+        }
 
         if !state.dirs.contains(path) {
             return Err(io::Error::new(
@@ -658,6 +680,12 @@ impl System for MemorySystem {
             .read()
             .map_err(|err| io::Error::other(err.to_string()))?;
         Self::check_no_file_above(&state.files, path)?;
+        if state.dirs.contains(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::IsADirectory,
+                format!("Is a directory: {}", path.display()),
+            ));
+        }
         let bytes = state.files.get(path).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -678,6 +706,13 @@ impl System for MemorySystem {
             .write()
             .map_err(|err| io::Error::other(err.to_string()))?;
         Self::check_no_file_above(&state.files, path)?;
+
+        if state.files.contains_key(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                format!("Not a directory: {}", path.display()),
+            ));
+        }
 
         // Match RealSystem (fs::remove_dir_all): a missing path is NotFound.
         if !state.dirs.remove(path) {
@@ -708,6 +743,13 @@ impl System for MemorySystem {
             .write()
             .map_err(|err| io::Error::other(err.to_string()))?;
         Self::check_no_file_above(&state.files, path)?;
+
+        if state.dirs.contains(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::IsADirectory,
+                format!("Is a directory: {}", path.display()),
+            ));
+        }
 
         if !state.files.contains_key(path) {
             return Err(io::Error::new(
@@ -957,6 +999,20 @@ impl System for MemorySystem {
         state.files.insert(path.to_path_buf(), contents.to_vec());
         drop(state);
         Ok(())
+    }
+}
+
+/// What `open` returns for a folder: every read fails, as reading a folder does
+/// on disk.
+struct FolderReader;
+
+impl Read for FolderReader {
+    #[inline]
+    fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+        Err(io::Error::new(
+            io::ErrorKind::IsADirectory,
+            "Is a directory",
+        ))
     }
 }
 
