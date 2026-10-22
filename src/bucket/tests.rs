@@ -7,7 +7,12 @@ use super::{MinioBucket, MinioConfig};
 use super::{S3Bucket, S3Config};
 #[cfg(any(feature = "minio", feature = "s3"))]
 use alloc::sync::Arc;
+#[cfg(feature = "minio")]
+use aws_sdk_s3::{error::SdkError, operation::get_object::GetObjectError};
+#[cfg(not(feature = "minio"))]
 use core::error::Error as _;
+#[cfg(feature = "minio")]
+use core::{error::Error, iter};
 use std::io;
 #[cfg(any(feature = "minio", feature = "s3"))]
 use std::{
@@ -457,11 +462,35 @@ fn minio_config_debug_keeps_the_secret_key_out() {
 
 #[cfg(feature = "minio")]
 #[test]
-fn minio_get_with_nothing_listening_is_other() {
+fn minio_get_with_nothing_listening_is_other_naming_the_dispatch_failure_and_its_cause() {
     let error = minio("http://127.0.0.1:9".to_owned())
         .get("task.md")
         .unwrap_err();
     assert_eq!(error.kind(), ObjectErrorKind::Other);
+    let message = error.to_string();
+    assert!(message.starts_with("dispatch failure: "));
+    assert!(message.contains("Connection refused"));
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_get_answered_403_names_the_status_the_code_and_the_message() {
+    let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>SignatureDoesNotMatch</Code><Message>The request signature we calculated does not match the signature you provided.</Message></Error>";
+    let (endpoint, _seen) = canned(vec![answer(
+        "403 Forbidden",
+        "Content-Type: application/xml\r\n",
+        body,
+    )]);
+    let error = minio(endpoint).get("task.md").unwrap_err();
+    assert_eq!(error.kind(), ObjectErrorKind::Other);
+    assert_eq!(
+        error.to_string(),
+        "403 SignatureDoesNotMatch: The request signature we calculated does not match the signature you provided."
+    );
+    assert!(
+        iter::successors(error.source(), |&cause| cause.source())
+            .any(<dyn Error>::is::<SdkError<GetObjectError>>)
+    );
 }
 
 /// The configuration every AWS S3 scenario uses.
