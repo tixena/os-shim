@@ -269,6 +269,8 @@ impl MemorySystem {
     ///
     /// Returns an error if:
     /// - The internal lock cannot be acquired
+    /// - The path is a file (`AlreadyExists`)
+    /// - A path above it is a file (`NotADirectory`)
     #[inline]
     pub fn with_dir<P>(self, path: P) -> io::Result<Self>
     where
@@ -279,6 +281,13 @@ impl MemorySystem {
             .state
             .write()
             .map_err(|err| io::Error::other(err.to_string()))?;
+        if state.files.contains_key(&path_buf) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("File exists: {}", path_buf.display()),
+            ));
+        }
+        Self::check_no_file_above(&state.files, &path_buf)?;
         Self::ensure_parent_dirs(&mut state.dirs, &path_buf);
         state.dirs.insert(path_buf);
         drop(state);
@@ -308,6 +317,8 @@ impl MemorySystem {
     ///
     /// Returns an error if:
     /// - The internal lock cannot be acquired
+    /// - A path above it is a file (`NotADirectory`)
+    /// - The path is a folder (`IsADirectory`)
     #[inline]
     pub fn with_file<P>(self, path: P, contents: &[u8]) -> io::Result<Self>
     where
@@ -318,6 +329,13 @@ impl MemorySystem {
             .state
             .write()
             .map_err(|err| io::Error::other(err.to_string()))?;
+        Self::check_no_file_above(&state.files, &path_buf)?;
+        if state.dirs.contains(&path_buf) {
+            return Err(io::Error::new(
+                io::ErrorKind::IsADirectory,
+                format!("Is a directory: {}", path_buf.display()),
+            ));
+        }
 
         // Ensure parent directories exist
         if let Some(parent) = path_buf.parent() {
