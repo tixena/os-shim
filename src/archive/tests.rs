@@ -11,6 +11,7 @@ use std::process::Command;
 #[cfg(slow_tests)]
 use std::process::Stdio;
 use std::thread;
+use std::time::SystemTime;
 use time::OffsetDateTime;
 use zip::ZipArchive;
 use zip::write::{SimpleFileOptions, StreamWriter, ZipWriter};
@@ -103,6 +104,10 @@ impl System for MinimalSystem {
 
     fn metadata(&self, path: &Path) -> io::Result<FileMetadata> {
         self.inner.metadata(path)
+    }
+
+    fn now(&self) -> SystemTime {
+        self.inner.now()
     }
 
     fn open(&self, path: &Path) -> io::Result<Box<dyn Read + '_>> {

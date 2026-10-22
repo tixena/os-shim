@@ -9,6 +9,7 @@ use crate::System as _;
 use std::env::VarError;
 use std::io::{self, Read as _, Write as _};
 use std::path::Path;
+use std::time::SystemTime;
 
 #[test]
 fn write_then_read_to_string_roundtrips() {
@@ -197,6 +198,13 @@ fn metadata_missing_path_is_not_found() {
 
     let err = system.metadata(&missing).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::NotFound);
+}
+
+#[test]
+fn now_is_after_the_unix_epoch() {
+    let now = RealSystem::new().now();
+
+    now.duration_since(SystemTime::UNIX_EPOCH).unwrap();
 }
 
 #[test]

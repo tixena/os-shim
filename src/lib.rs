@@ -228,6 +228,10 @@ pub trait System: Send + Sync {
     /// - The path cannot be read.
     fn metadata(&self, path: &Path) -> io::Result<FileMetadata>;
 
+    /// The current time: the machine's in `RealSystem`, the one a test set in
+    /// `MemorySystem`.
+    fn now(&self) -> SystemTime;
+
     /// Open a file for reading (returns a readable stream).
     ///
     /// # Errors

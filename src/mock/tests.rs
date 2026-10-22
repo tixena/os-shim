@@ -33,7 +33,14 @@ fn metadata_not_found() {
 
 #[test]
 fn metadata_modified_updates_on_write() {
-    let system = MemorySystem::new().with_dir("/test").unwrap();
+    let start = SystemTime::UNIX_EPOCH
+        .checked_add(Duration::from_secs(1_700_000_000))
+        .unwrap();
+    let system = MemorySystem::new()
+        .with_dir("/test")
+        .unwrap()
+        .with_now(start)
+        .unwrap();
 
     system.write(Path::new("/test/file.txt"), b"first").unwrap();
     let mtime1 = system
@@ -41,7 +48,7 @@ fn metadata_modified_updates_on_write() {
         .unwrap()
         .modified;
 
-    // Write again to update the modification time
+    system.advance(Duration::from_secs(1)).unwrap();
     system
         .write(Path::new("/test/file.txt"), b"second")
         .unwrap();
@@ -50,7 +57,48 @@ fn metadata_modified_updates_on_write() {
         .unwrap()
         .modified;
 
-    assert!(mtime2 >= mtime1);
+    assert_eq!(mtime1, start);
+    assert_eq!(mtime2, mtime1.checked_add(Duration::from_secs(1)).unwrap());
+}
+
+#[test]
+fn now_starts_at_the_unix_epoch() {
+    assert_eq!(MemorySystem::new().now(), SystemTime::UNIX_EPOCH);
+}
+
+#[test]
+fn with_now_sets_the_time() {
+    let time = SystemTime::UNIX_EPOCH
+        .checked_add(Duration::from_secs(1_700_000_000))
+        .unwrap();
+    let system = MemorySystem::new().with_now(time).unwrap();
+
+    assert_eq!(system.now(), time);
+}
+
+#[test]
+fn advance_moves_the_time_forward() {
+    let time = SystemTime::UNIX_EPOCH
+        .checked_add(Duration::from_secs(1_700_000_000))
+        .unwrap();
+    let system = MemorySystem::new().with_now(time).unwrap();
+
+    system.advance(Duration::from_secs(5)).unwrap();
+
+    assert_eq!(
+        system.now(),
+        time.checked_add(Duration::from_secs(5)).unwrap()
+    );
+}
+
+#[test]
+fn advance_that_overflows_errors_and_keeps_the_time() {
+    let system = MemorySystem::new();
+
+    let err = system.advance(Duration::MAX).unwrap_err();
+
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(system.now(), SystemTime::UNIX_EPOCH);
 }
 
 #[test]
