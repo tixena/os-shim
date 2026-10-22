@@ -12,13 +12,15 @@ use aws_sdk_s3::config::Builder as ConfigBuilder;
 use aws_sdk_s3::{
     Client, Config,
     config::{BehaviorVersion, Credentials, Region, retry::RetryConfig},
-    error::SdkError,
+    error::{ProvideErrorMetadata, SdkError},
     primitives::ByteStream,
 };
 use core::error::Error;
 use core::fmt;
 use core::future::ready;
 use core::hash::{Hash as _, Hasher as _};
+#[cfg(any(feature = "minio", feature = "s3"))]
+use core::iter;
 #[cfg(not(feature = "async"))]
 use interface::Bucket;
 use std::hash::DefaultHasher;
@@ -414,8 +416,16 @@ impl SdkBucket {
             Condition::Absent => unconditional.if_none_match("*"),
             Condition::ETag(tag) => unconditional.if_match(tag),
         };
-        let output = request.send().await.map_err(classify)?;
-        output.e_tag().map(str::to_owned).ok_or_else(missing_etag)
+        match request.send().await.map_err(classify) {
+            Ok(output) => output.e_tag().map(str::to_owned).ok_or_else(missing_etag),
+            Err(error)
+                if error.kind() == ObjectErrorKind::NotFound
+                    && matches!(*condition, Condition::ETag(_)) =>
+            {
+                Err(ObjectError::precondition_failed())
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -659,11 +669,35 @@ impl Bucket for S3Bucket {
     }
 }
 
+/// An SDK failure that reads as what the answer or the transport said.
+#[cfg(any(feature = "minio", feature = "s3"))]
+#[derive(Debug)]
+struct SdkFailure {
+    /// The status, S3 code and message of the answer, or the transport's causes.
+    message: String,
+    /// The SDK's own error.
+    source: Box<dyn Error + Send + Sync>,
+}
+
+#[cfg(any(feature = "minio", feature = "s3"))]
+impl fmt::Display for SdkFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+#[cfg(any(feature = "minio", feature = "s3"))]
+impl Error for SdkFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 /// The error for an SDK failure: 404 is `NotFound`, 412 is `PreconditionFailed`, anything else is `Other`.
 #[cfg(any(feature = "minio", feature = "s3"))]
 fn classify<E>(error: SdkError<E>) -> ObjectError
 where
-    E: Error + Send + Sync + 'static,
+    E: Error + ProvideErrorMetadata + Send + Sync + 'static,
 {
     match error
         .raw_response()
@@ -671,7 +705,33 @@ where
     {
         Some(404) => ObjectError::not_found(),
         Some(412) => ObjectError::precondition_failed(),
-        _ => ObjectError::from(io::Error::other(error)),
+        _ => ObjectError::from(io::Error::other(SdkFailure {
+            message: describe(&error),
+            source: Box::new(error),
+        })),
+    }
+}
+
+/// What `error` says: the status, S3 code and message of a service's answer, or else each cause in turn.
+#[cfg(any(feature = "minio", feature = "s3"))]
+fn describe<E>(error: &SdkError<E>) -> String
+where
+    E: Error + ProvideErrorMetadata + 'static,
+{
+    if let (Some(service), Some(response)) = (error.as_service_error(), error.raw_response()) {
+        let status = response.status().as_u16();
+        match (service.code(), service.message()) {
+            (Some(code), Some(text)) => format!("{status} {code}: {text}"),
+            (Some(code), None) => format!("{status} {code}"),
+            (None, Some(text)) => format!("{status}: {text}"),
+            (None, None) => status.to_string(),
+        }
+    } else {
+        let top: &(dyn Error + 'static) = error;
+        iter::successors(Some(top), |&cause| cause.source())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(": ")
     }
 }
 

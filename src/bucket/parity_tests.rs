@@ -191,6 +191,19 @@ where
     ]
 }
 
+/// A put under a stale tag at a key that holds nothing, and a get of that key.
+#[cfg(minio_tests)]
+fn missing_key_tagged_put<B>(bucket: &BlockingBucket<B>, prefix: &str) -> Vec<String>
+where
+    B: Bucket,
+{
+    let key = format!("{prefix}none.md");
+    vec![
+        put_line(&bucket.put(&key, b"# Task\n", &Condition::ETag("\"stale\"".to_owned()))),
+        get_line(&bucket.get(&key)),
+    ]
+}
+
 /// Tags of the same bytes at two keys, and of different bytes.
 fn same_bytes_tags<B>(bucket: &BlockingBucket<B>, prefix: &str) -> Vec<String>
 where
@@ -275,6 +288,16 @@ fn missing_key_deletes_agree_with_the_server() {
         "missing key deletes",
         &missing_key_deletes(&memory(), "a/"),
         &missing_key_deletes(&server(), "missing-key-deletes/"),
+    );
+}
+
+#[cfg(minio_tests)]
+#[test]
+fn missing_key_tagged_put_agrees_with_the_server() {
+    assert_agree(
+        "missing key tagged put",
+        &missing_key_tagged_put(&memory(), "a/"),
+        &missing_key_tagged_put(&server(), "missing-key-tagged-put/"),
     );
 }
 
