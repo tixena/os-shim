@@ -292,6 +292,21 @@ fn answer(status: &str, headers: &str, body: &str) -> String {
     )
 }
 
+/// A 404 answer whose S3 error body carries `code` and `message`.
+#[cfg(any(feature = "minio", feature = "s3"))]
+fn not_found_answer(code: &str, message: &str) -> String {
+    let body = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>{code}</Code><Message>{message}</Message></Error>"
+    );
+    answer("404 Not Found", "Content-Type: application/xml\r\n", &body)
+}
+
+/// The 404 answer for a bucket that does not exist.
+#[cfg(any(feature = "minio", feature = "s3"))]
+fn no_such_bucket() -> String {
+    not_found_answer("NoSuchBucket", "The specified bucket does not exist.")
+}
+
 /// A `ListObjectsV2` answer with `key`, truncated with the token `next` when it is given.
 #[cfg(feature = "minio")]
 fn page(key: &str, next: Option<&str>) -> String {
@@ -493,6 +508,40 @@ fn minio_get_answered_403_names_the_status_the_code_and_the_message() {
     );
 }
 
+#[cfg(feature = "minio")]
+#[test]
+fn minio_get_answered_404_no_such_bucket_is_other_naming_the_answer() {
+    let (endpoint, _seen) = canned(vec![no_such_bucket()]);
+    let error = minio(endpoint).get("task.md").unwrap_err();
+    assert_eq!(error.kind(), ObjectErrorKind::Other);
+    assert_eq!(
+        error.to_string(),
+        "404 NoSuchBucket: The specified bucket does not exist."
+    );
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_get_answered_404_no_such_key_is_not_found() {
+    let (endpoint, _seen) = canned(vec![not_found_answer(
+        "NoSuchKey",
+        "The specified key does not exist.",
+    )]);
+    let error = minio(endpoint).get("task.md").unwrap_err();
+    assert_eq!(error.kind(), ObjectErrorKind::NotFound);
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_put_with_a_tag_answered_404_no_such_bucket_is_other() {
+    let (endpoint, seen) = canned(vec![no_such_bucket()]);
+    let error = minio(endpoint)
+        .put("task.md", b"x", &Condition::ETag("\"a\"".to_owned()))
+        .unwrap_err();
+    assert_eq!(error.kind(), ObjectErrorKind::Other);
+    assert_eq!(requests(&seen), ["PUT if-match=\"a\""]);
+}
+
 /// The configuration every AWS S3 scenario uses.
 #[cfg(feature = "s3")]
 fn s3_config() -> S3Config {
@@ -543,6 +592,17 @@ fn s3_delete_with_a_tag_of_a_missing_object_is_precondition_failed() {
         .delete("task.md", &Condition::ETag("\"a\"".to_owned()))
         .unwrap_err();
     assert_eq!(error.kind(), ObjectErrorKind::PreconditionFailed);
+    assert_eq!(requests(&seen), ["DELETE if-match=\"a\""]);
+}
+
+#[cfg(feature = "s3")]
+#[test]
+fn s3_delete_with_a_tag_answered_404_no_such_bucket_is_other() {
+    let (endpoint, seen) = canned(vec![no_such_bucket()]);
+    let error = s3(&endpoint)
+        .delete("task.md", &Condition::ETag("\"a\"".to_owned()))
+        .unwrap_err();
+    assert_eq!(error.kind(), ObjectErrorKind::Other);
     assert_eq!(requests(&seen), ["DELETE if-match=\"a\""]);
 }
 
