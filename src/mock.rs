@@ -21,8 +21,8 @@ use std::io::Seek;
 use std::io::{self, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
-use std::time::SystemTime;
+use std::sync::{Arc, PoisonError, RwLock};
+use std::time::{Duration, SystemTime};
 
 /// Global counter for generating unique temp directory IDs.
 static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -65,12 +65,37 @@ struct MemorySystemState {
     files: BTreeMap<PathBuf, Vec<u8>>,
     /// Per-file last-modification timestamps.
     modified: BTreeMap<PathBuf, SystemTime>,
+    /// The time `now()` gives.
+    now: SystemTime,
     /// Set of PIDs considered alive (for `is_pid_alive` mock).
     #[cfg(feature = "process")]
     pids_alive: BTreeSet<u32>,
 }
 
 impl MemorySystem {
+    /// Moves the time `now()` gives forward by `by`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The internal lock cannot be acquired
+    /// - The time would overflow
+    #[inline]
+    pub fn advance(&self, by: Duration) -> io::Result<()> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        state.now = state.now.checked_add(by).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Advancing the clock overflows SystemTime",
+            )
+        })?;
+        drop(state);
+        Ok(())
+    }
+
     /// Append `chunk` to the file at `path`, creating it if this is the first
     /// write, without copying the whole file to do it.
     ///
@@ -91,7 +116,8 @@ impl MemorySystem {
                 format!("Parent directory does not exist: {}", parent.display()),
             ));
         }
-        state.modified.insert(path.to_path_buf(), SystemTime::now());
+        let now = state.now;
+        state.modified.insert(path.to_path_buf(), now);
         let slot = state.files.entry(path.to_path_buf()).or_default();
         if truncate {
             slot.clear();
@@ -176,6 +202,7 @@ impl MemorySystem {
                 env_vars: BTreeMap::new(),
                 files: BTreeMap::new(),
                 modified: BTreeMap::new(),
+                now: SystemTime::UNIX_EPOCH,
                 #[cfg(feature = "process")]
                 pids_alive: BTreeSet::new(),
             })),
@@ -283,8 +310,26 @@ impl MemorySystem {
             Self::ensure_parent_dirs(&mut state.dirs, parent);
         }
 
-        state.modified.insert(path_buf.clone(), SystemTime::now());
+        let now = state.now;
+        state.modified.insert(path_buf.clone(), now);
         state.files.insert(path_buf, contents.to_vec());
+        drop(state);
+        Ok(self)
+    }
+
+    /// The time `now()` gives (builder pattern).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The internal lock cannot be acquired
+    #[inline]
+    pub fn with_now(self, time: SystemTime) -> io::Result<Self> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        state.now = time;
         drop(state);
         Ok(self)
     }
@@ -495,6 +540,14 @@ impl System for MemorySystem {
     }
 
     #[inline]
+    fn now(&self) -> SystemTime {
+        self.state
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .now
+    }
+
+    #[inline]
     fn open(&self, path: &Path) -> io::Result<Box<dyn Read + '_>> {
         let state = self
             .state
@@ -647,7 +700,8 @@ impl System for MemorySystem {
             }
             state.files.insert(to.to_path_buf(), contents);
             state.modified.remove(from);
-            state.modified.insert(to.to_path_buf(), SystemTime::now());
+            let now = state.now;
+            state.modified.insert(to.to_path_buf(), now);
             return Ok(());
         }
 
@@ -663,6 +717,7 @@ impl System for MemorySystem {
                 .map(|(path, contents)| (path.clone(), contents.clone()))
                 .collect();
 
+            let now = state.now;
             for (old_path, contents) in files_to_move {
                 state.files.remove(&old_path);
                 state.modified.remove(&old_path);
@@ -670,7 +725,7 @@ impl System for MemorySystem {
                     .strip_prefix(from)
                     .map_err(|err| io::Error::other(err.to_string()))?;
                 let new_path = to.join(relative);
-                state.modified.insert(new_path.clone(), SystemTime::now());
+                state.modified.insert(new_path.clone(), now);
                 state.files.insert(new_path, contents);
             }
 
@@ -812,7 +867,8 @@ impl System for MemorySystem {
             ));
         }
 
-        state.modified.insert(path.to_path_buf(), SystemTime::now());
+        let now = state.now;
+        state.modified.insert(path.to_path_buf(), now);
         state.files.insert(path.to_path_buf(), contents.to_vec());
         drop(state);
         Ok(())
@@ -902,7 +958,8 @@ impl Write for MemoryAppendWriter {
             .or_insert_with(Vec::new);
         entry.extend_from_slice(&self.buffer);
         self.buffer.clear();
-        state.modified.insert(self.path.clone(), SystemTime::now());
+        let now = state.now;
+        state.modified.insert(self.path.clone(), now);
         drop(state);
         Ok(())
     }

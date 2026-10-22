@@ -7,6 +7,7 @@ use std::env::VarError;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 use tempfile::TempDir;
 
 /// Production implementation of System trait.
@@ -109,6 +110,11 @@ impl System for RealSystem {
             len: meta.len(),
             modified: meta.modified()?,
         })
+    }
+
+    #[inline]
+    fn now(&self) -> SystemTime {
+        SystemTime::now()
     }
 
     #[inline]
