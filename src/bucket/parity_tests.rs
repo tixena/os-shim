@@ -365,6 +365,30 @@ fn observe_a_put_with_the_tag_stripped_of_its_quotes() {
     eprintln!("object afterwards: {}", get_line(&bucket.get(key)));
 }
 
+/// Not a parity sequence, since `MemoryBucket` has no missing-bucket state: every call to
+/// a bucket the server does not have is `Other`, and names the server's answer.
+#[cfg(minio_tests)]
+#[test]
+fn a_missing_bucket_is_other_on_the_server() {
+    let mut config = config();
+    "os-shim-no-such-bucket".clone_into(&mut config.bucket);
+    let bucket = BlockingBucket::new(MinioBucket::new(config)).unwrap();
+    let key = "missing-bucket/note.md";
+    let got = bucket.get(key);
+    let transcript = vec![
+        get_line(&got),
+        put_line(&bucket.put(key, b"# Note\n", &Condition::None)),
+        put_line(&bucket.put(key, b"# Note\n", &Condition::ETag("\"stale\"".to_owned()))),
+        shape(&bucket.list("missing-bucket/"), |keys| {
+            format!("keys {keys:?}")
+        }),
+    ];
+    eprintln!("missing bucket on the server:\n{}", transcript.join("\n"));
+    assert_eq!(transcript, ["Other", "Other", "Other", "Other"]);
+    let message = got.unwrap_err().to_string();
+    assert!(message.starts_with("404 NoSuchBucket"), "{message}");
+}
+
 /// The value of an environment variable the S3 tests need.
 #[cfg(s3_tests)]
 fn aws_variable(name: &str) -> String {

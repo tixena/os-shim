@@ -59,7 +59,7 @@ pub enum Condition {
 pub enum ObjectErrorKind {
     /// No object at the key: HTTP 404.
     NotFound,
-    /// Any other failure: the network, a 403, a 5xx, an answer that cannot be read.
+    /// Any other failure: the network, a missing bucket, a 403, a 5xx, an answer that cannot be read.
     Other,
     /// The condition does not hold: HTTP 412.
     PreconditionFailed,
@@ -693,7 +693,8 @@ impl Error for SdkFailure {
     }
 }
 
-/// The error for an SDK failure: 404 is `NotFound`, 412 is `PreconditionFailed`, anything else is `Other`.
+/// The error for an SDK failure: 404 is `NotFound` unless its S3 code is `NoSuchBucket`, 412 is
+/// `PreconditionFailed`, anything else is `Other`.
 #[cfg(any(feature = "minio", feature = "s3"))]
 fn classify<E>(error: SdkError<E>) -> ObjectError
 where
@@ -703,7 +704,14 @@ where
         .raw_response()
         .map(|response| response.status().as_u16())
     {
-        Some(404) => ObjectError::not_found(),
+        Some(404)
+            if error
+                .as_service_error()
+                .and_then(ProvideErrorMetadata::code)
+                != Some("NoSuchBucket") =>
+        {
+            ObjectError::not_found()
+        }
         Some(412) => ObjectError::precondition_failed(),
         _ => ObjectError::from(io::Error::other(SdkFailure {
             message: describe(&error),
