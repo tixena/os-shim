@@ -243,6 +243,68 @@ fn with_env_sets_env_var() {
 }
 
 #[test]
+fn with_dir_over_a_file_fails_and_keeps_the_file() {
+    let system = MemorySystem::new().with_file("/v/a.md", b"a").unwrap();
+
+    let kind = system
+        .clone()
+        .with_dir("/v/a.md")
+        .err()
+        .map(|err| err.kind());
+
+    assert_eq!(kind, Some(io::ErrorKind::AlreadyExists));
+    assert!(system.is_file(Path::new("/v/a.md")).unwrap());
+    assert!(!system.is_dir(Path::new("/v/a.md")).unwrap());
+}
+
+#[test]
+fn with_dir_below_a_file_fails_and_keeps_the_file() {
+    let system = MemorySystem::new().with_file("/v/a.md", b"a").unwrap();
+
+    let kind = system
+        .clone()
+        .with_dir("/v/a.md/sub")
+        .err()
+        .map(|err| err.kind());
+
+    assert_eq!(kind, Some(io::ErrorKind::NotADirectory));
+    assert!(system.is_file(Path::new("/v/a.md")).unwrap());
+    assert!(!system.is_dir(Path::new("/v/a.md")).unwrap());
+    assert!(!system.exists(Path::new("/v/a.md/sub")).unwrap());
+}
+
+#[test]
+fn with_file_below_a_file_fails_and_keeps_the_file() {
+    let system = MemorySystem::new().with_file("/v/a.md", b"a").unwrap();
+
+    let kind = system
+        .clone()
+        .with_file("/v/a.md/b.md", b"b")
+        .err()
+        .map(|err| err.kind());
+
+    assert_eq!(kind, Some(io::ErrorKind::NotADirectory));
+    assert!(system.is_file(Path::new("/v/a.md")).unwrap());
+    assert!(!system.is_dir(Path::new("/v/a.md")).unwrap());
+    assert!(!system.exists(Path::new("/v/a.md/b.md")).unwrap());
+}
+
+#[test]
+fn with_file_over_a_folder_fails_and_keeps_the_folder() {
+    let system = MemorySystem::new().with_dir("/v/d").unwrap();
+
+    let kind = system
+        .clone()
+        .with_file("/v/d", b"d")
+        .err()
+        .map(|err| err.kind());
+
+    assert_eq!(kind, Some(io::ErrorKind::IsADirectory));
+    assert!(system.is_dir(Path::new("/v/d")).unwrap());
+    assert!(!system.is_file(Path::new("/v/d")).unwrap());
+}
+
+#[test]
 fn default_matches_new() {
     let system = MemorySystem::default();
     assert_eq!(system.current_dir().unwrap(), PathBuf::from("/"));
