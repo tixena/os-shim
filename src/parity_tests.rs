@@ -736,6 +736,87 @@ fn parity_rename_dest_parent_missing_is_not_found() {
         mock.rename(Path::new("/work/src.txt"), Path::new("/work/no/dest.txt")),
         io::ErrorKind::NotFound,
     );
+    assert_eq!(
+        real.read_to_string(&tmp.path().join("src.txt")).unwrap(),
+        "x"
+    );
+    assert_eq!(
+        mock.read_to_string(Path::new("/work/src.txt")).unwrap(),
+        "x"
+    );
+}
+
+#[test]
+fn parity_rename_file_onto_dir_is_a_directory() {
+    let real = RealSystem::new();
+    let tmp = real.create_temp_dir().unwrap();
+    real.write(&tmp.path().join("a.md"), b"a", WriteMode::Replace)
+        .unwrap();
+    real.create_dir_all(&tmp.path().join("d")).unwrap();
+
+    let mock = MemorySystem::new()
+        .with_file("/work/a.md", b"a")
+        .unwrap()
+        .with_dir("/work/d")
+        .unwrap();
+
+    assert_both_err_kind(
+        real.rename(&tmp.path().join("a.md"), &tmp.path().join("d")),
+        mock.rename(Path::new("/work/a.md"), Path::new("/work/d")),
+        io::ErrorKind::IsADirectory,
+    );
+    assert!(real.is_file(&tmp.path().join("a.md")).unwrap());
+    assert!(mock.is_file(Path::new("/work/a.md")).unwrap());
+    assert!(real.is_dir(&tmp.path().join("d")).unwrap());
+    assert!(mock.is_dir(Path::new("/work/d")).unwrap());
+    assert!(!real.is_file(&tmp.path().join("d")).unwrap());
+    assert!(!mock.is_file(Path::new("/work/d")).unwrap());
+}
+
+#[test]
+fn parity_rename_dir_onto_file_is_not_a_directory() {
+    let real = RealSystem::new();
+    let tmp = real.create_temp_dir().unwrap();
+    real.write(&tmp.path().join("a.md"), b"a", WriteMode::Replace)
+        .unwrap();
+    real.create_dir_all(&tmp.path().join("d")).unwrap();
+
+    let mock = MemorySystem::new()
+        .with_file("/work/a.md", b"a")
+        .unwrap()
+        .with_dir("/work/d")
+        .unwrap();
+
+    assert_both_err_kind(
+        real.rename(&tmp.path().join("d"), &tmp.path().join("a.md")),
+        mock.rename(Path::new("/work/d"), Path::new("/work/a.md")),
+        io::ErrorKind::NotADirectory,
+    );
+    assert!(real.is_file(&tmp.path().join("a.md")).unwrap());
+    assert!(mock.is_file(Path::new("/work/a.md")).unwrap());
+    assert!(!real.is_dir(&tmp.path().join("a.md")).unwrap());
+    assert!(!mock.is_dir(Path::new("/work/a.md")).unwrap());
+    assert!(real.is_dir(&tmp.path().join("d")).unwrap());
+    assert!(mock.is_dir(Path::new("/work/d")).unwrap());
+}
+
+#[test]
+fn parity_rename_dir_to_missing_parent_is_not_found() {
+    let real = RealSystem::new();
+    let tmp = real.create_temp_dir().unwrap();
+    real.create_dir_all(&tmp.path().join("d")).unwrap();
+
+    let mock = MemorySystem::new().with_dir("/work/d").unwrap();
+
+    assert_both_err_kind(
+        real.rename(&tmp.path().join("d"), &tmp.path().join("nope").join("d3")),
+        mock.rename(Path::new("/work/d"), Path::new("/work/nope/d3")),
+        io::ErrorKind::NotFound,
+    );
+    assert!(real.exists(&tmp.path().join("d")).unwrap());
+    assert!(mock.exists(Path::new("/work/d")).unwrap());
+    assert!(!real.exists(&tmp.path().join("nope").join("d3")).unwrap());
+    assert!(!mock.exists(Path::new("/work/nope/d3")).unwrap());
 }
 
 #[test]
