@@ -44,6 +44,9 @@ pub mod real;
 )]
 mod parity_tests;
 
+#[cfg(feature = "async")]
+use core::pin::Pin;
+use core::time::Duration;
 use std::env::VarError;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -303,6 +306,34 @@ pub trait System: Send + Sync {
 
     /// Set an environment variable.
     fn set_env_var(&self, key: &str, value: &str);
+
+    /// Waits `duration`: on the machine in `RealSystem`; in `MemorySystem`,
+    /// it moves the clock `now` gives forward by `duration` and returns at once.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - `MemorySystem`'s clock would overflow, or its state lock is poisoned.
+    fn sleep(&self, duration: Duration) -> io::Result<()>;
+
+    /// Waits `duration` without holding the thread: on tokio's timer in
+    /// `RealSystem`; in `MemorySystem`, it moves the clock forward by
+    /// `duration` when awaited.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - `MemorySystem`'s clock would overflow, or its state lock is poisoned.
+    ///
+    /// # Panics
+    ///
+    /// In `RealSystem`, when awaited outside a tokio runtime with its timer on
+    /// (`Builder::enable_time` or `Builder::enable_all`).
+    #[cfg(feature = "async")]
+    fn sleep_async(
+        &self,
+        duration: Duration,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>>;
 
     /// A pull-based zip stream of `source`, held in memory.
     ///

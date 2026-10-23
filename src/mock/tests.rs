@@ -360,3 +360,91 @@ fn default_matches_new() {
     assert_eq!(system.current_dir().unwrap(), PathBuf::from("/"));
     assert!(system.is_dir(Path::new("/")).unwrap());
 }
+
+fn epoch_plus(seconds: u64) -> SystemTime {
+    SystemTime::UNIX_EPOCH
+        .checked_add(Duration::from_secs(seconds))
+        .unwrap()
+}
+
+#[test]
+fn sleep_moves_the_clock_forward_by_the_duration() {
+    let system = MemorySystem::new().with_now(epoch_plus(100)).unwrap();
+
+    system.sleep(Duration::from_secs(2)).unwrap();
+
+    assert_eq!(system.now(), epoch_plus(102));
+}
+
+#[test]
+fn sleeping_twice_adds_the_durations() {
+    let system = MemorySystem::new().with_now(epoch_plus(100)).unwrap();
+
+    system.sleep(Duration::from_secs(2)).unwrap();
+    system.sleep(Duration::from_secs(3)).unwrap();
+
+    assert_eq!(system.now(), epoch_plus(105));
+}
+
+#[test]
+fn sleep_that_overflows_the_clock_is_invalid_input_and_leaves_it_unchanged() {
+    let near_end = epoch_plus(1_000);
+    let system = MemorySystem::new().with_now(near_end).unwrap();
+
+    let err = system.sleep(Duration::MAX).unwrap_err();
+
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(system.now(), near_end);
+}
+
+#[test]
+fn files_written_after_a_sleep_take_the_moved_clock_as_modified() {
+    let system = MemorySystem::new()
+        .with_dir("/test")
+        .unwrap()
+        .with_now(epoch_plus(100))
+        .unwrap();
+
+    system.sleep(Duration::from_secs(2)).unwrap();
+    system
+        .write(Path::new("/test/file.txt"), b"x", WriteMode::Replace)
+        .unwrap();
+
+    let meta = system.metadata(Path::new("/test/file.txt")).unwrap();
+    assert_eq!(meta.modified, epoch_plus(102));
+}
+
+#[cfg(feature = "async")]
+#[tokio::test(flavor = "current_thread")]
+async fn sleep_async_through_dyn_system_moves_the_clock_when_awaited() {
+    let system = MemorySystem::new().with_now(epoch_plus(100)).unwrap();
+    let shared: &dyn System = &system;
+
+    let pending = shared.sleep_async(Duration::from_secs(3));
+    assert_eq!(system.now(), epoch_plus(100));
+    pending.await.unwrap();
+
+    assert_eq!(system.now(), epoch_plus(103));
+}
+
+#[cfg(feature = "async")]
+#[tokio::test(flavor = "current_thread")]
+async fn sleep_async_dropped_unawaited_leaves_the_clock_where_it_was() {
+    let system = MemorySystem::new().with_now(epoch_plus(100)).unwrap();
+
+    drop(system.sleep_async(Duration::from_secs(3)));
+
+    assert_eq!(system.now(), epoch_plus(100));
+}
+
+#[cfg(feature = "async")]
+#[tokio::test(flavor = "current_thread")]
+async fn sleep_async_that_overflows_the_clock_is_invalid_input_and_leaves_it_unchanged() {
+    let near_end = epoch_plus(1_000);
+    let system = MemorySystem::new().with_now(near_end).unwrap();
+
+    let err = system.sleep_async(Duration::MAX).await.unwrap_err();
+
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(system.now(), near_end);
+}

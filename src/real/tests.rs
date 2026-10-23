@@ -7,10 +7,16 @@
 use super::RealSystem;
 use crate::System as _;
 use crate::WriteMode;
+#[cfg(any(feature = "async", slow_tests))]
+use core::time::Duration;
 use std::env::VarError;
 use std::io::{self, Read as _, Write as _};
 use std::path::Path;
+#[cfg(slow_tests)]
+use std::time::Instant as MachineInstant;
 use std::time::SystemTime;
+#[cfg(feature = "async")]
+use tokio::time::{Instant, timeout};
 
 #[test]
 fn write_then_read_to_string_roundtrips() {
@@ -525,4 +531,40 @@ fn walk_dir_follow_links_false_does_not_descend_symlinked_dir() {
     let names = relative_walk_names(system, &walk_root, false, false);
     assert!(names.iter().any(|name| name == "link"));
     assert!(!names.iter().any(|name| name == "link/inside.txt"));
+}
+
+#[cfg(feature = "async")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn sleep_async_waits_exactly_the_duration_on_tokios_paused_clock() {
+    let system = RealSystem::new();
+    let start = Instant::now();
+
+    system.sleep_async(Duration::from_secs(2)).await.unwrap();
+
+    assert_eq!(start.elapsed(), Duration::from_secs(2));
+}
+
+#[cfg(feature = "async")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn sleep_async_holds_for_its_whole_duration() {
+    let system = RealSystem::new();
+
+    let outcome = timeout(
+        Duration::from_secs(1),
+        system.sleep_async(Duration::from_secs(10)),
+    )
+    .await;
+
+    outcome.unwrap_err();
+}
+
+#[cfg(slow_tests)]
+#[test]
+fn sleep_waits_at_least_the_duration() {
+    let system = RealSystem::new();
+    let start = MachineInstant::now();
+
+    system.sleep(Duration::from_millis(50)).unwrap();
+
+    assert!(start.elapsed() >= Duration::from_millis(50));
 }
