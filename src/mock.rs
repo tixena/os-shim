@@ -127,6 +127,52 @@ impl MemorySystem {
         Ok(())
     }
 
+    /// Fail a folder rename the way a real filesystem does, before anything moves.
+    fn check_dir_rename(
+        files: &BTreeMap<PathBuf, Vec<u8>>,
+        dirs: &BTreeSet<PathBuf>,
+        from: &Path,
+        to: &Path,
+    ) -> io::Result<()> {
+        if files.contains_key(to) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                format!("Not a directory: {}", to.display()),
+            ));
+        }
+        if let Some(parent) = to.parent()
+            && !dirs.contains(parent)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Parent directory does not exist: {}", parent.display()),
+            ));
+        }
+        if to == from {
+            return Ok(());
+        }
+        if to.starts_with(from) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Cannot move a folder into itself: {} to {}",
+                    from.display(),
+                    to.display()
+                ),
+            ));
+        }
+        if dirs.contains(to)
+            && (files.keys().any(|path| path.parent() == Some(to))
+                || dirs.iter().any(|path| path.parent() == Some(to)))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::DirectoryNotEmpty,
+                format!("Directory not empty: {}", to.display()),
+            ));
+        }
+        Ok(())
+    }
+
     /// Fail with `NotADirectory` when a proper ancestor of `path` is a file, as
     /// resolving `path` on disk does.
     fn check_no_file_above(files: &BTreeMap<PathBuf, Vec<u8>>, path: &Path) -> io::Result<()> {
@@ -798,20 +844,7 @@ impl System for MemorySystem {
             ));
         }
         if state.dirs.contains(from) {
-            if state.files.contains_key(to) {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotADirectory,
-                    format!("Not a directory: {}", to.display()),
-                ));
-            }
-            if let Some(parent) = to.parent()
-                && !state.dirs.contains(parent)
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("Parent directory does not exist: {}", parent.display()),
-                ));
-            }
+            Self::check_dir_rename(&state.files, &state.dirs, from, to)?;
         }
 
         // Handle file rename
@@ -827,9 +860,9 @@ impl System for MemorySystem {
             }
             let contents = state.files.remove(from).unwrap_or_default();
             state.files.insert(to.to_path_buf(), contents);
-            state.modified.remove(from);
-            let now = state.now;
-            state.modified.insert(to.to_path_buf(), now);
+            if let Some(modified) = state.modified.remove(from) {
+                state.modified.insert(to.to_path_buf(), modified);
+            }
             return Ok(());
         }
 
@@ -845,15 +878,16 @@ impl System for MemorySystem {
                 .map(|(path, contents)| (path.clone(), contents.clone()))
                 .collect();
 
-            let now = state.now;
             for (old_path, contents) in files_to_move {
                 state.files.remove(&old_path);
-                state.modified.remove(&old_path);
+                let old_modified = state.modified.remove(&old_path);
                 let relative = old_path
                     .strip_prefix(from)
                     .map_err(|err| io::Error::other(err.to_string()))?;
                 let new_path = to.join(relative);
-                state.modified.insert(new_path.clone(), now);
+                if let Some(modified) = old_modified {
+                    state.modified.insert(new_path.clone(), modified);
+                }
                 state.files.insert(new_path, contents);
             }
 
