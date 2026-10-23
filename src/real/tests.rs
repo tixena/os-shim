@@ -10,6 +10,7 @@ use crate::WriteMode;
 #[cfg(any(feature = "async", slow_tests))]
 use core::time::Duration;
 use std::env::VarError;
+use std::fs::File;
 use std::io::{self, Read as _, Write as _};
 use std::path::Path;
 #[cfg(slow_tests)]
@@ -17,6 +18,9 @@ use std::time::Instant as MachineInstant;
 use std::time::SystemTime;
 #[cfg(feature = "async")]
 use tokio::time::{Instant, timeout};
+
+const OLD_LOCK: &[u8] = b"5f0c3e8e-9b1d-4c7a-8a43-2f6d0e1b7c55";
+const NEW_LOCK: &[u8] = b"a41c1f02-77e4-4b8e-9d0c-3e5b8f6a2d19";
 
 #[test]
 fn write_then_read_to_string_roundtrips() {
@@ -567,4 +571,48 @@ fn sleep_waits_at_least_the_duration() {
     system.sleep(Duration::from_millis(50)).unwrap();
 
     assert!(start.elapsed() >= Duration::from_millis(50));
+}
+
+#[test]
+fn remove_opened_if_leaves_a_file_made_after_the_open() {
+    let system = RealSystem::new();
+    let tmp = system.create_temp_dir().unwrap();
+    let lock = tmp.path().join("report.md.lock");
+    system.write(&lock, OLD_LOCK, WriteMode::CreateNew).unwrap();
+    let opened = File::open(&lock).unwrap();
+
+    system.remove_file(&lock).unwrap();
+    system.write(&lock, NEW_LOCK, WriteMode::CreateNew).unwrap();
+
+    assert!(!super::remove_opened_if(opened, &lock, OLD_LOCK).unwrap());
+    assert_eq!(system.read_to_string(&lock).unwrap().as_bytes(), NEW_LOCK);
+}
+
+#[test]
+fn remove_opened_if_leaves_a_file_made_after_the_open_with_the_same_contents() {
+    let system = RealSystem::new();
+    let tmp = system.create_temp_dir().unwrap();
+    let lock = tmp.path().join("report.md.lock");
+    system.write(&lock, OLD_LOCK, WriteMode::CreateNew).unwrap();
+    let opened = File::open(&lock).unwrap();
+
+    system.remove_file(&lock).unwrap();
+    system.write(&lock, OLD_LOCK, WriteMode::CreateNew).unwrap();
+
+    assert!(!super::remove_opened_if(opened, &lock, OLD_LOCK).unwrap());
+    assert_eq!(system.read_to_string(&lock).unwrap().as_bytes(), OLD_LOCK);
+}
+
+#[test]
+fn remove_opened_if_leaves_the_path_empty_when_the_file_was_removed() {
+    let system = RealSystem::new();
+    let tmp = system.create_temp_dir().unwrap();
+    let lock = tmp.path().join("report.md.lock");
+    system.write(&lock, OLD_LOCK, WriteMode::CreateNew).unwrap();
+    let opened = File::open(&lock).unwrap();
+
+    system.remove_file(&lock).unwrap();
+
+    assert!(!super::remove_opened_if(opened, &lock, OLD_LOCK).unwrap());
+    assert!(!system.exists(&lock).unwrap());
 }

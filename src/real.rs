@@ -5,6 +5,7 @@ use crate::{FileMetadata, System, TempDirHandle, WalkEntry, WriteMode};
 use core::pin::Pin;
 use core::time::Duration;
 use ignore::WalkBuilder;
+use same_file::Handle;
 use std::env;
 use std::env::VarError;
 use std::fs;
@@ -161,6 +162,11 @@ impl System for RealSystem {
     }
 
     #[inline]
+    fn remove_file_if(&self, path: &Path, contents: &[u8]) -> io::Result<bool> {
+        remove_opened_if(fs::File::open(path)?, path, contents)
+    }
+
+    #[inline]
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         fs::rename(from, to)
     }
@@ -254,6 +260,27 @@ impl TempDirHandle for RealTempDir {
     fn to_zip_stream(&self) -> io::Result<Box<dyn Read>> {
         RealSystem::new().to_zip_stream(self.inner.path())
     }
+}
+
+/// The steps of `remove_file_if` after it opens `path` as `file`.
+fn remove_opened_if(file: fs::File, path: &Path, contents: &[u8]) -> io::Result<bool> {
+    file.lock()?;
+    let mut held = Vec::new();
+    (&file).read_to_end(&mut held)?;
+    if held != contents {
+        return Ok(false);
+    }
+    let opened = Handle::from_file(file)?;
+    let still_named = match Handle::from_path(path) {
+        Ok(named) => named == opened,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    if !still_named {
+        return Ok(false);
+    }
+    fs::remove_file(path)?;
+    Ok(true)
 }
 
 #[cfg(test)]

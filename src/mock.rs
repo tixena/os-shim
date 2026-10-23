@@ -831,6 +831,37 @@ impl System for MemorySystem {
     }
 
     #[inline]
+    fn remove_file_if(&self, path: &Path, contents: &[u8]) -> io::Result<bool> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        Self::check_no_file_above(&state.files, path)?;
+
+        if state.dirs.contains(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::IsADirectory,
+                format!("Is a directory: {}", path.display()),
+            ));
+        }
+
+        let Some(held) = state.files.get(path) else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("File not found: {}", path.display()),
+            ));
+        };
+        if held.as_slice() != contents {
+            return Ok(false);
+        }
+
+        state.files.remove(path);
+        state.modified.remove(path);
+        drop(state);
+        Ok(true)
+    }
+
+    #[inline]
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         let mut state = self
             .state

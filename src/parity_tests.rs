@@ -1364,3 +1364,93 @@ fn parity_walk_dir_follow_links_agrees_without_symlinks() {
         vec!["alpha.txt", "empty.txt", "sub", "sub/beta.txt"]
     );
 }
+
+#[test]
+fn parity_remove_file_if_same_contents_removes() {
+    let real = RealSystem::new();
+    let tmp = real.create_temp_dir().unwrap();
+    let real_file = tmp.path().join("lock");
+    real.write(&real_file, b"a", WriteMode::CreateNew).unwrap();
+    let mock = MemorySystem::new().with_dir("/work").unwrap();
+    let mock_file = Path::new("/work/lock");
+    mock.write(mock_file, b"a", WriteMode::CreateNew).unwrap();
+
+    assert!(real.remove_file_if(&real_file, b"a").unwrap());
+    assert!(mock.remove_file_if(mock_file, b"a").unwrap());
+    assert!(!real.exists(&real_file).unwrap());
+    assert!(!mock.exists(mock_file).unwrap());
+}
+
+#[test]
+fn parity_remove_file_if_other_contents_keeps() {
+    let real = RealSystem::new();
+    let tmp = real.create_temp_dir().unwrap();
+    let real_file = tmp.path().join("lock");
+    real.write(&real_file, b"a", WriteMode::CreateNew).unwrap();
+    let mock = MemorySystem::new().with_dir("/work").unwrap();
+    let mock_file = Path::new("/work/lock");
+    mock.write(mock_file, b"a", WriteMode::CreateNew).unwrap();
+
+    assert!(!real.remove_file_if(&real_file, b"b").unwrap());
+    assert!(!mock.remove_file_if(mock_file, b"b").unwrap());
+    assert_eq!(real.read_to_string(&real_file).unwrap(), "a");
+    assert_eq!(mock.read_to_string(mock_file).unwrap(), "a");
+}
+
+#[test]
+fn parity_remove_file_if_missing_is_not_found() {
+    let real = RealSystem::new();
+    let tmp = real.create_temp_dir().unwrap();
+    let mock = MemorySystem::new().with_dir("/work").unwrap();
+
+    assert_both_err_kind(
+        real.remove_file_if(&tmp.path().join("missing"), b"a"),
+        mock.remove_file_if(Path::new("/work/missing"), b"a"),
+        io::ErrorKind::NotFound,
+    );
+}
+
+#[test]
+fn parity_remove_file_if_missing_parent_is_not_found() {
+    let real = RealSystem::new();
+    let tmp = real.create_temp_dir().unwrap();
+    let mock = MemorySystem::new().with_dir("/work").unwrap();
+
+    assert_both_err_kind(
+        real.remove_file_if(&tmp.path().join("missing/lock"), b"a"),
+        mock.remove_file_if(Path::new("/work/missing/lock"), b"a"),
+        io::ErrorKind::NotFound,
+    );
+}
+
+#[test]
+fn parity_remove_file_if_of_a_dir_is_a_directory() {
+    let real = RealSystem::new();
+    let tmp = real.create_temp_dir().unwrap();
+    let real_dir = tmp.path().join("d");
+    real.create_dir_all(&real_dir).unwrap();
+    let mock = MemorySystem::new().with_dir("/work/d").unwrap();
+
+    assert_both_err_kind(
+        real.remove_file_if(&real_dir, b"a"),
+        mock.remove_file_if(Path::new("/work/d"), b"a"),
+        io::ErrorKind::IsADirectory,
+    );
+}
+
+#[test]
+fn parity_remove_file_if_below_a_file_is_not_a_directory() {
+    let real = RealSystem::new();
+    let tmp = real.create_temp_dir().unwrap();
+    let mock = MemorySystem::new().with_dir("/work").unwrap();
+    real.write(&tmp.path().join("a.md"), b"a", WriteMode::Replace)
+        .unwrap();
+    mock.write(Path::new("/work/a.md"), b"a", WriteMode::Replace)
+        .unwrap();
+
+    assert_both_err_kind(
+        real.remove_file_if(&tmp.path().join("a.md/b.md"), b"a"),
+        mock.remove_file_if(Path::new("/work/a.md/b.md"), b"a"),
+        io::ErrorKind::NotADirectory,
+    );
+}
