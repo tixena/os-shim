@@ -122,6 +122,56 @@ fn rename_file_moves_content() {
 }
 
 #[test]
+fn rename_keeps_the_modification_time() {
+    let start = SystemTime::UNIX_EPOCH
+        .checked_add(Duration::from_secs(1_700_000_000))
+        .unwrap();
+    let system = MemorySystem::new()
+        .with_dir("/test")
+        .unwrap()
+        .with_now(start)
+        .unwrap();
+    system
+        .write(Path::new("/test/m.md"), b"m", WriteMode::Replace)
+        .unwrap();
+    system.advance(Duration::from_secs(60)).unwrap();
+
+    system
+        .rename(Path::new("/test/m.md"), Path::new("/test/n.md"))
+        .unwrap();
+
+    assert_eq!(
+        system.metadata(Path::new("/test/n.md")).unwrap().modified,
+        start
+    );
+}
+
+#[test]
+fn rename_of_a_folder_keeps_its_files_modification_times() {
+    let start = SystemTime::UNIX_EPOCH
+        .checked_add(Duration::from_secs(1_700_000_000))
+        .unwrap();
+    let system = MemorySystem::new()
+        .with_dir("/test/g")
+        .unwrap()
+        .with_now(start)
+        .unwrap();
+    system
+        .write(Path::new("/test/g/k.md"), b"k", WriteMode::Replace)
+        .unwrap();
+    system.advance(Duration::from_secs(60)).unwrap();
+
+    system
+        .rename(Path::new("/test/g"), Path::new("/test/h"))
+        .unwrap();
+
+    assert_eq!(
+        system.metadata(Path::new("/test/h/k.md")).unwrap().modified,
+        start
+    );
+}
+
+#[test]
 fn rename_nonexistent_returns_error() {
     let system = MemorySystem::new();
     let result = system.rename(Path::new("/missing"), Path::new("/other"));
