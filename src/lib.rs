@@ -295,6 +295,23 @@ pub trait System: Send + Sync {
     /// - The file cannot be removed.
     fn remove_file(&self, path: &Path) -> io::Result<()>;
 
+    /// Removes the file at `path` only when its contents are `contents`:
+    /// `Ok(true)` when it removed it, `Ok(false)` when the file holds other
+    /// contents or another file took its place, and it stays.
+    ///
+    /// Two callers that remove the same file through this method never both
+    /// remove it, and neither removes a file that another made at the path in
+    /// the meantime, as long as files are made there only with
+    /// `WriteMode::CreateNew`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Nothing is at the path (`NotFound`), it is a folder (`IsADirectory`),
+    ///   or a file is above it (`NotADirectory`).
+    /// - The file cannot be read or removed.
+    fn remove_file_if(&self, path: &Path, contents: &[u8]) -> io::Result<bool>;
+
     /// Rename or move a file or directory.
     ///
     /// # Errors

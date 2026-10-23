@@ -137,6 +137,10 @@ impl System for MinimalSystem {
         self.inner.remove_file(path)
     }
 
+    fn remove_file_if(&self, path: &Path, contents: &[u8]) -> io::Result<bool> {
+        self.inner.remove_file_if(path, contents)
+    }
+
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         self.inner.rename(from, to)
     }

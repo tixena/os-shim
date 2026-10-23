@@ -30,7 +30,7 @@ let system = MemorySystem::new()
 assert_eq!(config_path(&system)?, "debug = true");
 ```
 
-In production the same function takes `&os_shim::real::RealSystem::new()`, which delegates to `std::env` and `std::fs`. `System` covers environment variables, the current directory and executable, reading, writing, appending, copying, renaming and removing files, folders and their walks, metadata, temporary directories that are removed on drop, the current time, and a wait that `MemorySystem` answers by moving its clock. `MemorySystem`'s clock starts at the Unix epoch; `with_now` sets it, `advance` moves it forward, and each file `MemorySystem` writes takes its modification time from it.
+In production the same function takes `&os_shim::real::RealSystem::new()`, which delegates to `std::env` and `std::fs`. `System` covers environment variables, the current directory and executable, reading, writing, appending, copying, renaming and removing files, removing a file only while it holds what the caller read, folders and their walks, metadata, temporary directories that are removed on drop, the current time, and a wait that `MemorySystem` answers by moving its clock. `MemorySystem`'s clock starts at the Unix epoch; `with_now` sets it, `advance` moves it forward, and each file `MemorySystem` writes takes its modification time from it.
 
 ## Zip archives (`zip`)
 
