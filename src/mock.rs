@@ -461,6 +461,12 @@ impl System for MemorySystem {
                 .read()
                 .map_err(|err| io::Error::other(err.to_string()))?;
             Self::check_no_file_above(&state.files, from)?;
+            if state.dirs.contains(from) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Not a regular file: {}", from.display()),
+                ));
+            }
             state
                 .files
                 .get(from)
@@ -482,9 +488,9 @@ impl System for MemorySystem {
 
     #[inline]
     fn create(&self, path: &Path) -> io::Result<Box<dyn Write + '_>> {
-        let state = self
+        let mut state = self
             .state
-            .read()
+            .write()
             .map_err(|err| io::Error::other(err.to_string()))?;
         Self::check_no_file_above(&state.files, path)?;
         if state.dirs.contains(path) {
@@ -493,6 +499,17 @@ impl System for MemorySystem {
                 format!("Is a directory: {}", path.display()),
             ));
         }
+        if let Some(parent) = path.parent()
+            && !state.dirs.contains(parent)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Parent directory does not exist: {}", parent.display()),
+            ));
+        }
+        let now = state.now;
+        state.modified.insert(path.to_path_buf(), now);
+        state.files.insert(path.to_path_buf(), Vec::new());
         drop(state);
 
         // For create, we need a writer that updates the mock filesystem
@@ -672,9 +689,9 @@ impl System for MemorySystem {
 
     #[inline]
     fn open_append(&self, path: &Path) -> io::Result<Box<dyn Write + '_>> {
-        let state = self
+        let mut state = self
             .state
-            .read()
+            .write()
             .map_err(|err| io::Error::other(err.to_string()))?;
         Self::check_no_file_above(&state.files, path)?;
         if state.dirs.contains(path) {
@@ -682,6 +699,19 @@ impl System for MemorySystem {
                 io::ErrorKind::IsADirectory,
                 format!("Is a directory: {}", path.display()),
             ));
+        }
+        if let Some(parent) = path.parent()
+            && !state.dirs.contains(parent)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Parent directory does not exist: {}", parent.display()),
+            ));
+        }
+        if !state.files.contains_key(path) {
+            let now = state.now;
+            state.modified.insert(path.to_path_buf(), now);
+            state.files.insert(path.to_path_buf(), Vec::new());
         }
         drop(state);
 
