@@ -1,5 +1,7 @@
 # os-shim
 
+[![XERJ Corpus Hub contributor](https://hub.xerj.org/contributors/eburgos/badge.svg)](https://hub.xerj.org/contributors/eburgos)
+
 A mockable layer between Rust code and the machine it runs on. Code written against os-shim's traits runs on the real system in production and on an in-memory twin in tests, with no filesystem, server or clock to set up.
 
 | Piece | Real implementation | In-memory twin | Feature |
