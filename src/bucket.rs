@@ -320,7 +320,9 @@ impl SdkBucket {
             .map_err(classify)
         {
             Ok(head) => Ok(head.e_tag().map(str::to_owned)),
-            Err(error) if error.kind() == ObjectErrorKind::NotFound => Ok(None),
+            Err(error) if error.kind() == ObjectErrorKind::NotFound => {
+                self.object_is_missing().await
+            }
             Err(error) => Err(error),
         }
     }
@@ -396,6 +398,26 @@ impl SdkBucket {
             );
         }
         Ok(keys)
+    }
+
+    /// `Ok(None)` when the bucket exists, since a `HEAD` 404 carries no S3 code to say which of
+    /// the object and the bucket is missing.
+    async fn object_is_missing(&self) -> Result<Option<String>, ObjectError> {
+        match self.client.head_bucket().bucket(&self.bucket).send().await {
+            Ok(_) => Ok(None),
+            Err(error)
+                if error
+                    .raw_response()
+                    .map(|response| response.status().as_u16())
+                    == Some(404) =>
+            {
+                Err(ObjectError::from(io::Error::other(format!(
+                    "404: the bucket {} does not exist",
+                    self.bucket
+                ))))
+            }
+            Err(error) => Err(classify(error)),
+        }
     }
 
     /// Write `bytes` whole at `key` when `condition` holds, and give the new entity tag.

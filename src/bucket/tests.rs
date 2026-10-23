@@ -428,12 +428,15 @@ fn minio_delete_with_the_current_tag_sends_if_match() {
 #[cfg(feature = "minio")]
 #[test]
 fn minio_delete_with_a_tag_of_a_missing_object_fails_without_deleting() {
-    let (endpoint, seen) = canned(vec![answer("404 Not Found", "", "")]);
+    let (endpoint, seen) = canned(vec![
+        answer("404 Not Found", "", ""),
+        answer("200 OK", "", ""),
+    ]);
     let error = minio(endpoint)
         .delete("task.md", &Condition::ETag("\"a\"".to_owned()))
         .unwrap_err();
     assert_eq!(error.kind(), ObjectErrorKind::PreconditionFailed);
-    assert_eq!(requests(&seen), ["HEAD if-match=-"]);
+    assert_eq!(requests(&seen), ["HEAD if-match=-", "HEAD if-match=-"]);
 }
 
 #[cfg(feature = "minio")]
@@ -529,6 +532,47 @@ fn minio_get_answered_404_no_such_key_is_not_found() {
     )]);
     let error = minio(endpoint).get("task.md").unwrap_err();
     assert_eq!(error.kind(), ObjectErrorKind::NotFound);
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_delete_absent_of_a_missing_key_in_an_existing_bucket_succeeds() {
+    let (endpoint, seen) = canned(vec![
+        answer("404 Not Found", "", ""),
+        answer("200 OK", "", ""),
+    ]);
+    minio(endpoint)
+        .delete("task.md", &Condition::Absent)
+        .unwrap();
+    assert_eq!(requests(&seen), ["HEAD if-match=-", "HEAD if-match=-"]);
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_delete_absent_in_a_missing_bucket_is_other_naming_the_bucket() {
+    let (endpoint, seen) = canned(vec![
+        answer("404 Not Found", "", ""),
+        answer("404 Not Found", "", ""),
+    ]);
+    let error = minio(endpoint)
+        .delete("task.md", &Condition::Absent)
+        .unwrap_err();
+    assert_eq!(error.kind(), ObjectErrorKind::Other);
+    assert_eq!(error.to_string(), "404: the bucket archie does not exist");
+    assert_eq!(requests(&seen), ["HEAD if-match=-", "HEAD if-match=-"]);
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_delete_with_a_tag_in_a_missing_bucket_is_other() {
+    let (endpoint, _seen) = canned(vec![
+        answer("404 Not Found", "", ""),
+        answer("404 Not Found", "", ""),
+    ]);
+    let error = minio(endpoint)
+        .delete("task.md", &Condition::ETag("\"a\"".to_owned()))
+        .unwrap_err();
+    assert_eq!(error.kind(), ObjectErrorKind::Other);
 }
 
 #[cfg(feature = "minio")]
