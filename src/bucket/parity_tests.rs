@@ -389,6 +389,23 @@ fn a_missing_bucket_is_other_on_the_server() {
     assert!(message.starts_with("404 NoSuchBucket"), "{message}");
 }
 
+#[cfg(minio_tests)]
+#[test]
+fn a_delete_on_a_missing_bucket_is_other_on_the_server() {
+    let mut config = config();
+    "os-shim-no-such-bucket".clone_into(&mut config.bucket);
+    let bucket = BlockingBucket::new(MinioBucket::new(config)).unwrap();
+    let key = "missing-bucket/note.md";
+    for condition in [Condition::Absent, Condition::ETag("\"x\"".to_owned())] {
+        let error = bucket.delete(key, &condition).unwrap_err();
+        assert_eq!(error.kind(), ObjectErrorKind::Other, "{condition:?}");
+        assert!(
+            error.to_string().contains("os-shim-no-such-bucket"),
+            "{error}"
+        );
+    }
+}
+
 /// The value of an environment variable the S3 tests need.
 #[cfg(s3_tests)]
 fn aws_variable(name: &str) -> String {
