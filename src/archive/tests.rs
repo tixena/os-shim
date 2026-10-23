@@ -4,6 +4,9 @@ use super::{ZipOptions, ZipStreamWriter, to_zip_writer};
 use crate::mock::MemorySystem;
 use crate::real::RealSystem;
 use crate::{FileMetadata, System, TempDirHandle, WalkEntry, WriteMode};
+#[cfg(feature = "async")]
+use core::pin::Pin;
+use core::time::Duration;
 use std::env::VarError;
 use std::io::{self, Cursor, Read, Write, pipe};
 use std::path::{Path, PathBuf};
@@ -140,6 +143,18 @@ impl System for MinimalSystem {
 
     fn set_env_var(&self, key: &str, value: &str) {
         self.inner.set_env_var(key, value);
+    }
+
+    fn sleep(&self, duration: Duration) -> io::Result<()> {
+        self.inner.sleep(duration)
+    }
+
+    #[cfg(feature = "async")]
+    fn sleep_async(
+        &self,
+        duration: Duration,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+        self.inner.sleep_async(duration)
     }
 
     fn walk_dir(
@@ -1085,5 +1100,36 @@ fn an_entry_above_four_gibibytes_archives_and_extracts() {
     assert_eq!(
         sha256_of_extracted_entry(&destination, "big.bin"),
         sha256_of_file(&source)
+    );
+}
+
+#[test]
+fn minimal_system_passes_sleep_to_its_inner_system() {
+    let inner = MemorySystem::new();
+    let system = MinimalSystem { inner };
+
+    system.sleep(Duration::from_secs(2)).unwrap();
+
+    assert_eq!(
+        system.now(),
+        SystemTime::UNIX_EPOCH
+            .checked_add(Duration::from_secs(2))
+            .unwrap()
+    );
+}
+
+#[cfg(feature = "async")]
+#[tokio::test(flavor = "current_thread")]
+async fn minimal_system_passes_sleep_async_to_its_inner_system() {
+    let inner = MemorySystem::new();
+    let system = MinimalSystem { inner };
+
+    system.sleep_async(Duration::from_secs(3)).await.unwrap();
+
+    assert_eq!(
+        system.now(),
+        SystemTime::UNIX_EPOCH
+            .checked_add(Duration::from_secs(3))
+            .unwrap()
     );
 }

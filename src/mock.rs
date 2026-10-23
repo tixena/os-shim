@@ -9,6 +9,8 @@
     reason = "I couldn't find that trait in the core crate"
 )]
 
+#[cfg(feature = "async")]
+use core::pin::Pin;
 use tracing::error;
 
 #[cfg(feature = "zip")]
@@ -894,6 +896,20 @@ impl System for MemorySystem {
             .write()
             .expect("MemorySystem lock poisoned in set_env_var");
         state.env_vars.insert(key.to_owned(), value.to_owned());
+    }
+
+    #[inline]
+    fn sleep(&self, duration: Duration) -> io::Result<()> {
+        self.advance(duration)
+    }
+
+    #[cfg(feature = "async")]
+    #[inline]
+    fn sleep_async(
+        &self,
+        duration: Duration,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+        Box::pin(async move { self.advance(duration) })
     }
 
     #[inline]

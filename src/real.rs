@@ -1,14 +1,20 @@
 //! Real system implementation using `std::env` and `std::fs`.
 
 use crate::{FileMetadata, System, TempDirHandle, WalkEntry, WriteMode};
+#[cfg(feature = "async")]
+use core::pin::Pin;
+use core::time::Duration;
 use ignore::WalkBuilder;
 use std::env;
 use std::env::VarError;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::SystemTime;
 use tempfile::TempDir;
+#[cfg(feature = "async")]
+use tokio::time;
 
 /// Production implementation of System trait.
 ///
@@ -166,6 +172,24 @@ impl System for RealSystem {
         unsafe {
             env::set_var(key, value);
         }
+    }
+
+    #[inline]
+    fn sleep(&self, duration: Duration) -> io::Result<()> {
+        thread::sleep(duration);
+        Ok(())
+    }
+
+    #[cfg(feature = "async")]
+    #[inline]
+    fn sleep_async(
+        &self,
+        duration: Duration,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+        Box::pin(async move {
+            time::sleep(duration).await;
+            Ok(())
+        })
     }
 
     #[inline]

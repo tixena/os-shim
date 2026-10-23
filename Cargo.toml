@@ -39,11 +39,11 @@ aws-sdk-s3 = { version = "1.144.0", default-features = false, features = [
 ], optional = true }
 
 [dev-dependencies]
-tokio = { version = "1.44.2", features = ["rt", "macros"] }
+tokio = { version = "1.44.2", features = ["rt", "macros", "test-util"] }
 
 [features]
 default = []
-async = []
+async = ["dep:tokio", "tokio/time"]
 minio = ["dep:tokio", "dep:aws-sdk-s3"]
 process = ["libc"]
 s3 = ["dep:tokio", "dep:aws-sdk-s3"]
