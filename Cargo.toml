@@ -50,6 +50,9 @@ process = ["libc"]
 s3 = ["dep:tokio", "dep:aws-sdk-s3"]
 zip = ["dep:zip", "dep:time"]
 
+[package.metadata.docs.rs]
+all-features = true
+
 [lints.clippy]
 all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }

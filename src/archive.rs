@@ -1,4 +1,106 @@
-//! Zip archive support for the [`System`] trait: a tree in, a zip stream out, and back.
+//! Zip archives of a [`System`] tree: pack a directory or file into zip bytes, and unpack zip bytes into a tree.
+//!
+//! Available with the `zip` feature, which is off by default:
+//!
+//! ```toml
+//! os-shim = { version = "0.1", features = ["zip"] }
+//! ```
+//!
+//! Every read and write goes through [`System`]. The same code packs from and
+//! unpacks to the real disk with `RealSystem`, or to memory with `MemorySystem`.
+//! A test can build a tree in memory, zip it, load the bytes back and compare,
+//! with no temporary files.
+//!
+//! # Where things live
+//!
+//! - Packing: [`System::to_zip_vec`], [`System::to_zip_stream`] and
+//!   [`System::to_zip_writer`] are provided methods on the trait. They use
+//!   [`ZipOptions::default`], so hidden entries are included. To change the
+//!   options, call the free function [`to_zip_writer`].
+//! - Unpacking: [`load_zip`] reads a stream that cannot seek, such as a pipe.
+//!   [`load_zip_seekable`] reads anything that implements `Read + Seek`.
+//!   `MemorySystem::from_zip_reader` and `MemorySystem::from_zip_stream` wrap
+//!   them and return a new in-memory tree.
+//! - Writing to a sink that cannot seek: [`ZipStreamWriter`].
+//!
+//! # Example: round trip through memory
+//!
+//! ```
+//! use os_shim::{System, mock::MemorySystem};
+//! use std::io::Cursor;
+//! use std::path::Path;
+//!
+//! let source = MemorySystem::new()
+//!     .with_file("/project/readme.txt", b"hello")?
+//!     .with_file("/project/src/main.rs", b"fn main() {}")?;
+//!
+//! // The directory's contents are archived, not the directory itself.
+//! let bytes = source.to_zip_vec(Path::new("/project"))?;
+//!
+//! let copy = MemorySystem::from_zip_reader(Cursor::new(bytes))?;
+//! assert_eq!(copy.read_to_string(Path::new("/readme.txt"))?, "hello");
+//! assert_eq!(copy.read_to_string(Path::new("/src/main.rs"))?, "fn main() {}");
+//! # Ok::<(), std::io::Error>(())
+//! ```
+//!
+//! # Example: leave out hidden entries
+//!
+//! The trait methods always include hidden entries. Pass options to the free
+//! function to drop them. A hidden directory is skipped with everything below it.
+//!
+//! ```
+//! use os_shim::archive::{ZipOptions, to_zip_writer};
+//! use os_shim::{System, mock::MemorySystem};
+//! use std::io::Cursor;
+//! use std::path::Path;
+//!
+//! let source = MemorySystem::new()
+//!     .with_file("/project/app.txt", b"app")?
+//!     .with_file("/project/.env", b"SECRET=1")?
+//!     .with_file("/project/.cache/data", b"cached")?;
+//!
+//! let mut bytes = Vec::new();
+//! let options = ZipOptions::default().with_hidden(false);
+//! to_zip_writer(&source, Path::new("/project"), &mut bytes, options)?;
+//!
+//! let copy = MemorySystem::from_zip_reader(Cursor::new(bytes))?;
+//! assert!(copy.exists(Path::new("/app.txt"))?);
+//! assert!(!copy.exists(Path::new("/.env"))?);
+//! assert!(!copy.exists(Path::new("/.cache"))?);
+//! # Ok::<(), std::io::Error>(())
+//! ```
+//!
+//! # Ignore rules
+//!
+//! The only filter is [`ZipOptions::include_hidden`]: an entry whose final name
+//! starts with `.` is skipped when it is `false`. There is no `.gitignore`
+//! support, no glob patterns and no custom filter.
+//!
+//! # Limits and memory
+//!
+//! - Packing builds the whole archive in memory before it writes a byte to the
+//!   sink. `System::to_zip_vec` and `System::to_zip_stream` hold about twice the
+//!   archive size at their peak. Keep archives under about 1 GiB. The code sets
+//!   no size limit.
+//! - `System::to_zip_stream` is not lazy: it returns a cursor over a finished
+//!   archive, so the first byte is available only after the last is built.
+//! - Unpacking streams each entry through a fixed buffer, so it uses constant
+//!   memory. It sets no limit on the unpacked size, so an untrusted archive can
+//!   expand without bound. Unpacking is not atomic: if a later entry fails, the
+//!   earlier files stay.
+//! - An entry whose name would leave the destination, such as `../x`, is
+//!   refused with an error. Unpack untrusted archives into a `MemorySystem` first
+//!   if you want to look at them before anything touches disk.
+//!
+//! # What the archive looks like
+//!
+//! - Entry names use `/` and are relative to the source.
+//! - Directories come first, then files, each sorted by path.
+//! - Files are deflated and carry the source's modification time, clamped to the
+//!   zip range of 1980-01-01 to 2107-12-31. The in-memory tree stamps directories
+//!   with the Unix epoch, so those entries read 1980-01-01.
+//! - A symlink that points back into the tree is listed but not entered again, so
+//!   a cycle cannot loop forever.
 
 use crate::System;
 use alloc::collections::BTreeSet;
@@ -16,16 +118,31 @@ const COPY_BUFFER_BYTES: usize = 0x1_0000;
 /// First year a ZIP timestamp can express.
 const ZIP_EPOCH_YEAR: i32 = 1980;
 
-/// Options controlling archive construction.
+/// Options for [`to_zip_writer`].
+///
+/// Start from [`ZipOptions::default`] and adjust with the builder methods. The
+/// type is `#[non_exhaustive]`, so a struct literal does not compile outside this
+/// crate. The `System::to_zip_*` trait methods always use the default options.
+///
+/// ```
+/// use os_shim::archive::ZipOptions;
+///
+/// let options = ZipOptions::default().with_hidden(false);
+/// assert!(!options.include_hidden);
+/// assert!(ZipOptions::default().include_hidden);
+/// ```
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct ZipOptions {
-    /// Whether dot-prefixed entries are archived.
+    /// Whether entries whose name starts with `.` are archived. The default is
+    /// `true`. When `false`, a hidden directory is skipped with everything below it.
     pub include_hidden: bool,
 }
 
 impl ZipOptions {
     /// Set whether dot-prefixed entries are archived (builder pattern).
+    ///
+    /// `false` also skips everything below a hidden directory.
     #[must_use]
     #[inline]
     pub const fn with_hidden(mut self, include_hidden: bool) -> Self {
@@ -45,9 +162,35 @@ impl Default for ZipOptions {
 
 /// A zip writer that writes one entry at a time into a sink that cannot seek.
 ///
+/// Use it when the sink is a socket or a pipe and you do not want to build the
+/// whole tree in memory first. Call [`start_entry`](Self::start_entry), write the
+/// entry's bytes with the [`Write`] methods, repeat, then call
+/// [`finish`](Self::finish). Write only after the first `start_entry`.
+///
 /// Each entry is deflated and its sizes follow its data in a data descriptor,
 /// so the archive loads through [`load_zip_seekable`] and not through
-/// [`load_zip`], which needs the sizes in the local header.
+/// [`load_zip`], which needs the sizes in the local header. Entries carry no
+/// modification time.
+///
+/// ```
+/// use os_shim::{System, mock::MemorySystem};
+/// use os_shim::archive::ZipStreamWriter;
+/// use std::io::{Cursor, Write};
+/// use std::path::Path;
+///
+/// let mut writer = ZipStreamWriter::new(Vec::new());
+/// writer.start_entry("notes/hello.txt")?;
+/// writer.write_all(b"hello")?;
+/// writer.start_entry("notes/bye.txt")?;
+/// writer.write_all(b"bye")?;
+/// let bytes = writer.finish()?;
+///
+/// // Read it back with the seekable loader, not `load_zip`.
+/// let system = MemorySystem::from_zip_reader(Cursor::new(bytes))?;
+/// assert_eq!(system.read_to_string(Path::new("/notes/hello.txt"))?, "hello");
+/// assert_eq!(system.read_to_string(Path::new("/notes/bye.txt"))?, "bye");
+/// # Ok::<(), std::io::Error>(())
+/// ```
 pub struct ZipStreamWriter<W: Write> {
     /// The zip writer over the sink.
     zip: ZipWriter<StreamWriter<W>>,
@@ -55,6 +198,9 @@ pub struct ZipStreamWriter<W: Write> {
 
 impl<W: Write> ZipStreamWriter<W> {
     /// Write the central directory and give the sink back.
+    ///
+    /// Call it once, after the last entry. Without it the archive has no
+    /// central directory and cannot be read.
     ///
     /// # Errors
     ///
@@ -68,6 +214,8 @@ impl<W: Write> ZipStreamWriter<W> {
     }
 
     /// A writer over `sink`, with no entry started.
+    ///
+    /// Nothing is written to `sink` until the first entry starts.
     #[must_use]
     #[inline]
     pub fn new(sink: W) -> Self {
@@ -78,6 +226,10 @@ impl<W: Write> ZipStreamWriter<W> {
 
     /// End the entry being written, if any, and start the next; the bytes
     /// written next are its content.
+    ///
+    /// `name` is used as given. Use `/` between parts, as in `dir/file.txt`.
+    /// The entry is deflated, has no modification time and no zip64 flag, so a
+    /// very large entry may fail.
     ///
     /// # Errors
     ///
@@ -210,12 +362,35 @@ fn is_hidden(path: &Path) -> bool {
 ///
 /// The reader need not be seekable, so a pipe is a valid source. An entry whose
 /// sizes follow its data in a data descriptor cannot be sized from a stream and is
-/// refused; [`load_zip_seekable`] reads such archives.
+/// refused; [`load_zip_seekable`] reads such archives. Archives from
+/// [`to_zip_writer`] and the `System::to_zip_*` methods load here;
+/// archives from [`ZipStreamWriter`] do not.
+///
+/// `destination` is created first, with its parents. Existing files at the
+/// same paths are overwritten. Memory use is constant, but nothing limits the
+/// unpacked size.
+///
+/// ```
+/// use os_shim::archive::load_zip;
+/// use os_shim::{System, mock::MemorySystem};
+/// use std::path::Path;
+///
+/// let source = MemorySystem::new().with_file("/data/a.txt", b"alpha")?;
+/// let bytes = source.to_zip_vec(Path::new("/data"))?;
+///
+/// let target = MemorySystem::new();
+/// let mut reader: &[u8] = &bytes;
+/// load_zip(&target, &mut reader, Path::new("/unpacked"))?;
+/// assert_eq!(target.read_to_string(Path::new("/unpacked/a.txt"))?, "alpha");
+/// # Ok::<(), std::io::Error>(())
+/// ```
 ///
 /// # Errors
 ///
-/// Returns an error if the archive is malformed, an entry name escapes the
-/// destination, or an entry cannot be written.
+/// Returns an error if the archive is malformed, an entry uses a data
+/// descriptor, an entry name escapes the destination (an absolute name or one
+/// with `..` that climbs out), or an entry cannot be written. Entries written
+/// before the failure stay in place.
 #[inline]
 pub fn load_zip<S>(system: &S, mut source: &mut dyn Read, destination: &Path) -> io::Result<()>
 where
@@ -233,12 +408,34 @@ where
 /// Entries are found through the central directory at the end of the archive,
 /// so an entry whose sizes follow its data in a data descriptor loads too;
 /// [`load_zip`] refuses those, because a stream offers nothing past the local
-/// header to size the entry by.
+/// header to size the entry by. Entries are extracted in central-directory order.
+///
+/// `destination` is created first, with its parents. Existing files at the
+/// same paths are overwritten. Memory use is constant, but nothing limits the
+/// unpacked size.
+///
+/// ```
+/// use os_shim::archive::{ZipStreamWriter, load_zip_seekable};
+/// use os_shim::{System, mock::MemorySystem};
+/// use std::io::{Cursor, Write};
+/// use std::path::Path;
+///
+/// let mut writer = ZipStreamWriter::new(Vec::new());
+/// writer.start_entry("logs/today.txt")?;
+/// writer.write_all(b"ok")?;
+/// let bytes = writer.finish()?;
+///
+/// let system = MemorySystem::new();
+/// load_zip_seekable(&system, Cursor::new(bytes), Path::new("/restore"))?;
+/// assert_eq!(system.read_to_string(Path::new("/restore/logs/today.txt"))?, "ok");
+/// # Ok::<(), std::io::Error>(())
+/// ```
 ///
 /// # Errors
 ///
 /// Returns an error if the archive is malformed, an entry name escapes the
-/// destination, or an entry cannot be written.
+/// destination (an absolute name or one with `..` that climbs out), or an entry
+/// cannot be written. Entries written before the failure stay in place.
 #[inline]
 pub fn load_zip_seekable<S, R>(system: &S, source: R, destination: &Path) -> io::Result<()>
 where
@@ -291,11 +488,36 @@ where
 /// A directory contributes its *contents*: archiving `A/` yields `file.txt`, not
 /// `A/file.txt`. A lone file yields exactly one entry, named after the file.
 ///
+/// This is the only way to pass [`ZipOptions`]; the `System::to_zip_*` trait
+/// methods call it with the defaults. The archive is built in memory and written
+/// to `sink` in one `write_all` call. Keep archives under about 1 GiB.
+///
+/// Directory entries come first, then files, each sorted by path. Files are
+/// deflated and written with zip64 fields. Modification times are clamped to the
+/// zip range of 1980-01-01 to 2107-12-31.
+///
+/// ```
+/// use os_shim::mock::MemorySystem;
+/// use os_shim::archive::{ZipOptions, to_zip_writer};
+/// use std::path::Path;
+///
+/// let system = MemorySystem::new().with_file("/docs/guide.txt", b"read me")?;
+///
+/// let mut bytes = Vec::new();
+/// to_zip_writer(&system, Path::new("/docs/guide.txt"), &mut bytes, ZipOptions::default())?;
+/// assert!(!bytes.is_empty());
+///
+/// let missing = to_zip_writer(&system, Path::new("/nope"), &mut Vec::new(), ZipOptions::default());
+/// assert_eq!(missing.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+/// # Ok::<(), std::io::Error>(())
+/// ```
+///
 /// # Errors
 ///
 /// Returns an error if:
-/// - `source` does not exist.
-/// - The source tree cannot be read, or holds a name with no ZIP representation.
+/// - `source` is neither a file nor a directory: kind `NotFound`.
+/// - The source tree cannot be read, or holds a name that is not UTF-8 and so has
+///   no zip representation.
 /// - The sink cannot be written.
 #[inline]
 pub fn to_zip_writer<S>(

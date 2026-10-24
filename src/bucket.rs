@@ -1,5 +1,94 @@
-//! Whole objects in one bucket of an object store: an asynchronous interface,
-//! an in-memory bucket for tests, and a synchronous wrapper.
+//! Whole objects in one bucket of an S3-compatible object store, written and
+//! deleted under conditions, with an in-memory twin for tests.
+//!
+//! Available with the `minio` or the `s3` feature. The `Bucket` trait can be
+//! named and implemented only with the `async` feature as well.
+//!
+//! # What it is
+//!
+//! The module reads, writes, deletes and lists whole objects by key. It has no
+//! ranges, no streaming, no metadata, no copy and no versions. Every put and
+//! delete takes a [`Condition`]:
+//!
+//! - [`Condition::None`]: no check. A put replaces, a delete removes.
+//! - [`Condition::Absent`]: the put succeeds only if no object is at the key.
+//! - [`Condition::ETag`]: the put or delete succeeds only if the object at the
+//!   key has this entity tag.
+//!
+//! A put returns the new entity tag. A get returns the bytes with their tag
+//! ([`Object`]). A failed condition is an [`ObjectError`] whose
+//! [`kind`](ObjectError::kind) is [`ObjectErrorKind::PreconditionFailed`], the
+//! same on every implementation.
+//!
+//! # The pieces
+//!
+//! - `Bucket`: the asynchronous trait with `get`, `put`, `delete` and `list`.
+//!   Its methods return `impl Future + Send`, so it cannot be a trait object;
+//!   take a generic `B: Bucket`.
+//! - `MinioBucket` and `MinioConfig` (feature `minio`): a client for `MinIO`,
+//!   `RustFS` and other servers that speak its API. Path-style addressing.
+//! - `S3Bucket` and `S3Config` (feature `s3`): a client for AWS S3.
+//! - [`MemoryBucket`]: the same interface over a map in memory. No server, no
+//!   network. Clones share the same objects.
+//! - [`BlockingBucket`]: wraps any `Bucket` for code that is not async. It owns
+//!   a tokio runtime.
+//!
+//! # When to use it
+//!
+//! - **Claim a lock or lease.** Put with `Condition::Absent`; only one caller
+//!   wins. Renew or release it with the tag the put returned.
+//! - **Edit a shared document.** Get, change the bytes, put with
+//!   `Condition::ETag(object.etag)`. On `PreconditionFailed`, get again and
+//!   retry. No update is lost.
+//! - **Test with no server.** Write the code against a generic `B: Bucket`,
+//!   run it on `MinioBucket` or `S3Bucket` in production and on
+//!   [`MemoryBucket`] in tests. A test can play two clients with two clones.
+//!
+//! # Example
+//!
+//! Claim a key, then update it only while nobody else has changed it:
+//!
+//! ```
+//! use os_shim::bucket::{BlockingBucket, Condition, MemoryBucket, ObjectErrorKind};
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let shared = MemoryBucket::default();
+//! let ours = BlockingBucket::new(shared.clone())?;
+//! let theirs = BlockingBucket::new(shared)?;
+//!
+//! // Create if absent: the first caller wins, the second is refused.
+//! let first_tag = ours.put("jobs/42", b"claimed by ours", &Condition::Absent)?;
+//! let refused = theirs.put("jobs/42", b"claimed by theirs", &Condition::Absent);
+//! assert_eq!(
+//!     refused.unwrap_err().kind(),
+//!     ObjectErrorKind::PreconditionFailed
+//! );
+//!
+//! // Update if unchanged: the tag from the get says what we saw.
+//! let seen = ours.get("jobs/42")?;
+//! assert_eq!(seen.etag, first_tag);
+//! ours.put("jobs/42", b"done", &Condition::ETag(seen.etag.clone()))?;
+//!
+//! // The same tag is now stale, so a second update with it is refused.
+//! let stale = theirs.put("jobs/42", b"overwrite", &Condition::ETag(seen.etag));
+//! assert_eq!(
+//!     stale.unwrap_err().kind(),
+//!     ObjectErrorKind::PreconditionFailed
+//! );
+//! assert_eq!(theirs.get("jobs/42")?.bytes, b"done");
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Things that bite
+//!
+//! - The clients never retry. A network failure or a 5xx is an
+//!   [`ObjectErrorKind::Other`] error and the caller decides what to do.
+//! - Credentials are a fixed access key and secret key. There is no session
+//!   token and no environment or profile lookup.
+//! - Entity tags differ between implementations. A tag from [`MemoryBucket`]
+//!   means nothing to a real store, and the reverse.
+//! - [`BlockingBucket`] panics when called from inside a tokio runtime.
 
 #[macro_use]
 mod interface;
@@ -32,40 +121,80 @@ use tokio::runtime::{Builder, Runtime};
 declare_bucket!();
 
 /// One object: its bytes and the entity tag the store gave it.
+///
+/// Returned by `get`. It cannot be built outside this crate. Pass `etag` back
+/// in [`Condition::ETag`] to write or delete only if the object has not changed
+/// since you read it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Object {
     /// The object's content.
     pub bytes: Vec<u8>,
     /// The `ETag` exactly as the store gave it, quotes included.
+    ///
+    /// Pass it back unchanged. A real store computes it its own way; on
+    /// [`MemoryBucket`] it is a hash of the bytes, so the same bytes always
+    /// give the same tag.
     pub etag: String,
 }
 
 /// What a put or a delete waits for.
+///
+/// Import the variants by path (`Condition::None`), not with `use
+/// Condition::*`, where `None` hides `Option::None`. The enum is
+/// `non_exhaustive`: a `match` outside this crate needs a `_` arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Condition {
     /// No object is at the key: `If-None-Match: *`.
+    ///
+    /// On a put, this creates the object only if the key is free. On a delete
+    /// it deletes nothing: it succeeds if the key is empty and fails with
+    /// `PreconditionFailed` if an object is there.
     Absent,
     /// The object at the key has this entity tag: `If-Match`.
+    ///
+    /// Give the tag as `get` or `put` returned it, quotes included. If the key
+    /// is empty, a put or a delete with this condition fails with
+    /// `PreconditionFailed`, not `NotFound`.
     ETag(String),
     /// Nothing: a put replaces and a delete removes whatever is there.
+    ///
+    /// A delete of a key with no object succeeds.
     None,
 }
 
 /// Which way a bucket operation failed.
+///
+/// Read it with [`ObjectError::kind`]. The enum is `non_exhaustive`: a `match`
+/// outside this crate needs a `_` arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ObjectErrorKind {
     /// No object at the key: HTTP 404.
+    ///
+    /// Only `get` returns it. Do not retry; the object is not there.
     NotFound,
     /// Any other failure: the network, a missing bucket, a 403, a 5xx, an answer that cannot be read.
+    ///
+    /// A missing bucket is this kind, not `NotFound`. Nothing is retried for
+    /// you, so a transient failure is yours to retry. The error's `source`
+    /// has the detail.
     Other,
     /// The condition does not hold: HTTP 412.
+    ///
+    /// Someone else got there first, or the tag is stale, or the key is empty
+    /// under [`Condition::ETag`]. The object is unchanged. Get it again and
+    /// decide whether to retry.
     PreconditionFailed,
 }
 
 /// Why a bucket operation failed.
+///
+/// Branch on [`kind`](Self::kind). The only public way to make one is
+/// `From<io::Error>`, which gives kind [`ObjectErrorKind::Other`]. `Display`
+/// shows the underlying error of an `Other` failure, else a fixed phrase for
+/// the kind.
 #[derive(Debug)]
 pub struct ObjectError {
     /// Which way it failed.
@@ -134,6 +263,41 @@ impl Error for ObjectError {
 }
 
 /// Objects in memory, for tests that reach no server.
+///
+/// It follows the same rules as the real clients: [`Condition`] and
+/// [`ObjectErrorKind`] mean the same, and a condition is checked and applied in
+/// one step. Make one with `MemoryBucket::default()`. Clones share the same
+/// objects, so a test can play two clients with two clones.
+///
+/// Its entity tag is a hash of the bytes in double quotes, so the same bytes
+/// give the same tag, and putting identical bytes again does not change it.
+/// Tags from a real store are not comparable. `list` returns keys sorted.
+///
+/// ```
+/// use os_shim::bucket::{BlockingBucket, Condition, MemoryBucket, ObjectErrorKind};
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let bucket = BlockingBucket::new(MemoryBucket::default())?;
+///
+/// let tag = bucket.put("config.json", b"{\"v\":1}", &Condition::Absent)?;
+/// assert!(bucket
+///     .put("config.json", b"{\"v\":2}", &Condition::Absent)
+///     .is_err());
+///
+/// let object = bucket.get("config.json")?;
+/// assert_eq!(object.etag, tag);
+///
+/// bucket.put("config.json", b"{\"v\":2}", &Condition::ETag(tag.clone()))?;
+/// let stale = bucket.delete("config.json", &Condition::ETag(tag));
+/// assert_eq!(
+///     stale.unwrap_err().kind(),
+///     ObjectErrorKind::PreconditionFailed
+/// );
+///
+/// assert_eq!(bucket.list("config")?, ["config.json"]);
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, Default)]
 pub struct MemoryBucket {
     /// The bytes at each key.
@@ -227,6 +391,10 @@ impl Bucket for MemoryBucket {
 ///
 /// A call from code already inside a tokio runtime panics; such code uses
 /// the asynchronous interface directly.
+///
+/// Wrap [`MemoryBucket`], `MinioBucket` or `S3Bucket`. The methods take the
+/// same arguments and return the same results as the `Bucket` trait, without
+/// the futures. It cannot be cloned and gives no access to the bucket inside.
 #[derive(Debug)]
 pub struct BlockingBucket<B> {
     /// The bucket each call reaches.
@@ -241,6 +409,11 @@ impl<B: Bucket> BlockingBucket<B> {
     /// # Errors
     ///
     /// `PreconditionFailed` when `condition` does not hold, the object unchanged.
+    /// `Other` when the store cannot be reached or refuses.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from inside a tokio runtime.
     #[inline]
     pub fn delete(&self, key: &str, condition: &Condition) -> Result<(), ObjectError> {
         self.runtime.block_on(self.bucket.delete(key, condition))
@@ -251,6 +424,11 @@ impl<B: Bucket> BlockingBucket<B> {
     /// # Errors
     ///
     /// `NotFound` when no object is at `key`.
+    /// `Other` when the store cannot be reached or refuses.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from inside a tokio runtime.
     #[inline]
     pub fn get(&self, key: &str) -> Result<Object, ObjectError> {
         self.runtime.block_on(self.bucket.get(key))
@@ -261,12 +439,19 @@ impl<B: Bucket> BlockingBucket<B> {
     /// # Errors
     ///
     /// `Other` when a page cannot be read.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from inside a tokio runtime.
     #[inline]
     pub fn list(&self, prefix: &str) -> Result<Vec<String>, ObjectError> {
         self.runtime.block_on(self.bucket.list(prefix))
     }
 
     /// A blocking bucket over `bucket`.
+    ///
+    /// Each one builds its own current-thread runtime, so make it once and
+    /// reuse it.
     ///
     /// # Errors
     ///
@@ -282,6 +467,11 @@ impl<B: Bucket> BlockingBucket<B> {
     /// # Errors
     ///
     /// `PreconditionFailed` when `condition` does not hold, the object unchanged.
+    /// `Other` when the store cannot be reached or refuses.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from inside a tokio runtime.
     #[inline]
     pub fn put(
         &self,
@@ -452,6 +642,10 @@ impl SdkBucket {
 }
 
 /// Where a `MinIO`-compatible server is, and the keys that sign every request.
+///
+/// Available with the `minio` feature. The arguments of [`new`](Self::new) are
+/// all strings, so keep their order straight: endpoint, region, bucket,
+/// access key, secret key. `Debug` prints the secret key as `<redacted>`.
 #[cfg(feature = "minio")]
 #[derive(Clone)]
 #[non_exhaustive]
@@ -460,9 +654,11 @@ pub struct MinioConfig {
     pub access_key: String,
     /// The bucket every operation reaches.
     pub bucket: String,
-    /// The server's address: scheme, host and port.
+    /// The server's address: scheme, host and port, such as `http://localhost:9000`.
     pub endpoint: String,
     /// The region requests are signed for, such as `us-east-1`.
+    ///
+    /// `MinIO` does not care which, but a value is required.
     pub region: String,
     /// The secret key; `Debug` prints it as `<redacted>`.
     pub secret_key: String,
@@ -508,6 +704,12 @@ impl fmt::Debug for MinioConfig {
 ///
 /// A delete with an entity-tag condition reads the object's tag first, because
 /// `MinIO`'s server ignores `If-Match` on a delete, and sends `If-Match` as well.
+/// The read and the delete are two requests, so a write between them can slip through
+/// on servers that ignore `If-Match`.
+///
+/// Available with the `minio` feature. It uses path-style addressing, a fixed
+/// access key and secret key, and never retries. It implements `Bucket`; wrap
+/// it in [`BlockingBucket`] for synchronous code.
 #[cfg(feature = "minio")]
 #[derive(Debug)]
 pub struct MinioBucket(
@@ -572,6 +774,10 @@ impl Bucket for MinioBucket {
 }
 
 /// The AWS S3 bucket to reach, and the keys that sign every request.
+///
+/// Available with the `s3` feature. The order of the arguments of
+/// [`new`](Self::new) is region, bucket, access key, secret key. `Debug`
+/// prints the secret key as `<redacted>`.
 #[cfg(feature = "s3")]
 #[derive(Clone)]
 #[non_exhaustive]
@@ -622,6 +828,10 @@ impl fmt::Debug for S3Config {
 /// A client for an AWS S3 bucket, over AWS's SDK.
 ///
 /// A delete with an entity-tag condition sends `If-Match` and lets AWS check it.
+///
+/// Available with the `s3` feature. It uses a fixed access key and secret key
+/// and never retries. It implements `Bucket`; wrap it in [`BlockingBucket`] for
+/// synchronous code.
 #[cfg(feature = "s3")]
 #[derive(Debug)]
 pub struct S3Bucket(

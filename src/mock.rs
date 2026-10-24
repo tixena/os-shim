@@ -1,4 +1,100 @@
-//! In-memory system implementation for testing.
+//! [`MemorySystem`]: a [`System`] that lives entirely in memory.
+//!
+//! Write your code against `&dyn System` (or a generic `S: System`). Use
+//! [`RealSystem`](crate::real::RealSystem) in production and `MemorySystem` in
+//! tests. The test then needs no disk, no temporary folders, no real
+//! environment variables, no real clock and no real processes.
+//!
+//! # What it holds
+//!
+//! One `MemorySystem` holds files, folders, environment variables, a current
+//! folder, a current executable path, a clock and (with the `process` feature)
+//! a set of live process ids. A new one starts with:
+//!
+//! - one folder, `/`;
+//! - current folder `/` and current executable `/mock/exe`;
+//! - no files and no environment variables;
+//! - the clock at [`SystemTime::UNIX_EPOCH`];
+//! - no live process ids.
+//!
+//! `Clone` gives a second handle to the same state, not a copy. Each
+//! `MemorySystem` made by [`new`](MemorySystem::new) has its own state, so
+//! tests that run in parallel do not see each other.
+//!
+//! The ways it differs from the real machine are listed under
+//! [Differences to know about](#differences-to-know-about).
+//!
+//! # Set it up
+//!
+//! The `with_*` builders each take `self` and return `io::Result<Self>`. They
+//! fail only on a poisoned lock or on a clash such as a file where a folder
+//! must go. Chain them with `?`:
+//!
+//! ```
+//! use os_shim::{System, mock::MemorySystem};
+//! use std::path::Path;
+//!
+//! let system = MemorySystem::new()
+//!     .with_env("HOME", "/home/user")?
+//!     .with_file("/home/user/.app.toml", b"name = \"demo\"")?
+//!     .with_current_dir("/home/user")?;
+//!
+//! // `with_file` made the parent folders.
+//! assert!(system.is_dir(Path::new("/home/user"))?);
+//! // A relative path is joined onto the current folder.
+//! assert_eq!(
+//!     system.read_to_string(&system.canonicalize(Path::new(".app.toml"))?)?,
+//!     "name = \"demo\""
+//! );
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! # Time
+//!
+//! The clock only moves when you move it. [`advance`](MemorySystem::advance)
+//! and [`System::sleep`] both add to it and return at once. Every file takes
+//! its modified time from the clock when it is written. A test for a lock that
+//! expires after 60 seconds therefore runs in microseconds:
+//!
+//! ```
+//! use os_shim::{System, mock::MemorySystem};
+//! use std::path::Path;
+//! use std::time::Duration;
+//!
+//! let system = MemorySystem::new().with_file("/app.lock", b"owner-1")?;
+//! let taken_at = system.metadata(Path::new("/app.lock"))?.modified;
+//!
+//! system.sleep(Duration::from_secs(61))?;
+//!
+//! let age = system.now().duration_since(taken_at)?;
+//! assert!(age > Duration::from_secs(60));
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! # Errors match the real system
+//!
+//! The same call fails with the same [`io::ErrorKind`] on `MemorySystem` and on
+//! `RealSystem`: `NotFound` for a missing path, `AlreadyExists` for
+//! `WriteMode::CreateNew` onto an existing path, `IsADirectory` for a file call
+//! on a folder, `NotADirectory` for a file used as a folder. The crate's parity
+//! tests run the same operations on both and compare the answers, so code that
+//! branches on the error kind behaves the same under test.
+//!
+//! # Differences to know about
+//!
+//! - There are no symbolic links. [`System::walk_dir`] ignores `follow_links`
+//!   and has no `.gitignore` handling, which `RealSystem` has.
+//! - [`System::canonicalize`] only joins a relative path onto the current
+//!   folder. It does not check that the path exists.
+//! - [`System::read_dir`] gives no order. [`System::walk_dir`] sorts by path.
+//! - [`System::create_temp_dir`] gives `/tmp/mock_<n>` inside the memory
+//!   filesystem, never a real folder.
+//!
+//! # Features
+//!
+//! - `process`: adds `MemorySystem::with_pid` and answers `System::is_pid_alive`.
+//! - `async`: adds `System::sleep_async`, which advances the clock when awaited.
+//! - `zip`: adds `MemorySystem::from_zip_reader` and `MemorySystem::from_zip_stream`.
 
 #![expect(
     clippy::std_instead_of_alloc,
@@ -29,10 +125,16 @@ use std::time::{Duration, SystemTime};
 /// Global counter for generating unique temp directory IDs.
 static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// In-memory implementation of System trait for testing.
+/// In-memory implementation of [`System`] for testing.
 ///
-/// `MemorySystem` provides an in-memory filesystem and environment,
-/// perfect for fast, isolated unit tests without side effects.
+/// `MemorySystem` provides an in-memory filesystem, environment, clock and
+/// process table, for fast, isolated unit tests without side effects. Build one
+/// with [`new`](Self::new) and the `with_*` builders, then pass it where your
+/// code takes `&dyn System`. Use [`advance`](Self::advance) or [`System::sleep`]
+/// to move its clock.
+///
+/// Clones share state: `system.clone()` is a second handle to the same files,
+/// not a snapshot. [`Default`] is the same as [`new`](Self::new).
 ///
 /// # Example
 /// ```
@@ -46,6 +148,44 @@ static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 ///
 /// assert_eq!(system.env_var("HOME").unwrap(), "/home/user");
 /// assert!(system.exists(Path::new("/test/file.txt")).unwrap());
+/// ```
+///
+/// # Shared state
+///
+/// ```
+/// use os_shim::{System, WriteMode, mock::MemorySystem};
+/// use std::path::Path;
+///
+/// let system = MemorySystem::new();
+/// let handle = system.clone();
+///
+/// handle.write(Path::new("/note.txt"), b"hi", WriteMode::CreateNew)?;
+///
+/// assert_eq!(system.read_to_string(Path::new("/note.txt"))?, "hi");
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+///
+/// # Errors that match the disk
+///
+/// ```
+/// use os_shim::{System, WriteMode, mock::MemorySystem};
+/// use std::io::ErrorKind;
+/// use std::path::Path;
+///
+/// let system = MemorySystem::new();
+/// let path = Path::new("/app.lock");
+///
+/// system.write(path, b"first", WriteMode::CreateNew)?;
+/// let second = system.write(path, b"second", WriteMode::CreateNew);
+/// assert_eq!(second.unwrap_err().kind(), ErrorKind::AlreadyExists);
+///
+/// // Remove the lock only while it still holds our id.
+/// assert!(!system.remove_file_if(path, b"someone else")?);
+/// assert!(system.remove_file_if(path, b"first")?);
+///
+/// let gone = system.read_to_string(path);
+/// assert_eq!(gone.unwrap_err().kind(), ErrorKind::NotFound);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Clone)]
 pub struct MemorySystem {
@@ -77,11 +217,32 @@ struct MemorySystemState {
 impl MemorySystem {
     /// Moves the time `now()` gives forward by `by`.
     ///
+    /// This is the clock that [`System::sleep`] moves too. Files written after
+    /// the call take the new time as their modified time. Files already
+    /// written keep the time they had.
+    ///
+    /// ```
+    /// use os_shim::{System, mock::MemorySystem};
+    /// use std::path::Path;
+    /// use std::time::{Duration, SystemTime};
+    ///
+    /// let system = MemorySystem::new().with_file("/old.txt", b"a")?;
+    /// system.advance(Duration::from_secs(30))?;
+    /// system.write(Path::new("/new.txt"), b"b", os_shim::WriteMode::Replace)?;
+    ///
+    /// let old = system.metadata(Path::new("/old.txt"))?.modified;
+    /// let new = system.metadata(Path::new("/new.txt"))?.modified;
+    /// assert_eq!(old, SystemTime::UNIX_EPOCH);
+    /// assert_eq!(new, SystemTime::UNIX_EPOCH + Duration::from_secs(30));
+    /// assert_eq!(system.now(), new);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The internal lock cannot be acquired
-    /// - The time would overflow
+    /// - The time would overflow (`InvalidInput`)
     #[inline]
     pub fn advance(&self, by: Duration) -> io::Result<()> {
         let mut state = self
@@ -218,6 +379,22 @@ impl MemorySystem {
     /// They are found through the archive's central directory, so an archive whose
     /// entries carry data descriptors loads too.
     ///
+    /// Available with the `zip` feature. A tree archived with
+    /// [`System::to_zip_vec`] comes back with the folder's contents at the root.
+    ///
+    /// ```
+    /// use os_shim::{System, mock::MemorySystem};
+    /// use std::io::Cursor;
+    /// use std::path::Path;
+    ///
+    /// let source = MemorySystem::new().with_file("/project/src/a.txt", b"hello")?;
+    /// let bytes = source.to_zip_vec(Path::new("/project"))?;
+    ///
+    /// let loaded = MemorySystem::from_zip_reader(Cursor::new(bytes))?;
+    /// assert_eq!(loaded.read_to_string(Path::new("/src/a.txt"))?, "hello");
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns an error if:
@@ -240,6 +417,20 @@ impl MemorySystem {
     /// need not be seekable. An archive whose entries carry data descriptors is
     /// refused; [`from_zip_reader`](Self::from_zip_reader) reads it.
     ///
+    /// Available with the `zip` feature.
+    ///
+    /// ```
+    /// use os_shim::{System, mock::MemorySystem};
+    /// use std::path::Path;
+    ///
+    /// let source = MemorySystem::new().with_file("/project/a.txt", b"hello")?;
+    /// let mut archive = source.to_zip_stream(Path::new("/project"))?;
+    ///
+    /// let loaded = MemorySystem::from_zip_stream(&mut archive)?;
+    /// assert_eq!(loaded.read_to_string(Path::new("/a.txt"))?, "hello");
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns an error if:
@@ -253,6 +444,23 @@ impl MemorySystem {
     }
 
     /// Create a new `MemorySystem` with default state.
+    ///
+    /// The only folder is `/`. The current folder is `/` and the current
+    /// executable is `/mock/exe`. There are no files, no environment variables
+    /// and no live process ids. The clock reads [`SystemTime::UNIX_EPOCH`].
+    ///
+    /// ```
+    /// use os_shim::{System, mock::MemorySystem};
+    /// use std::path::{Path, PathBuf};
+    /// use std::time::SystemTime;
+    ///
+    /// let system = MemorySystem::new();
+    /// assert_eq!(system.current_dir()?, PathBuf::from("/"));
+    /// assert_eq!(system.current_exe()?, PathBuf::from("/mock/exe"));
+    /// assert_eq!(system.now(), SystemTime::UNIX_EPOCH);
+    /// assert!(system.read_dir(Path::new("/"))?.is_empty());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     #[inline]
     pub fn new() -> Self {
@@ -272,6 +480,10 @@ impl MemorySystem {
     }
 
     /// Set the current working directory (builder pattern).
+    ///
+    /// The path is stored as given. The folder is not created and its
+    /// existence is not checked. Relative paths given to
+    /// [`System::canonicalize`] are joined onto it.
     ///
     /// # Errors
     ///
@@ -293,6 +505,9 @@ impl MemorySystem {
 
     /// Set the path returned by `current_exe()` (builder pattern).
     ///
+    /// The path is stored as given. No file is created and its existence is
+    /// not checked.
+    ///
     /// # Errors
     ///
     /// Returns an error if:
@@ -311,7 +526,17 @@ impl MemorySystem {
         Ok(self)
     }
 
-    /// Add a directory (builder pattern).
+    /// Add a directory and every folder above it (builder pattern).
+    ///
+    /// ```
+    /// use os_shim::{System, mock::MemorySystem};
+    /// use std::path::Path;
+    ///
+    /// let system = MemorySystem::new().with_dir("/srv/app/logs")?;
+    /// assert!(system.is_dir(Path::new("/srv/app"))?);
+    /// assert!(system.is_dir(Path::new("/srv/app/logs"))?);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     ///
     /// # Errors
     ///
@@ -344,6 +569,20 @@ impl MemorySystem {
 
     /// Set an environment variable (builder pattern).
     ///
+    /// The variable lives in this `MemorySystem` only. The process environment
+    /// is not touched, so parallel tests do not collide. A later call with the
+    /// same key replaces the value.
+    ///
+    /// ```
+    /// use os_shim::{System, mock::MemorySystem};
+    /// use std::env::VarError;
+    ///
+    /// let system = MemorySystem::new().with_env("MODE", "test")?;
+    /// assert_eq!(system.env_var("MODE")?, "test");
+    /// assert_eq!(system.env_var("MISSING"), Err(VarError::NotPresent));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns an error if:
@@ -360,6 +599,28 @@ impl MemorySystem {
     }
 
     /// Add a file with contents (builder pattern).
+    ///
+    /// Missing parent folders are created. An existing file at the path is
+    /// replaced. The file's modified time is the clock at this moment, so call
+    /// [`with_now`](Self::with_now) or [`advance`](Self::advance) first to give
+    /// it another time.
+    ///
+    /// ```
+    /// use os_shim::{System, mock::MemorySystem};
+    /// use std::path::Path;
+    /// use std::time::{Duration, SystemTime};
+    ///
+    /// let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+    /// let system = MemorySystem::new()
+    ///     .with_now(at)?
+    ///     .with_file("/data/in.csv", b"a,b\n1,2\n")?;
+    ///
+    /// let meta = system.metadata(Path::new("/data/in.csv"))?;
+    /// assert_eq!(meta.len, 8);
+    /// assert_eq!(meta.modified, at);
+    /// assert!(system.is_dir(Path::new("/data"))?);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     ///
     /// # Errors
     ///
@@ -397,7 +658,20 @@ impl MemorySystem {
         Ok(self)
     }
 
-    /// The time `now()` gives (builder pattern).
+    /// Set the clock to an absolute time (builder pattern).
+    ///
+    /// Without this the clock starts at [`SystemTime::UNIX_EPOCH`]. Files
+    /// already created keep their earlier modified times.
+    ///
+    /// ```
+    /// use os_shim::{System, mock::MemorySystem};
+    /// use std::time::{Duration, SystemTime};
+    ///
+    /// let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    /// let system = MemorySystem::new().with_now(at)?;
+    /// assert_eq!(system.now(), at);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     ///
     /// # Errors
     ///
@@ -415,6 +689,20 @@ impl MemorySystem {
     }
 
     /// Add a PID to the set of alive processes (builder pattern).
+    ///
+    /// Available with the `process` feature. [`System::is_pid_alive`] answers
+    /// `true` for the ids added here and `false` for every other id. An id
+    /// cannot be removed once added; build a new `MemorySystem` for the dead
+    /// case.
+    ///
+    /// ```
+    /// use os_shim::{System, mock::MemorySystem};
+    ///
+    /// let system = MemorySystem::new().with_pid(1234)?;
+    /// assert!(system.is_pid_alive(1234));
+    /// assert!(!system.is_pid_alive(4321));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     ///
     /// # Errors
     ///
@@ -1252,6 +1540,27 @@ impl Drop for MemoryAppendWriter {
 }
 
 /// In-memory temporary directory handle that cleans up on drop.
+///
+/// It cannot be built directly. [`System::create_temp_dir`] on a
+/// [`MemorySystem`] returns it as a `Box<dyn TempDirHandle>`. The folder is
+/// `/tmp/mock_<n>` inside the memory filesystem, where `<n>` comes from a
+/// counter shared by every `MemorySystem` in the process. Dropping the handle
+/// removes the folder and everything in it.
+///
+/// ```
+/// use os_shim::{System, TempDirHandle, mock::MemorySystem};
+///
+/// let system = MemorySystem::new();
+/// let dir = system.create_temp_dir()?;
+/// let path = dir.path().to_path_buf();
+///
+/// assert!(path.starts_with("/tmp"));
+/// assert!(system.is_dir(&path)?);
+///
+/// drop(dir);
+/// assert!(!system.exists(&path)?);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[non_exhaustive]
 pub struct MemoryTempDir {
     /// Path to the temporary directory in the mock filesystem.
