@@ -1,4 +1,35 @@
-//! Real system implementation using `std::env` and `std::fs`.
+//! The [`System`] for production: [`RealSystem`] runs on the real machine.
+//!
+//! Pass it wherever code takes `&dyn System`. Tests pass
+//! [`MemorySystem`](crate::mock::MemorySystem) instead.
+//!
+//! # Use it in `main`
+//!
+//! Build the system once in `main` and pass a reference down. A function can
+//! take `&dyn System` or a generic `S: System`; both accept `&RealSystem`.
+//!
+//! ```
+//! use os_shim::{System, real::RealSystem};
+//! use std::io;
+//! use std::path::Path;
+//!
+//! fn file_size(system: &dyn System, path: &Path) -> io::Result<u64> {
+//!     Ok(system.metadata(path)?.len)
+//! }
+//!
+//! fn has_config<S: System>(system: &S) -> io::Result<bool> {
+//!     system.exists(Path::new("app.toml"))
+//! }
+//!
+//! // The body of `main` in a program that uses the real machine.
+//! fn run() -> io::Result<()> {
+//!     let system = RealSystem::new();
+//!     if has_config(&system)? {
+//!         println!("{} bytes", file_size(&system, Path::new("app.toml"))?);
+//!     }
+//!     Ok(())
+//! }
+//! ```
 
 use crate::{FileMetadata, System, TempDirHandle, WalkEntry, WriteMode};
 #[cfg(feature = "async")]
@@ -17,17 +48,46 @@ use tempfile::TempDir;
 #[cfg(feature = "async")]
 use tokio::time;
 
-/// Production implementation of System trait.
+/// Production implementation of [`System`].
 ///
 /// This implementation directly delegates to the standard library's
 /// environment and filesystem functions. It's a zero-cost abstraction
 /// that provides no overhead in production.
+///
+/// It holds no state, so it is `Copy` and every value is the same machine.
+/// What to know before using it:
+///
+/// - [`walk_dir`](System::walk_dir) respects `.gitignore` files.
+/// - [`set_env_var`](System::set_env_var) changes the environment of the whole
+///   process.
+/// - [`sleep`](System::sleep) blocks the thread; `sleep_async` (feature
+///   `async`) needs a tokio runtime with its timer on.
+/// - [`create_temp_dir`](System::create_temp_dir) makes a real directory,
+///   handed back as a [`RealTempDir`].
+/// - [`is_pid_alive`](System::is_pid_alive) (feature `process`) works on Unix
+///   only.
+///
+/// # Example
+///
+/// ```
+/// use os_shim::{System, real::RealSystem};
+///
+/// fn is_unconfigured(system: &dyn System) -> bool {
+///     system.env_var("OS_SHIM_DOC_EXAMPLE_UNSET").is_err()
+/// }
+///
+/// let system = RealSystem::new();
+/// let copy = system;
+/// assert!(is_unconfigured(&system));
+/// assert!(is_unconfigured(&copy));
+/// assert!(is_unconfigured(&RealSystem::default()));
+/// ```
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct RealSystem;
 
 impl RealSystem {
-    /// Create a new `RealSystem` instance.
+    /// Create a new `RealSystem`. It is the same as [`RealSystem::default`].
     #[must_use]
     #[inline]
     pub const fn new() -> Self {
@@ -243,7 +303,11 @@ impl System for RealSystem {
     }
 }
 
-/// Real filesystem temporary directory handle.
+/// The temporary directory [`RealSystem::create_temp_dir`] makes, removed from
+/// disk when dropped.
+///
+/// It is reached through the [`TempDirHandle`] it is returned as, and cannot be
+/// built directly.
 pub struct RealTempDir {
     /// The underlying `tempfile::TempDir` that manages cleanup on drop.
     inner: TempDir,
