@@ -192,7 +192,6 @@ where
 }
 
 /// A put under a stale tag at a key that holds nothing, and a get of that key.
-#[cfg(minio_tests)]
 fn missing_key_tagged_put<B>(bucket: &BlockingBucket<B>, prefix: &str) -> Vec<String>
 where
     B: Bucket,
@@ -497,6 +496,16 @@ fn missing_key_deletes_agree_with_aws() {
         "missing key deletes",
         &missing_key_deletes(&memory(), "a/"),
         &aws_transcript("missing-key-deletes", missing_key_deletes),
+    );
+}
+
+#[cfg(s3_tests)]
+#[test]
+fn missing_key_tagged_put_agrees_with_aws() {
+    assert_agree(
+        "missing key tagged put",
+        &missing_key_tagged_put(&memory(), "a/"),
+        &aws_transcript("missing-key-tagged-put", missing_key_tagged_put),
     );
 }
 
