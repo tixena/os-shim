@@ -267,15 +267,13 @@ impl System for RealSystem {
     ) -> io::Result<Vec<WalkEntry>> {
         let mut entries = Vec::new();
 
-        // Use WalkBuilder from ignore crate to respect .gitignore files.
-        // Our `hidden` means "include hidden files" (see trait docs), but
-        // WalkBuilder::hidden(true) *excludes* hidden files, so forward !hidden.
+        // `hidden` here means "include hidden files", but `WalkBuilder::hidden(true)` excludes
+        // them, so the flag is forwarded negated.
         for result in WalkBuilder::new(path)
             .follow_links(follow_links)
             .hidden(!hidden)
             .build()
             .skip(1)
-        // Skip the root directory itself
         {
             let entry = result.map_err(io::Error::other)?;
             let entry_path = entry.path().to_path_buf();

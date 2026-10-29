@@ -1279,7 +1279,6 @@ fn parity_rename_directory_moves_subtree() {
     mock.rename(Path::new("/work/from"), Path::new("/work/to"))
         .unwrap();
 
-    // Old tree is gone, new tree carries the same relative contents on both.
     assert_eq!(
         real.exists(&tmp.path().join("from")).unwrap(),
         mock.exists(Path::new("/work/from")).unwrap()
@@ -1308,8 +1307,7 @@ fn parity_rename_directory_moves_subtree() {
     );
 }
 
-/// `remove_dir_all` on a missing path: both return `NotFound` (converged; was a
-/// divergence where Memory silently returned Ok).
+/// `remove_dir_all` on a missing path returns `NotFound` on both.
 #[test]
 fn parity_remove_dir_all_missing_is_not_found() {
     let real = RealSystem::new();
@@ -1323,9 +1321,7 @@ fn parity_remove_dir_all_missing_is_not_found() {
     );
 }
 
-/// `remove_dir_all` on a populated tree evicts the root and every descendant on
-/// both impls. The missing-path case only exercises the early `NotFound` return;
-/// this pins the actual subtree-removal path where Memory could silently diverge.
+/// `remove_dir_all` on a populated tree removes the root and every descendant on both.
 #[test]
 fn parity_remove_dir_all_removes_populated_tree() {
     let real = RealSystem::new();
@@ -1352,8 +1348,7 @@ fn parity_remove_dir_all_removes_populated_tree() {
     }
 }
 
-/// `walk_dir` on a missing path: both yield an empty list (converged; Memory used
-/// to return `NotFound`).
+/// `walk_dir` on a missing path yields an empty list on both.
 #[test]
 fn parity_walk_dir_missing_yields_empty() {
     let real = RealSystem::new();
@@ -1372,9 +1367,7 @@ fn parity_walk_dir_missing_yields_empty() {
     );
 }
 
-/// The `hidden` flag honors its documented meaning on both impls: `true`
-/// includes dotfiles, `false` excludes them (converged; Memory used to ignore the
-/// flag and both impls used the inverse semantics).
+/// `hidden` true includes dotfiles and false excludes them, on both.
 #[test]
 fn parity_walk_dir_hidden_flag_includes_dotfiles() {
     let real = RealSystem::new();
@@ -1418,9 +1411,7 @@ fn parity_walk_dir_hidden_flag_includes_dotfiles() {
     assert_eq!(walk_names(false), vec!["visible.txt"]);
 }
 
-/// `follow_links` is a faithful no-op on the mock (no symlink modeling). On a
-/// symlink-free tree both impls yield identical entries for either flag value,
-/// so mock and real agree.
+/// On a tree without symlinks, `follow_links` yields the same entries on both.
 #[test]
 fn parity_walk_dir_follow_links_agrees_without_symlinks() {
     let real = RealSystem::new();
@@ -1453,7 +1444,6 @@ fn parity_walk_dir_follow_links_agrees_without_symlinks() {
         real_names
     };
 
-    // Both flag values yield the same tree on both impls.
     assert_eq!(walk_names(true), walk_names(false));
     assert_eq!(
         walk_names(false),

@@ -128,13 +128,8 @@ declare_bucket!();
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Object {
-    /// The object's content.
     pub bytes: Vec<u8>,
     /// The `ETag` exactly as the store gave it, quotes included.
-    ///
-    /// Pass it back unchanged. A real store computes it its own way; on
-    /// [`MemoryBucket`] it is a hash of the bytes, so the same bytes always
-    /// give the same tag.
     pub etag: String,
 }
 
@@ -143,24 +138,18 @@ pub struct Object {
 /// Import the variants by path (`Condition::None`), not with `use
 /// Condition::*`, where `None` hides `Option::None`. The enum is
 /// `non_exhaustive`: a `match` outside this crate needs a `_` arm.
+///
+/// `Absent` on a delete deletes nothing: it succeeds on an empty key and fails
+/// with `PreconditionFailed` if an object is there. `ETag` on an empty key fails
+/// with `PreconditionFailed`, not `NotFound`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Condition {
     /// No object is at the key: `If-None-Match: *`.
-    ///
-    /// On a put, this creates the object only if the key is free. On a delete
-    /// it deletes nothing: it succeeds if the key is empty and fails with
-    /// `PreconditionFailed` if an object is there.
     Absent,
     /// The object at the key has this entity tag: `If-Match`.
-    ///
-    /// Give the tag as `get` or `put` returned it, quotes included. If the key
-    /// is empty, a put or a delete with this condition fails with
-    /// `PreconditionFailed`, not `NotFound`.
     ETag(String),
     /// Nothing: a put replaces and a delete removes whatever is there.
-    ///
-    /// A delete of a key with no object succeeds.
     None,
 }
 
@@ -168,24 +157,18 @@ pub enum Condition {
 ///
 /// Read it with [`ObjectError::kind`]. The enum is `non_exhaustive`: a `match`
 /// outside this crate needs a `_` arm.
+///
+/// Only `get` returns `NotFound`; a missing bucket is `Other`. Nothing is
+/// retried for you, so a transient `Other` is yours to retry. After
+/// `PreconditionFailed` the object is unchanged: get it again and decide.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ObjectErrorKind {
     /// No object at the key: HTTP 404.
-    ///
-    /// Only `get` returns it. Do not retry; the object is not there.
     NotFound,
     /// Any other failure: the network, a missing bucket, a 403, a 5xx, an answer that cannot be read.
-    ///
-    /// A missing bucket is this kind, not `NotFound`. Nothing is retried for
-    /// you, so a transient failure is yours to retry. The error's `source`
-    /// has the detail.
     Other,
     /// The condition does not hold: HTTP 412.
-    ///
-    /// Someone else got there first, or the tag is stale, or the key is empty
-    /// under [`Condition::ETag`]. The object is unchanged. Get it again and
-    /// decide whether to retry.
     PreconditionFailed,
 }
 
@@ -650,17 +633,10 @@ impl SdkBucket {
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct MinioConfig {
-    /// The access key.
     pub access_key: String,
-    /// The bucket every operation reaches.
     pub bucket: String,
-    /// The server's address: scheme, host and port, such as `http://localhost:9000`.
     pub endpoint: String,
-    /// The region requests are signed for, such as `us-east-1`.
-    ///
-    /// `MinIO` does not care which, but a value is required.
     pub region: String,
-    /// The secret key; `Debug` prints it as `<redacted>`.
     pub secret_key: String,
 }
 
@@ -782,13 +758,9 @@ impl Bucket for MinioBucket {
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct S3Config {
-    /// The access key.
     pub access_key: String,
-    /// The bucket every operation reaches.
     pub bucket: String,
-    /// The bucket's region, such as `us-east-1`.
     pub region: String,
-    /// The secret key; `Debug` prints it as `<redacted>`.
     pub secret_key: String,
 }
 

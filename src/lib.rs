@@ -509,11 +509,8 @@ use std::time::SystemTime;
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct WalkEntry {
-    /// Whether the entry is a directory.
     pub is_dir: bool,
-    /// Whether the entry is a file.
     pub is_file: bool,
-    /// The path of the entry.
     pub path: PathBuf,
 }
 
@@ -525,27 +522,22 @@ pub struct WalkEntry {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct FileMetadata {
-    /// Whether the path is a directory.
     pub is_dir: bool,
-    /// Whether the path is a regular file.
     pub is_file: bool,
-    /// File size in bytes (0 for directories).
     pub len: u64,
-    /// Last modification time.
     pub modified: SystemTime,
 }
 
 /// How [`System::write`] treats a file already at the path.
 ///
 /// `CreateNew` is the primitive for lock files: of several callers that write
-/// the same path, one succeeds and the others get `AlreadyExists`.
+/// the same path, one succeeds and the others get `AlreadyExists`. The check and
+/// the creation are one step, but the contents follow it, so a reader can see the
+/// new file empty for a moment. A folder at the path counts as a file there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WriteMode {
-    /// Writes the file only when nothing is at the path: `AlreadyExists`
-    /// otherwise. The check and the creation are one step; the contents are
-    /// written after it, so a reader can see the new file empty for a moment.
-    /// A folder at the path counts as something being there.
+    /// Writes the file only when nothing is at the path; otherwise `AlreadyExists`.
     CreateNew,
     /// Writes the file, replacing one already at the path.
     Replace,
@@ -559,7 +551,6 @@ pub enum WriteMode {
 /// For `RealSystem`, this wraps `tempfile::TempDir` and uses real filesystem.
 /// For `MemorySystem`, this manages an in-memory temporary directory.
 pub trait TempDirHandle {
-    /// The path of the temporary directory.
     fn path(&self) -> &Path;
 
     /// A pull-based zip stream of this directory's contents.
@@ -611,8 +602,6 @@ pub trait TempDirHandle {
 ///
 /// The trait needs `Send + Sync`, so one system can be shared between threads.
 pub trait System: Send + Sync {
-    // ==================== Environment Operations ====================
-
     /// Canonicalize a path (resolve to absolute path).
     ///
     /// `RealSystem` resolves symbolic links and fails when the path does not

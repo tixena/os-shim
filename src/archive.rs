@@ -134,8 +134,6 @@ const ZIP_EPOCH_YEAR: i32 = 1980;
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct ZipOptions {
-    /// Whether entries whose name starts with `.` are archived. The default is
-    /// `true`. When `false`, a hidden directory is skipped with everything below it.
     pub include_hidden: bool,
 }
 
@@ -474,10 +472,8 @@ where
     if let Some(parent) = target.parent() {
         system.create_dir_all(parent)?;
     }
-    // Streamed rather than read whole: `read_to_end` would hold the entry's
-    // full *uncompressed* length, which for a real filesystem is a gigabyte
-    // of resident memory to write a gigabyte file. `create` hands back a
-    // sink, so the entry moves through a fixed buffer instead.
+    // Streamed through a fixed buffer, not read whole: `read_to_end` would hold the
+    // entry's full uncompressed length in memory.
     let mut sink = system.create(&target)?;
     io::copy(entry, &mut sink)?;
     sink.flush()
@@ -529,12 +525,8 @@ pub fn to_zip_writer<S>(
 where
     S: System + ?Sized,
 {
-    // Seekable, not streaming: `ZipWriter::new_stream` puts each entry's size in a
-    // trailing data descriptor instead of its local header, and an archive shaped
-    // that way cannot be read back by `zip::read::read_zipfile_from_stream` -- it
-    // fails with "The file length is not available in the local header". Building
-    // into a rewindable buffer keeps the round trip through a pipe possible, and
-    // is also what makes Info-ZIP's `unzip -t` report a clean archive.
+    // Built in a seekable buffer: a streamed zip puts sizes in a trailing descriptor
+    // that `read_zipfile_from_stream` cannot read back.
     let mut buffer = Cursor::new(Vec::<u8>::new());
     let mut writer = ZipWriter::new(&mut buffer);
 
@@ -580,9 +572,8 @@ where
     let mut stack: Vec<PathBuf> = vec![source.to_path_buf()];
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut files: Vec<PathBuf> = Vec::new();
-    // A directory that canonicalizes to somewhere already walked is a symlink
-    // back into the tree; descending into it would recurse until the kernel
-    // refuses the path depth.
+    // A directory that canonicalizes to a path already walked is a symlink back into
+    // the tree; descending would recurse until the path is too deep.
     let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
     seen.insert(system.canonicalize(source)?);
 

@@ -356,7 +356,6 @@ impl MemorySystem {
         let mut ancestors = Vec::new();
         let mut current = path;
 
-        // Collect all ancestors
         while let Some(parent) = current.parent() {
             ancestors.push(parent.to_path_buf());
             current = parent;
@@ -365,7 +364,6 @@ impl MemorySystem {
             }
         }
 
-        // Insert all ancestors and the path itself
         for ancestor in ancestors {
             dirs.insert(ancestor);
         }
@@ -646,7 +644,6 @@ impl MemorySystem {
             ));
         }
 
-        // Ensure parent directories exist
         if let Some(parent) = path_buf.parent() {
             Self::ensure_parent_dirs(&mut state.dirs, parent);
         }
@@ -731,7 +728,6 @@ impl Default for MemorySystem {
 impl System for MemorySystem {
     #[inline]
     fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
-        // For mock, just return absolute path
         if path.is_absolute() {
             Ok(path.to_path_buf())
         } else {
@@ -769,7 +765,6 @@ impl System for MemorySystem {
 
         let size = contents.len() as u64;
 
-        // Write to destination
         self.write(to, &contents, WriteMode::Replace)?;
         Ok(size)
     }
@@ -800,8 +795,6 @@ impl System for MemorySystem {
         state.files.insert(path.to_path_buf(), Vec::new());
         drop(state);
 
-        // For create, we need a writer that updates the mock filesystem
-        // We'll use a custom writer that captures bytes
         Ok(Box::new(MemoryWriter {
             path: path.to_path_buf(),
             started: false,
@@ -829,11 +822,9 @@ impl System for MemorySystem {
 
     #[inline]
     fn create_temp_dir(&self) -> io::Result<Box<dyn TempDirHandle>> {
-        // Generate unique temp directory ID
         let id = TEMP_DIR_COUNTER.fetch_add(1, Ordering::SeqCst);
         let temp_path = PathBuf::from(format!("/tmp/mock_{id}"));
 
-        // Create the directory in the mock filesystem
         self.create_dir_all(&temp_path)?;
 
         Ok(Box::new(MemoryTempDir {
@@ -1034,7 +1025,6 @@ impl System for MemorySystem {
 
         let mut entries = Vec::new();
 
-        // Find all direct children (files and directories)
         for file_path in state.files.keys() {
             if let Some(parent) = file_path.parent()
                 && parent == path
@@ -1106,7 +1096,6 @@ impl System for MemorySystem {
             ));
         }
 
-        // Remove all files, subdirectories, and timestamps under this path
         state
             .files
             .retain(|file_path, _| !file_path.starts_with(path));
@@ -1198,9 +1187,7 @@ impl System for MemorySystem {
             Self::check_dir_rename(&state.files, &state.dirs, from, to)?;
         }
 
-        // Handle file rename
         if state.files.contains_key(from) {
-            // Ensure parent directories for destination exist
             if let Some(parent) = to.parent()
                 && !state.dirs.contains(parent)
             {
@@ -1217,11 +1204,9 @@ impl System for MemorySystem {
             return Ok(());
         }
 
-        // Handle directory rename
         if state.dirs.remove(from) {
             state.dirs.insert(to.to_path_buf());
 
-            // Move all files and subdirectories under the old path
             let files_to_move: Vec<(PathBuf, Vec<u8>)> = state
                 .files
                 .iter()
@@ -1299,10 +1284,8 @@ impl System for MemorySystem {
     fn walk_dir(
         &self,
         path: &Path,
-        // `follow_links` is a faithful no-op: neither the mock filesystem nor the
-        // System trait models symlinks, so a symlink-free tree walks identically
-        // for both flag values -- which is exactly what RealSystem does when no
-        // symlinks are present. Kept to match the trait signature.
+        // `follow_links` is a no-op: the mock filesystem has no symlinks, so a tree walks
+        // the same for both flag values.
         _follow_links: bool,
         hidden: bool,
     ) -> io::Result<Vec<WalkEntry>> {
@@ -1328,7 +1311,6 @@ impl System for MemorySystem {
                 continue;
             }
 
-            // Skip the root directory itself
             if current != path {
                 entries.push(WalkEntry {
                     is_dir: state.dirs.contains(&current),
@@ -1337,7 +1319,6 @@ impl System for MemorySystem {
                 });
             }
 
-            // Find all direct children of current directory
             for dir in &state.dirs {
                 if let Some(parent) = dir.parent()
                     && parent == current
@@ -1371,7 +1352,6 @@ impl System for MemorySystem {
             });
         }
 
-        // Sort entries by path for deterministic output
         entries.sort_by(|left, right| left.path.cmp(&right.path));
 
         Ok(entries)
@@ -1385,7 +1365,6 @@ impl System for MemorySystem {
             .map_err(|err| io::Error::other(err.to_string()))?;
         Self::check_no_file_above(&state.files, path)?;
 
-        // Ensure parent directories exist
         if let Some(parent) = path.parent()
             && !state.dirs.contains(parent)
         {
@@ -1500,7 +1479,6 @@ impl Write for MemoryAppendWriter {
             .write()
             .map_err(|err| io::Error::other(err.to_string()))?;
 
-        // Ensure parent directory exists
         if let Some(parent) = self.path.parent()
             && !state.dirs.contains(parent)
         {
@@ -1585,7 +1563,6 @@ impl TempDirHandle for MemoryTempDir {
 impl Drop for MemoryTempDir {
     #[inline]
     fn drop(&mut self) {
-        // Remove the temporary directory from the mock filesystem when dropped
         match self.system.remove_dir_all(&self.path) {
             Ok(()) => (),
             Err(err) => error!("Failed to remove temporary directory: {err}"),

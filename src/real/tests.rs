@@ -256,13 +256,11 @@ fn open_append_appends_and_creates() {
     let tmp = system.create_temp_dir().unwrap();
     let file = tmp.path().join("log.txt");
 
-    // open_append on a missing file creates it.
     let mut first = system.open_append(&file).unwrap();
     first.write_all(b"one").unwrap();
     first.flush().unwrap();
     drop(first);
 
-    // A second append extends rather than truncates.
     let mut second = system.open_append(&file).unwrap();
     second.write_all(b"-two").unwrap();
     second.flush().unwrap();
@@ -443,9 +441,7 @@ fn walk_dir_includes_nested_entries() {
     assert_eq!(names, vec!["sub", "sub/inner.txt", "top.txt"]);
 }
 
-// `hidden` honors the trait's documented meaning: `true` INCLUDES dotfiles and
-// `false` EXCLUDES them. RealSystem achieves this by forwarding `!hidden` to
-// `ignore::WalkBuilder::hidden` (whose `true` excludes hidden files).
+// `hidden` true includes dotfiles and false excludes them, as the trait documents.
 #[test]
 fn walk_dir_hidden_true_includes_dotfiles() {
     let system = RealSystem::new();

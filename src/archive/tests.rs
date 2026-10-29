@@ -369,8 +369,8 @@ fn missing_source_reports_not_found() {
 
 #[test]
 fn directory_timestamp_older_than_the_zip_floor_is_clamped_up() {
-    // `MemorySystem` stamps directories it was never asked to write with the Unix
-    // epoch, a decade before the earliest date a ZIP entry can carry.
+    // `MemorySystem` stamps unwritten directories with the Unix epoch, before any date a
+    // ZIP entry can carry.
     let system = MemorySystem::new().with_dir("/proj/empty").unwrap();
     let mut archive = Vec::new();
     to_zip_writer(
@@ -519,8 +519,7 @@ fn info_zip_reports_a_clean_archive() {
     to_zip_writer(&system, &root, &mut sink, ZipOptions::default()).unwrap();
     drop(sink);
 
-    // `unzip` is an external tool; where it is not installed there is nothing to
-    // assert about it, and the archive is still covered by the reader-based tests.
+    // `unzip` may not be installed; the reader-based tests cover the archive then.
     let Ok(output) = Command::new("unzip").arg("-t").arg(&bundle).output() else {
         return;
     };
@@ -743,8 +742,8 @@ fn data_descriptor_archive() -> Vec<u8> {
 #[test]
 fn a_data_descriptor_archive_is_refused_by_the_stream_reader() {
     let archive = data_descriptor_archive();
-    // Byte 6 of a local header is the low byte of its flags; bit 3 defers the sizes. A directory
-    // entry has no data to defer, so the check reads the first file's header.
+    // Byte 6 of a local header holds its flags; bit 3 defers sizes, which a directory entry
+    // has none to defer, so the check reads the first file's header.
     let header = ZipArchive::new(Cursor::new(archive.as_slice()))
         .unwrap()
         .by_name("word/document.xml")
@@ -899,8 +898,7 @@ fn the_seekable_reader_loads_what_the_writer_produces() {
         .to_zip_vec(Path::new("/"))
         .unwrap();
 
-    // Names and contents, not whole bytes: a loaded file is stamped with the time
-    // it was written, so two loads can differ in their timestamps alone.
+    // Names and contents only: a loaded file is stamped with its load time.
     for reloaded in [&from_reader, &from_stream] {
         assert_eq!(entry_names(reloaded), entry_names(&archive));
         for name in entry_names(&archive) {
@@ -944,11 +942,8 @@ fn bytes_that_are_not_an_archive_report_an_error() {
 
 #[test]
 fn every_file_entry_carries_a_zip64_local_header() {
-    // The zip64 extra field is what lets an entry declare a length past
-    // 0xFFFFFFFF. It is on every file of this tiny archive because `file_options`
-    // sets `large_file(true)` with no size test at all; drop that flag and the
-    // extra field disappears, along with the crate's ability to archive anything
-    // at or above four gibibytes.
+    // The zip64 extra field lets an entry declare a length past 0xFFFFFFFF; `file_options`
+    // sets `large_file(true)`, so every file carries it.
     let system = memory_project();
     let mut archive = Vec::new();
     to_zip_writer(
@@ -975,9 +970,8 @@ fn every_file_entry_carries_a_zip64_local_header() {
 
 #[test]
 fn directory_entries_stay_off_the_zip64_path() {
-    // `ZipWriter::add_directory` never returns to the local header it just wrote,
-    // so a zip64 extra field placed there keeps its `u64::MAX` placeholder sizes
-    // and a streaming reader waits forever for entry data that is not coming.
+    // `add_directory` never revisits its local header, so a zip64 extra field there keeps
+    // `u64::MAX` placeholder sizes and a streaming reader waits for data that never comes.
     let system = memory_project();
     let mut archive = Vec::new();
     to_zip_writer(
@@ -1065,16 +1059,9 @@ fn write_incompressible_file(system: RealSystem, path: &Path, bytes: u64) {
     sink.flush().unwrap();
 }
 
-/// Pins zip64 for an entry past the 32-bit boundary: `to_zip_writer` produces an
-/// archive Info-ZIP accepts, and the entry survives the round trip byte for byte.
+/// An entry past 32 bits archives with zip64 and survives the round trip byte for byte.
 ///
-/// Opt-in, and deliberately so. It writes a four gibibyte fixture and
-/// `to_zip_writer` buffers the finished archive in memory, so it wants a
-/// disk-backed `TMPDIR` and double-digit gibibytes of headroom:
-///
-/// ```text
-/// TMPDIR=/var/tmp just test-slow
-/// ```
+/// Needs a disk-backed `TMPDIR` and double-digit gibibytes of headroom.
 #[cfg(slow_tests)]
 #[test]
 fn an_entry_above_four_gibibytes_archives_and_extracts() {
