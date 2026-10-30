@@ -90,8 +90,14 @@
 //!
 //! # Things that bite
 //!
-//! - The clients never retry. A network failure or a 5xx is an
-//!   [`ErrorKind::Other`] error and the caller decides what to do.
+//! - The clients never retry. A network failure, a timeout or a 5xx is an
+//!   [`ErrorKind::Unavailable`] error, a refused request is
+//!   [`ErrorKind::PermissionDenied`], and the caller decides what to do.
+//! - On `MinioBucket` and `S3Bucket` a folder is an empty object whose key ends
+//!   in `/`. `create_folder` writes one per level, and a put needs its parent
+//!   folder, so every put also lists. A folder another program made only by
+//!   writing keys below it disappears with its last key. When a file and a
+//!   folder share a path, the file wins: listings leave the folder out.
 //! - Credentials are a fixed access key and secret key. There is no session
 //!   token and no environment or profile lookup.
 //! - Revision tokens differ between implementations. A token from
@@ -130,6 +136,7 @@ use aws_sdk_s3::{
     config::{BehaviorVersion, Credentials, Region, retry::RetryConfig},
     error::{ProvideErrorMetadata, SdkError},
     primitives::ByteStream,
+    types::Object,
 };
 #[cfg(any(feature = "minio", feature = "s3"))]
 use core::error::Error;
@@ -621,6 +628,82 @@ impl SdkBucket {
         }
     }
 
+    /// Refuse a put at `path` that a disk would refuse: a folder is there, or its parent is not a folder.
+    async fn check_put(&self, path: &Path) -> Result<()> {
+        let resolved = lexical(path)?;
+        let Some(parent) = resolved.parent() else {
+            return Err(StorageError::from_kind(ErrorKind::IsADirectory));
+        };
+        if self.has_keys_below(&resolved).await? {
+            return Err(StorageError::from_kind(ErrorKind::IsADirectory));
+        }
+        if parent.parent().is_some() && !self.has_keys_below(parent).await? {
+            return Err(StorageError::from_kind(if self.is_object(parent).await? {
+                ErrorKind::NotADirectory
+            } else {
+                ErrorKind::NotFound
+            }));
+        }
+        Ok(())
+    }
+
+    /// Copy the file at `from` to `to` on the server, and give its length.
+    async fn copy(&self, from: &Path, to: &Path) -> Result<u64> {
+        let source = self.head(from).await?;
+        if source.is_dir {
+            return Err(StorageError::from_kind(ErrorKind::InvalidInput));
+        }
+        self.check_put(to).await?;
+        self.copy_object(&key_of(&self.prefix, from)?, &key_of(&self.prefix, to)?)
+            .await?;
+        Ok(source.len)
+    }
+
+    /// `CopyObject` from `from_key` to `to_key`, giving the copy's entity tag.
+    async fn copy_object(&self, from_key: &str, to_key: &str) -> Result<String> {
+        self.client
+            .copy_object()
+            .bucket(&self.bucket)
+            .key(to_key)
+            .copy_source(percent_encode(&format!("{}/{from_key}", self.bucket)))
+            .send()
+            .await
+            .map_err(classify)?
+            .copy_object_result()
+            .and_then(|copied| copied.e_tag())
+            .map(str::to_owned)
+            .ok_or_else(missing_etag)
+    }
+
+    /// Write an empty marker at `<folder>/` for `path` and every missing folder above it.
+    async fn create_folder(&self, path: &Path) -> Result<()> {
+        let target = lexical(path)?;
+        let mut missing = Vec::new();
+        for level in target.ancestors().filter(|level| level.parent().is_some()) {
+            if !self.has_keys_below(level).await? {
+                missing.push(level);
+            }
+        }
+        for level in missing.into_iter().rev() {
+            if self.is_object(level).await? {
+                return Err(StorageError::from_kind(if level == target {
+                    ErrorKind::AlreadyExists
+                } else {
+                    ErrorKind::NotADirectory
+                }));
+            }
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(self.folder_prefix(level)?)
+                .body(ByteStream::from_static(b""))
+                .send()
+                .await
+                .map_err(classify)?;
+        }
+        Ok(())
+    }
+
     /// The entity tag of the object at `key`, or `None` when no object is there.
     async fn current_tag(&self, key: &str) -> Result<Option<String>> {
         match self
@@ -641,18 +724,23 @@ impl SdkBucket {
     /// Delete the file at `path` when `condition` holds.
     async fn delete(&self, path: &Path, condition: &Condition) -> Result<()> {
         let key = key_of(&self.prefix, path)?;
-        let mut request = self.client.delete_object().bucket(&self.bucket).key(&key);
+        self.delete_key(&key, condition).await
+    }
+
+    /// Delete the object at `key` when `condition` holds.
+    async fn delete_key(&self, key: &str, condition: &Condition) -> Result<()> {
+        let mut request = self.client.delete_object().bucket(&self.bucket).key(key);
         match condition.clone() {
             Condition::None => {}
             Condition::Absent => {
-                return match self.current_tag(&key).await? {
+                return match self.current_tag(key).await? {
                     None => Ok(()),
                     Some(_) => Err(StorageError::from_kind(ErrorKind::AlreadyExists)),
                 };
             }
             Condition::Matches(token) => {
                 if self.check_before_delete
-                    && self.current_tag(&key).await?.as_deref() != Some(token.as_str())
+                    && self.current_tag(key).await?.as_deref() != Some(token.as_str())
                 {
                     return Err(StorageError::from_kind(ErrorKind::PreconditionFailed));
                 }
@@ -669,6 +757,30 @@ impl SdkBucket {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// The first object whose key starts with the folder's prefix, which is its marker when it has one.
+    async fn first_below(&self, folder: &Path) -> Result<Option<Object>> {
+        let page = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(self.folder_prefix(folder)?)
+            .max_keys(1)
+            .send()
+            .await
+            .map_err(classify)?;
+        Ok(page.contents().first().cloned())
+    }
+
+    /// The key prefix of the objects in the folder at `folder`: its key and `/`, or nothing for an empty key.
+    fn folder_prefix(&self, folder: &Path) -> Result<String> {
+        let key = key_of(&self.prefix, folder)?;
+        Ok(if key.is_empty() {
+            key
+        } else {
+            format!("{key}/")
+        })
     }
 
     /// The bytes and token of the file at `path`.
@@ -691,14 +803,23 @@ impl SdkBucket {
         Ok((collected.into_bytes().to_vec(), RevisionToken::new(etag)))
     }
 
-    /// The metadata of the file at `path`, from a `HEAD` on it.
+    /// Whether the folder has a marker or a key below it.
+    async fn has_keys_below(&self, folder: &Path) -> Result<bool> {
+        Ok(self.first_below(folder).await?.is_some())
+    }
+
+    /// The metadata of what is at `path`: a file from a `HEAD` on its key, else a folder.
     async fn head(&self, path: &Path) -> Result<FileMetadata> {
-        let key = key_of(&self.prefix, path)?;
+        let resolved = lexical(path)?;
+        if resolved.parent().is_none() {
+            return Ok(FileMetadata::new(true, false, 0, None, None));
+        }
+        let key = key_of(&self.prefix, &resolved)?;
         match self
             .client
             .head_object()
             .bucket(&self.bucket)
-            .key(key)
+            .key(&key)
             .send()
             .await
             .map_err(classify)
@@ -727,53 +848,174 @@ impl SdkBucket {
             }
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 self.object_is_missing().await?;
-                Err(StorageError::from_kind(ErrorKind::NotFound))
+                let Some(below) = self.first_below(&resolved).await? else {
+                    return Err(StorageError::from_kind(ErrorKind::NotFound));
+                };
+                let modified = below
+                    .key()
+                    .filter(|found| found.strip_suffix('/') == Some(key.as_str()))
+                    .and_then(|_| below.last_modified())
+                    .and_then(|time| SystemTime::try_from(*time).ok());
+                Ok(FileMetadata::new(true, false, 0, modified, None))
             }
             Err(error) => Err(error),
         }
     }
 
-    /// The entries below `folder`, every page of the listing read.
+    /// Whether an object sits at the key of `path`.
+    async fn is_object(&self, path: &Path) -> Result<bool> {
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key_of(&self.prefix, path)?)
+            .send()
+            .await
+            .map_err(classify)
+        {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                self.object_is_missing().await?;
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Every key that starts with `prefix`, every page read.
+    async fn keys_under(&self, prefix: &str) -> Result<Vec<String>> {
+        let mut keys = Vec::new();
+        let mut pages = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(prefix)
+            .into_paginator()
+            .send();
+        while let Some(answer) = pages.next().await {
+            let page = answer.map_err(classify)?;
+            keys.extend(
+                page.contents()
+                    .iter()
+                    .filter_map(|object| object.key().map(str::to_owned)),
+            );
+        }
+        Ok(keys)
+    }
+
+    /// The entries below `folder`, every page of the listing read, sorted by path.
+    ///
+    /// Where a file and a folder share a path, the file wins: `a` lists before `a/`.
     async fn list(&self, folder: &Path, depth: Depth) -> Result<Vec<WalkEntry>> {
         let base = lexical(folder)?;
-        let key = key_of(&self.prefix, &base)?;
-        let listed = if key.is_empty() {
-            key
-        } else {
-            format!("{key}/")
+        let listed = self.folder_prefix(&base)?;
+        let mut entries = match depth {
+            Depth::Children => self.list_children(&base, &listed).await?,
+            Depth::All => self.list_descendants(&base, &listed).await?,
         };
-        let mut entries = Vec::new();
+        if entries.is_empty() && base.parent().is_some() && self.is_object(&base).await? {
+            return Err(StorageError::from_kind(ErrorKind::NotADirectory));
+        }
+        entries.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(entries)
+    }
+
+    /// The direct children of the folder at `base`, whose keys start with `listed`, grouped by the store.
+    async fn list_children(&self, base: &Path, listed: &str) -> Result<Vec<WalkEntry>> {
+        let mut files = BTreeSet::new();
         let mut folders = BTreeSet::new();
         let mut pages = self
             .client
             .list_objects_v2()
             .bucket(&self.bucket)
-            .prefix(&listed)
+            .prefix(listed)
+            .delimiter("/")
             .into_paginator()
             .send();
         while let Some(answer) = pages.next().await {
             let page = answer.map_err(classify)?;
-            for relative in page
-                .contents()
+            files.extend(
+                page.contents()
+                    .iter()
+                    .filter_map(|object| object.key())
+                    .filter_map(|found| found.strip_prefix(listed))
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_owned),
+            );
+            folders.extend(
+                page.common_prefixes()
+                    .iter()
+                    .filter_map(|common| common.prefix())
+                    .filter_map(|found| found.strip_prefix(listed))
+                    .filter_map(|name| name.strip_suffix('/'))
+                    .map(str::to_owned),
+            );
+        }
+        let folder_entries = folders
+            .iter()
+            .filter(|name| !files.contains(*name))
+            .map(|name| WalkEntry::new(base.join(name), true, false));
+        let file_entries = files
+            .iter()
+            .map(|name| WalkEntry::new(base.join(name), false, true));
+        Ok(folder_entries.chain(file_entries).collect())
+    }
+
+    /// Every entry below the folder at `base`, whose keys start with `listed`: markers and the
+    /// folders implied by keys below them are folders, nothing is listed below a file.
+    async fn list_descendants(&self, base: &Path, listed: &str) -> Result<Vec<WalkEntry>> {
+        let keys = self.keys_under(listed).await?;
+        let relatives: Vec<&str> = keys
+            .iter()
+            .filter_map(|found| found.strip_prefix(listed))
+            .filter(|relative| !relative.is_empty())
+            .collect();
+        let files: BTreeSet<&str> = relatives
+            .iter()
+            .copied()
+            .filter(|relative| !relative.ends_with('/'))
+            .collect();
+        let mut folders = BTreeSet::new();
+        let mut entries = Vec::new();
+        for relative in relatives {
+            let marker = relative.strip_suffix('/');
+            let own = marker.unwrap_or(relative);
+            let levels: Vec<&Path> = Path::new(own)
+                .ancestors()
+                .filter(|level| !level.as_os_str().is_empty())
+                .skip(usize::from(marker.is_none()))
+                .collect();
+            let under_a_file = levels
                 .iter()
-                .filter_map(|object| object.key())
-                .filter_map(|object_key| object_key.strip_prefix(listed.as_str()))
-                .filter(|relative| !relative.is_empty())
-            {
-                match (depth, relative.split_once('/')) {
-                    (Depth::Children, Some((name, _rest))) => {
-                        if folders.insert(name.to_owned()) {
-                            entries.push(WalkEntry::new(base.join(name), true, false));
-                        }
-                    }
-                    (Depth::All | Depth::Children, _) if relative.ends_with('/') => {}
-                    (Depth::All | Depth::Children, _) => {
-                        entries.push(WalkEntry::new(base.join(relative), false, true));
-                    }
+                .any(|level| level.to_str().is_some_and(|name| files.contains(name)));
+            if under_a_file {
+                continue;
+            }
+            for level in levels {
+                if folders.insert(level) {
+                    entries.push(WalkEntry::new(base.join(level), true, false));
                 }
+            }
+            if marker.is_none() {
+                entries.push(WalkEntry::new(base.join(own), false, true));
             }
         }
         Ok(entries)
+    }
+
+    /// Copy the object at `from_key`, whose entity tag is `tag`, to `to_key`, then delete the
+    /// source under that tag; a failed delete removes the copy again.
+    async fn move_key(&self, from_key: &str, to_key: &str, tag: &str) -> Result<()> {
+        let copied = self.copy_object(from_key, to_key).await?;
+        let moved = Condition::Matches(RevisionToken::new(tag));
+        if let Err(error) = self.delete_key(from_key, &moved).await {
+            drop(
+                self.delete_key(to_key, &Condition::Matches(RevisionToken::new(copied)))
+                    .await,
+            );
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// `Ok(None)` when the bucket exists, since a `HEAD` 404 carries no S3 code to say which of
@@ -790,6 +1032,7 @@ impl SdkBucket {
 
     /// Write `bytes` at `path` when `condition` holds, and give the new token.
     async fn put(&self, path: &Path, bytes: &[u8], condition: &Condition) -> Result<RevisionToken> {
+        self.check_put(path).await?;
         let key = key_of(&self.prefix, path)?;
         let unconditional = self
             .client
@@ -821,6 +1064,75 @@ impl SdkBucket {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Delete every key below the folder at `path`, markers included.
+    async fn remove_folder(&self, path: &Path) -> Result<()> {
+        let base = lexical(path)?;
+        let keys = self.keys_under(&self.folder_prefix(&base)?).await?;
+        if keys.is_empty() {
+            return if base.parent().is_none() {
+                Ok(())
+            } else {
+                Err(StorageError::from_kind(if self.is_object(&base).await? {
+                    ErrorKind::NotADirectory
+                } else {
+                    ErrorKind::NotFound
+                }))
+            };
+        }
+        for key in &keys {
+            self.client
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .send()
+                .await
+                .map_err(classify)?;
+        }
+        Ok(())
+    }
+
+    /// Move a file, or a folder and every key below it, with server copies.
+    async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        let source = lexical(from)?;
+        let target = lexical(to)?;
+        let found = self.head(&source).await?;
+        if source == target {
+            return Ok(());
+        }
+        if found.is_dir {
+            return self.rename_folder(&source, &target).await;
+        }
+        self.check_put(&target).await?;
+        let tag = found.revision.ok_or_else(missing_etag)?;
+        self.move_key(
+            &key_of(&self.prefix, &source)?,
+            &key_of(&self.prefix, &target)?,
+            tag.as_str(),
+        )
+        .await
+    }
+
+    /// Create the folder at `target`, then move every key below `source` under it, markers included.
+    async fn rename_folder(&self, source: &Path, target: &Path) -> Result<()> {
+        if target.starts_with(source) {
+            return Err(StorageError::from_kind(ErrorKind::InvalidInput));
+        }
+        self.create_folder(target).await?;
+        let from_prefix = self.folder_prefix(source)?;
+        let to_prefix = self.folder_prefix(target)?;
+        for key in self.keys_under(&from_prefix).await? {
+            let Some(relative) = key.strip_prefix(from_prefix.as_str()) else {
+                continue;
+            };
+            let Some(tag) = self.current_tag(&key).await? else {
+                return Err(StorageError::from_kind(ErrorKind::NotFound));
+            };
+            self.move_key(&key, &format!("{to_prefix}{relative}"), &tag)
+                .await?;
+        }
+        Ok(())
     }
 }
 
@@ -898,6 +1210,10 @@ impl fmt::Debug for MinioConfig {
 /// The read and the delete are two requests, so a write between them can slip through
 /// on servers that ignore `If-Match`.
 ///
+/// Folders are empty marker objects, copies and renames run on the server, and
+/// `EmptyFoldersExist` holds for folders `create_folder` made; a folder another
+/// program made only by writing keys below it disappears with its last key.
+///
 /// Available with the `minio` feature. It uses path-style addressing, a fixed
 /// access key and secret key, and never retries. It implements `Bucket`; wrap
 /// it in [`BlockingBucket`] for synchronous code.
@@ -914,8 +1230,8 @@ impl MinioBucket {
     ///
     /// # Errors
     ///
-    /// `Other` when the store cannot be reached, or refuses to say whether the
-    /// bucket exists or to create it.
+    /// `Unavailable` when the store cannot be reached, `PermissionDenied` when
+    /// it refuses to say whether the bucket exists or to create it.
     #[inline]
     pub async fn ensure(&self) -> Result<()> {
         if self.0.bucket_exists().await? {
@@ -957,6 +1273,16 @@ impl MinioBucket {
 #[cfg(feature = "minio")]
 impl Bucket for MinioBucket {
     #[inline]
+    fn copy(&self, from: &Path, to: &Path) -> impl Future<Output = Result<u64>> + Send {
+        self.0.copy(from, to)
+    }
+
+    #[inline]
+    fn create_folder(&self, path: &Path) -> impl Future<Output = Result<()>> + Send {
+        self.0.create_folder(path)
+    }
+
+    #[inline]
     fn delete(
         &self,
         path: &Path,
@@ -997,6 +1323,16 @@ impl Bucket for MinioBucket {
         condition: &Condition,
     ) -> impl Future<Output = Result<RevisionToken>> + Send {
         self.0.put(path, bytes, condition)
+    }
+
+    #[inline]
+    fn remove_folder(&self, path: &Path) -> impl Future<Output = Result<()>> + Send {
+        self.0.remove_folder(path)
+    }
+
+    #[inline]
+    fn rename(&self, from: &Path, to: &Path) -> impl Future<Output = Result<()>> + Send {
+        self.0.rename(from, to)
     }
 }
 
@@ -1067,6 +1403,10 @@ impl fmt::Debug for S3Config {
 ///
 /// A delete with a token condition sends `If-Match` and lets AWS check it.
 ///
+/// Folders are empty marker objects, copies and renames run on the server, and
+/// `EmptyFoldersExist` holds for folders `create_folder` made; a folder another
+/// program made only by writing keys below it disappears with its last key.
+///
 /// Available with the `s3` feature. It uses a fixed access key and secret key
 /// and never retries. It implements `Bucket`; wrap it in [`BlockingBucket`] for
 /// synchronous code.
@@ -1084,8 +1424,9 @@ impl S3Bucket {
     ///
     /// # Errors
     ///
-    /// `Other` when AWS cannot be reached, or refuses to say whether the bucket
-    /// exists, to create it or to set its encryption.
+    /// `Unavailable` when AWS cannot be reached, `PermissionDenied` when it
+    /// refuses to say whether the bucket exists, to create it or to set its
+    /// encryption.
     #[inline]
     pub async fn ensure(&self, kms_key_arn: Option<&str>) -> Result<()> {
         if self.0.bucket_exists().await? {
@@ -1173,6 +1514,16 @@ impl S3Bucket {
 #[cfg(feature = "s3")]
 impl Bucket for S3Bucket {
     #[inline]
+    fn copy(&self, from: &Path, to: &Path) -> impl Future<Output = Result<u64>> + Send {
+        self.0.copy(from, to)
+    }
+
+    #[inline]
+    fn create_folder(&self, path: &Path) -> impl Future<Output = Result<()>> + Send {
+        self.0.create_folder(path)
+    }
+
+    #[inline]
     fn delete(
         &self,
         path: &Path,
@@ -1214,6 +1565,16 @@ impl Bucket for S3Bucket {
     ) -> impl Future<Output = Result<RevisionToken>> + Send {
         self.0.put(path, bytes, condition)
     }
+
+    #[inline]
+    fn remove_folder(&self, path: &Path) -> impl Future<Output = Result<()>> + Send {
+        self.0.remove_folder(path)
+    }
+
+    #[inline]
+    fn rename(&self, from: &Path, to: &Path) -> impl Future<Output = Result<()>> + Send {
+        self.0.rename(from, to)
+    }
 }
 
 /// An SDK failure that reads as what the answer or the transport said.
@@ -1241,33 +1602,52 @@ impl Error for SdkFailure {
 }
 
 /// The error for an SDK failure: 404 is `NotFound` unless its S3 code is `NoSuchBucket`, 412 is
-/// `PreconditionFailed`, anything else is `Other`.
+/// `PreconditionFailed`, 403 is `PermissionDenied`, a transport failure, a timeout and 500, 502,
+/// 503 and 504 are `Unavailable`, anything else is `Other`.
 #[cfg(any(feature = "minio", feature = "s3"))]
 fn classify<E>(error: SdkError<E>) -> StorageError
 where
     E: Error + ProvideErrorMetadata + Send + Sync + 'static,
 {
-    match error
+    let status = error
         .raw_response()
-        .map(|response| response.status().as_u16())
-    {
-        Some(404)
+        .map(|response| response.status().as_u16());
+    let kind = match (&error, status) {
+        (_, Some(404))
             if error
                 .as_service_error()
                 .and_then(ProvideErrorMetadata::code)
                 != Some("NoSuchBucket") =>
         {
-            StorageError::from_kind(ErrorKind::NotFound)
+            return StorageError::from_kind(ErrorKind::NotFound);
         }
-        Some(412) => StorageError::from_kind(ErrorKind::PreconditionFailed),
-        _ => StorageError::new(
-            ErrorKind::Other,
-            SdkFailure {
-                message: describe(&error),
-                source: Box::new(error),
-            },
-        ),
-    }
+        (_, Some(412)) => return StorageError::from_kind(ErrorKind::PreconditionFailed),
+        (_, Some(403)) => ErrorKind::PermissionDenied,
+        (_, Some(500 | 502 | 503 | 504))
+        | (&SdkError::DispatchFailure(_) | &SdkError::TimeoutError(_), _) => ErrorKind::Unavailable,
+        _ => ErrorKind::Other,
+    };
+    StorageError::new(
+        kind,
+        SdkFailure {
+            message: describe(&error),
+            source: Box::new(error),
+        },
+    )
+}
+
+/// `text` with every byte outside `A-Z a-z 0-9 - _ . ~ /` written as `%` and two hex digits.
+#[cfg(any(feature = "minio", feature = "s3"))]
+fn percent_encode(text: &str) -> String {
+    text.bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/') {
+                char::from(byte).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect()
 }
 
 /// What `error` says: the status, S3 code and message of a service's answer, or else each cause in turn.
@@ -1299,12 +1679,14 @@ fn missing_etag() -> StorageError {
     StorageError::new(ErrorKind::Other, "the answer carries no ETag header")
 }
 
-/// What the SDK clients promise: only the one-step writes, and the delete when `S3` checks `If-Match`.
+/// What the SDK clients promise: the one-step writes, folders that exist when empty, and the delete
+/// when `S3` checks `If-Match`.
 #[cfg(any(feature = "minio", feature = "s3"))]
 const fn sdk_guarantees(conditional_delete: bool) -> Guarantees {
     let writes = Guarantees::none()
         .with(Guarantee::ConditionalWriteInOneStep)
-        .with(Guarantee::CreateOnlyWriteInOneStep);
+        .with(Guarantee::CreateOnlyWriteInOneStep)
+        .with(Guarantee::EmptyFoldersExist);
     if conditional_delete {
         writes.with(Guarantee::ConditionalDeleteInOneStep)
     } else {

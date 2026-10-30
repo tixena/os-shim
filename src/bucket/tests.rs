@@ -3,7 +3,9 @@
 #![cfg(any(feature = "minio", feature = "s3"))]
 
 use super::paths::key_of;
-use super::{BlockingBucket, Condition, Depth, MemoryBucket, RevisionToken};
+use super::{
+    BlockingBucket, Bucket as _, Condition, Depth, Guarantee, MemoryBucket, RevisionToken,
+};
 #[cfg(feature = "minio")]
 use super::{MinioBucket, MinioConfig};
 #[cfg(feature = "s3")]
@@ -27,6 +29,34 @@ use std::{
     sync::Mutex,
     thread,
 };
+
+/// The guarantees every SDK client holds, whatever the store.
+#[cfg(any(feature = "minio", feature = "s3"))]
+const SDK_GUARANTEES: [Guarantee; 3] = [
+    Guarantee::ConditionalWriteInOneStep,
+    Guarantee::CreateOnlyWriteInOneStep,
+    Guarantee::EmptyFoldersExist,
+];
+
+/// Every guarantee there is.
+#[cfg(any(feature = "minio", feature = "s3"))]
+const EVERY_GUARANTEE: [Guarantee; 15] = [
+    Guarantee::AppendIsAtomic,
+    Guarantee::AppendWritesOnlyNewBytes,
+    Guarantee::ConditionalDeleteInOneStep,
+    Guarantee::ConditionalWriteInOneStep,
+    Guarantee::CreateOnlyWriteInOneStep,
+    Guarantee::DroppedWriterKeepsBytes,
+    Guarantee::EmptyFoldersExist,
+    Guarantee::FailedRenameKeepsDestination,
+    Guarantee::FileAndFolderNeverShareAPath,
+    Guarantee::FileRenameIsAtomic,
+    Guarantee::FolderRenameIsAtomic,
+    Guarantee::FuturesNeverWait,
+    Guarantee::ParentCheckInOneStep,
+    Guarantee::ReadersNeverSeePartialWrites,
+    Guarantee::WalkHonorsGitignore,
+];
 
 /// A list of lines the canned server records, shared with the test.
 type Log = Arc<Mutex<Vec<String>>>;
@@ -184,13 +214,14 @@ fn serve(
 }
 
 /// The rest of the request that starts with `request_line`, read off `reader`, as its method, its
-/// conditional headers, and its canned ACL and location constraint when it carries them.
+/// conditional headers, and its canned ACL, copy source and location constraint when it carries them.
 #[cfg(any(feature = "minio", feature = "s3"))]
 fn read_request(request_line: &str, reader: &mut BufReader<TcpStream>) -> String {
     let mut length = 0_u64;
     let mut if_match = String::from("-");
     let mut if_none_match = None;
     let mut acl = None;
+    let mut copy_source = None;
     loop {
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
@@ -202,6 +233,7 @@ fn read_request(request_line: &str, reader: &mut BufReader<TcpStream>) -> String
             "if-match" => value.trim().clone_into(&mut if_match),
             "if-none-match" => if_none_match = Some(value.trim().to_owned()),
             "x-amz-acl" => acl = Some(value.trim().to_owned()),
+            "x-amz-copy-source" => copy_source = Some(value.trim().to_owned()),
             _ => {}
         }
     }
@@ -215,6 +247,7 @@ fn read_request(request_line: &str, reader: &mut BufReader<TcpStream>) -> String
     let mut parts = vec![method.to_owned(), format!("if-match={if_match}")];
     parts.extend(if_none_match.map(|value| format!("if-none-match={value}")));
     parts.extend(acl.map(|value| format!("acl={value}")));
+    parts.extend(copy_source.map(|value| format!("copy-source={value}")));
     parts.extend(location.map(|region| format!("location={region}")));
     parts.join(" ")
 }
@@ -250,7 +283,7 @@ fn no_such_bucket() -> String {
 }
 
 /// A `ListObjectsV2` answer with `key`, truncated with the token `next` when it is given.
-#[cfg(feature = "minio")]
+#[cfg(any(feature = "minio", feature = "s3"))]
 fn page(key: &str, next: Option<&str>) -> String {
     let truncation = next.map_or_else(
         || "<IsTruncated>false</IsTruncated>".to_owned(),
@@ -264,6 +297,55 @@ fn page(key: &str, next: Option<&str>) -> String {
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult><Name>archie</Name><Prefix>vault/</Prefix>{truncation}<Contents><Key>{key}</Key></Contents></ListBucketResult>"
     );
     answer("200 OK", "Content-Type: application/xml\r\n", &body)
+}
+
+/// A `ListObjectsV2` answer with no key.
+#[cfg(any(feature = "minio", feature = "s3"))]
+fn empty_page() -> String {
+    answer(
+        "200 OK",
+        "Content-Type: application/xml\r\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult><Name>archie</Name><IsTruncated>false</IsTruncated></ListBucketResult>",
+    )
+}
+
+/// A `ListObjectsV2` answer holding `keys` as objects, with `LastModified` on the first, and
+/// `folders` as common prefixes.
+#[cfg(feature = "minio")]
+fn listing(keys: &[&str], folders: &[&str]) -> String {
+    let contents = keys
+        .iter()
+        .map(|key| {
+            format!(
+                "<Contents><Key>{key}</Key><LastModified>1970-01-01T00:16:40.000Z</LastModified></Contents>"
+            )
+        })
+        .collect::<Vec<_>>()
+        .concat();
+    let prefixes = folders
+        .iter()
+        .map(|folder| format!("<CommonPrefixes><Prefix>{folder}</Prefix></CommonPrefixes>"))
+        .collect::<Vec<_>>()
+        .concat();
+    answer(
+        "200 OK",
+        "Content-Type: application/xml\r\n",
+        &format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult><Name>archie</Name><IsTruncated>false</IsTruncated>{contents}{prefixes}</ListBucketResult>"
+        ),
+    )
+}
+
+/// A `CopyObject` answer carrying the entity tag `tag`, which is quoted.
+#[cfg(any(feature = "minio", feature = "s3"))]
+fn copied(tag: &str) -> String {
+    answer(
+        "200 OK",
+        "Content-Type: application/xml\r\n",
+        &format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><CopyObjectResult><ETag>&quot;{tag}&quot;</ETag></CopyObjectResult>"
+        ),
+    )
 }
 
 /// The requests the canned server has seen so far.
@@ -302,7 +384,10 @@ fn minio_get_answered_404_is_not_found() {
 #[cfg(feature = "minio")]
 #[test]
 fn minio_put_with_a_stale_tag_answered_412_is_precondition_failed() {
-    let (endpoint, seen) = canned(vec![answer("412 Precondition Failed", "", "")]);
+    let (endpoint, seen) = canned(vec![
+        empty_page(),
+        answer("412 Precondition Failed", "", ""),
+    ]);
     let error = minio(endpoint)
         .put(
             Path::new("/task.md"),
@@ -311,24 +396,30 @@ fn minio_put_with_a_stale_tag_answered_412_is_precondition_failed() {
         )
         .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::PreconditionFailed);
-    assert_eq!(requests(&seen), ["PUT if-match=\"a\""]);
+    assert_eq!(requests(&seen), ["GET if-match=-", "PUT if-match=\"a\""]);
 }
 
 #[cfg(feature = "minio")]
 #[test]
 fn minio_put_with_absent_answered_412_is_already_exists_and_sends_if_none_match_star() {
-    let (endpoint, seen) = canned(vec![answer("412 Precondition Failed", "", "")]);
+    let (endpoint, seen) = canned(vec![
+        empty_page(),
+        answer("412 Precondition Failed", "", ""),
+    ]);
     let error = minio(endpoint)
         .put(Path::new("/task.md"), b"x", &Condition::Absent)
         .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::AlreadyExists);
-    assert_eq!(requests(&seen), ["PUT if-match=- if-none-match=*"]);
+    assert_eq!(
+        requests(&seen),
+        ["GET if-match=-", "PUT if-match=- if-none-match=*"]
+    );
 }
 
 #[cfg(feature = "minio")]
 #[test]
 fn minio_put_gives_the_tag_the_server_answered() {
-    let (endpoint, _seen) = canned(vec![answer("200 OK", "ETag: \"b\"\r\n", "")]);
+    let (endpoint, _seen) = canned(vec![empty_page(), answer("200 OK", "ETag: \"b\"\r\n", "")]);
     let tag = minio(endpoint)
         .put(Path::new("/task.md"), b"x", &Condition::None)
         .unwrap();
@@ -406,11 +497,11 @@ fn minio_delete_with_no_condition_sends_one_delete() {
 
 #[cfg(feature = "minio")]
 #[test]
-fn minio_get_answered_503_is_other_after_one_request() {
+fn minio_get_answered_503_is_unavailable_after_one_request() {
     let unavailable = answer("503 Service Unavailable", "", "");
     let (endpoint, seen) = canned(vec![unavailable.clone(), unavailable.clone(), unavailable]);
     let error = minio(endpoint).get(Path::new("/task.md")).unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::Other);
+    assert_eq!(error.kind(), ErrorKind::Unavailable);
     assert_eq!(requests(&seen), ["GET if-match=-"]);
 }
 
@@ -430,6 +521,47 @@ fn minio_list_reads_every_page() {
 
 #[cfg(feature = "minio")]
 #[test]
+fn minio_list_of_a_file_is_not_a_directory_at_both_depths() {
+    for depth in [Depth::Children, Depth::All] {
+        let (endpoint, seen) = canned(vec![empty_page(), answer("200 OK", "ETag: \"a\"\r\n", "")]);
+        let error = minio(endpoint)
+            .list(Path::new("/vault/a.md"), depth)
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::NotADirectory);
+        assert_eq!(requests(&seen), ["GET if-match=-", "HEAD if-match=-"]);
+    }
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_list_of_a_missing_folder_is_empty_after_one_head() {
+    let (endpoint, seen) = canned(vec![
+        empty_page(),
+        not_found_answer("NoSuchKey", "The specified key does not exist."),
+        answer("200 OK", "", ""),
+    ]);
+    let entries = minio(endpoint)
+        .list(Path::new("/vault/nothing"), Depth::Children)
+        .unwrap();
+    assert!(entries.is_empty());
+    assert_eq!(
+        requests(&seen),
+        ["GET if-match=-", "HEAD if-match=-", "HEAD if-match=-"]
+    );
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_list_with_entries_costs_no_head() {
+    let (endpoint, seen) = canned(vec![page("vault/a.md", None)]);
+    minio(endpoint)
+        .list(Path::new("/vault"), Depth::All)
+        .unwrap();
+    assert_eq!(requests(&seen), ["GET if-match=-"]);
+}
+
+#[cfg(feature = "minio")]
+#[test]
 fn minio_config_debug_keeps_the_secret_key_out() {
     let config = minio_config("http://127.0.0.1:9000".to_owned());
     let shown = format!("{config:?}");
@@ -439,11 +571,11 @@ fn minio_config_debug_keeps_the_secret_key_out() {
 
 #[cfg(feature = "minio")]
 #[test]
-fn minio_get_with_nothing_listening_is_other_naming_the_dispatch_failure_and_its_cause() {
+fn minio_get_with_nothing_listening_is_unavailable_naming_the_dispatch_failure_and_its_cause() {
     let error = minio("http://127.0.0.1:9".to_owned())
         .get(Path::new("/task.md"))
         .unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::Other);
+    assert_eq!(error.kind(), ErrorKind::Unavailable);
     let message = error.to_string();
     assert!(message.starts_with("dispatch failure: "));
     assert!(message.contains("Connection refused"));
@@ -451,7 +583,7 @@ fn minio_get_with_nothing_listening_is_other_naming_the_dispatch_failure_and_its
 
 #[cfg(feature = "minio")]
 #[test]
-fn minio_get_answered_403_names_the_status_the_code_and_the_message() {
+fn minio_get_answered_403_is_permission_denied_naming_the_status_the_code_and_the_message() {
     let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>SignatureDoesNotMatch</Code><Message>The request signature we calculated does not match the signature you provided.</Message></Error>";
     let (endpoint, _seen) = canned(vec![answer(
         "403 Forbidden",
@@ -459,7 +591,7 @@ fn minio_get_answered_403_names_the_status_the_code_and_the_message() {
         body,
     )]);
     let error = minio(endpoint).get(Path::new("/task.md")).unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::Other);
+    assert_eq!(error.kind(), ErrorKind::PermissionDenied);
     assert_eq!(
         error.to_string(),
         "403 SignatureDoesNotMatch: The request signature we calculated does not match the signature you provided."
@@ -540,7 +672,7 @@ fn minio_delete_with_a_tag_in_a_missing_bucket_is_other() {
 #[cfg(feature = "minio")]
 #[test]
 fn minio_put_with_a_tag_answered_404_no_such_bucket_is_other() {
-    let (endpoint, seen) = canned(vec![no_such_bucket()]);
+    let (endpoint, seen) = canned(vec![empty_page(), no_such_bucket()]);
     let error = minio(endpoint)
         .put(
             Path::new("/task.md"),
@@ -549,7 +681,7 @@ fn minio_put_with_a_tag_answered_404_no_such_bucket_is_other() {
         )
         .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Other);
-    assert_eq!(requests(&seen), ["PUT if-match=\"a\""]);
+    assert_eq!(requests(&seen), ["GET if-match=-", "PUT if-match=\"a\""]);
 }
 
 #[cfg(feature = "minio")]
@@ -576,10 +708,14 @@ fn minio_head_of_a_missing_object_in_an_existing_bucket_is_not_found() {
     let (endpoint, seen) = canned(vec![
         answer("404 Not Found", "", ""),
         answer("200 OK", "", ""),
+        empty_page(),
     ]);
     let error = minio(endpoint).head(Path::new("/task.md")).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::NotFound);
-    assert_eq!(requests(&seen), ["HEAD if-match=-", "HEAD if-match=-"]);
+    assert_eq!(
+        requests(&seen),
+        ["HEAD if-match=-", "HEAD if-match=-", "GET if-match=-"]
+    );
 }
 
 #[cfg(feature = "minio")]
@@ -649,21 +785,21 @@ fn minio_ensure_creates_a_missing_bucket_with_no_acl_and_no_location() {
 
 #[cfg(feature = "minio")]
 #[test]
-fn minio_ensure_with_the_head_refused_is_other_and_creates_nothing() {
+fn minio_ensure_with_the_head_refused_is_permission_denied_and_creates_nothing() {
     let (endpoint, seen) = canned(vec![access_denied()]);
     let bucket = minio(endpoint);
     let error = bucket.runtime.block_on(bucket.bucket.ensure()).unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::Other);
+    assert_eq!(error.kind(), ErrorKind::PermissionDenied);
     assert_eq!(requests(&seen), ["HEAD if-match=-"]);
 }
 
 #[cfg(feature = "minio")]
 #[test]
-fn minio_ensure_with_the_create_refused_is_other_naming_the_answer() {
+fn minio_ensure_with_the_create_refused_is_permission_denied_naming_the_answer() {
     let (endpoint, seen) = canned(vec![answer("404 Not Found", "", ""), access_denied()]);
     let bucket = minio(endpoint);
     let error = bucket.runtime.block_on(bucket.bucket.ensure()).unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::Other);
+    assert_eq!(error.kind(), ErrorKind::PermissionDenied);
     assert_eq!(error.to_string(), "403 AccessDenied: Access Denied.");
     assert_eq!(requests(&seen), ["HEAD if-match=-", "PUT if-match=-"]);
 }
@@ -778,7 +914,10 @@ fn s3_get_answered_404_is_not_found() {
 #[cfg(feature = "s3")]
 #[test]
 fn s3_put_with_absent_answered_412_is_already_exists() {
-    let (endpoint, _seen) = canned(vec![answer("412 Precondition Failed", "", "")]);
+    let (endpoint, _seen) = canned(vec![
+        empty_page(),
+        answer("412 Precondition Failed", "", ""),
+    ]);
     let error = s3(&endpoint)
         .put(Path::new("/task.md"), b"x", &Condition::Absent)
         .unwrap_err();
@@ -787,11 +926,11 @@ fn s3_put_with_absent_answered_412_is_already_exists() {
 
 #[cfg(feature = "s3")]
 #[test]
-fn s3_get_answered_503_is_other_after_one_request() {
+fn s3_get_answered_503_is_unavailable_after_one_request() {
     let unavailable = answer("503 Service Unavailable", "", "");
     let (endpoint, seen) = canned(vec![unavailable.clone(), unavailable.clone(), unavailable]);
     let error = s3(&endpoint).get(Path::new("/task.md")).unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::Other);
+    assert_eq!(error.kind(), ErrorKind::Unavailable);
     assert_eq!(requests(&seen), ["GET if-match=-"]);
 }
 
@@ -819,10 +958,14 @@ fn s3_head_of_a_missing_object_in_an_existing_bucket_is_not_found() {
     let (endpoint, seen) = canned(vec![
         answer("404 Not Found", "", ""),
         answer("200 OK", "", ""),
+        empty_page(),
     ]);
     let error = s3(&endpoint).head(Path::new("/task.md")).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::NotFound);
-    assert_eq!(requests(&seen), ["HEAD if-match=-", "HEAD if-match=-"]);
+    assert_eq!(
+        requests(&seen),
+        ["HEAD if-match=-", "HEAD if-match=-", "GET if-match=-"]
+    );
 }
 
 #[cfg(feature = "s3")]
@@ -888,7 +1031,7 @@ fn s3_ensure_without_a_key_outside_us_east_1_names_the_region_and_sets_no_encryp
 
 #[cfg(feature = "s3")]
 #[test]
-fn s3_ensure_with_the_encryption_refused_is_other_naming_the_answer() {
+fn s3_ensure_with_the_encryption_refused_is_permission_denied_naming_the_answer() {
     let (endpoint, seen) = canned(vec![
         answer("404 Not Found", "", ""),
         answer("200 OK", "", ""),
@@ -903,7 +1046,7 @@ fn s3_ensure_with_the_encryption_refused_is_other_naming_the_answer() {
                 .ensure(Some("arn:aws:kms:us-east-1:111122223333:key/a")),
         )
         .unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::Other);
+    assert_eq!(error.kind(), ErrorKind::PermissionDenied);
     assert_eq!(error.to_string(), "403 AccessDenied: Access Denied.");
     assert_eq!(requests(&seen).len(), 3);
 }
@@ -919,8 +1062,11 @@ fn s3_config_debug_keeps_the_secret_key_out() {
 #[cfg(feature = "minio")]
 #[test]
 fn minio_put_under_a_prefix_puts_every_key_under_it() {
-    let (endpoint, _seen, targets) =
-        canned_with_targets(vec![answer("200 OK", "ETag: \"b\"\r\n", "")]);
+    let (endpoint, _seen, targets) = canned_with_targets(vec![
+        empty_page(),
+        page("tenant-7/notes/x.md", None),
+        answer("200 OK", "ETag: \"b\"\r\n", ""),
+    ]);
     let config = minio_config(endpoint).with_prefix("tenant-7/");
     assert_eq!(config.prefix.as_deref(), Some("tenant-7"));
     BlockingBucket::new(MinioBucket::new(config))
@@ -929,7 +1075,11 @@ fn minio_put_under_a_prefix_puts_every_key_under_it() {
         .unwrap();
     assert_eq!(
         *targets.lock().unwrap(),
-        ["PUT /archie/tenant-7/notes/a.md?x-id=PutObject"]
+        [
+            "GET /archie/?list-type=2&max-keys=1&prefix=tenant-7%2Fnotes%2Fa.md%2F",
+            "GET /archie/?list-type=2&max-keys=1&prefix=tenant-7%2Fnotes%2F",
+            "PUT /archie/tenant-7/notes/a.md?x-id=PutObject"
+        ]
     );
 }
 
@@ -972,8 +1122,11 @@ fn minio_list_of_children_groups_the_keys_by_the_next_component() {
 #[cfg(feature = "s3")]
 #[test]
 fn s3_put_under_a_prefix_puts_every_key_under_it() {
-    let (endpoint, _seen, targets) =
-        canned_with_targets(vec![answer("200 OK", "ETag: \"b\"\r\n", "")]);
+    let (endpoint, _seen, targets) = canned_with_targets(vec![
+        empty_page(),
+        page("tenant-7/notes/x.md", None),
+        answer("200 OK", "ETag: \"b\"\r\n", ""),
+    ]);
     let config = s3_config().with_prefix("tenant-7/");
     let prefix = config.prefix.clone().unwrap_or_default();
     let sdk = S3Bucket::sdk_config(config)
@@ -986,7 +1139,11 @@ fn s3_put_under_a_prefix_puts_every_key_under_it() {
         .unwrap();
     assert_eq!(
         *targets.lock().unwrap(),
-        ["PUT /archie/tenant-7/notes/a.md?x-id=PutObject"]
+        [
+            "GET /archie/?list-type=2&max-keys=1&prefix=tenant-7%2Fnotes%2Fa.md%2F",
+            "GET /archie/?list-type=2&max-keys=1&prefix=tenant-7%2Fnotes%2F",
+            "PUT /archie/tenant-7/notes/a.md?x-id=PutObject"
+        ]
     );
 }
 
@@ -998,4 +1155,536 @@ fn s3_delete_absent_over_an_object_is_already_exists() {
         .delete(Path::new("/task.md"), &Condition::Absent)
         .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::AlreadyExists);
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_create_folder_writes_a_marker_for_every_missing_level_highest_first() {
+    let missing = || answer("404 Not Found", "", "");
+    let (endpoint, _seen, targets) = canned_with_targets(vec![
+        empty_page(),
+        empty_page(),
+        missing(),
+        answer("200 OK", "", ""),
+        answer("200 OK", "", ""),
+        missing(),
+        answer("200 OK", "", ""),
+        answer("200 OK", "", ""),
+    ]);
+    minio(endpoint).create_folder(Path::new("/a/b")).unwrap();
+    assert_eq!(
+        *targets.lock().unwrap(),
+        [
+            "GET /archie/?list-type=2&max-keys=1&prefix=a%2Fb%2F",
+            "GET /archie/?list-type=2&max-keys=1&prefix=a%2F",
+            "HEAD /archie/a",
+            "HEAD /archie/",
+            "PUT /archie/a/?x-id=PutObject",
+            "HEAD /archie/a/b",
+            "HEAD /archie/",
+            "PUT /archie/a/b/?x-id=PutObject",
+        ]
+    );
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_create_folder_over_an_object_at_the_path_is_already_exists_and_writes_nothing() {
+    let (endpoint, _seen, targets) = canned_with_targets(vec![
+        empty_page(),
+        head_answer("ETag: \"a\"\r\nContent-Length: 1\r\n"),
+    ]);
+    let error = minio(endpoint).create_folder(Path::new("/a")).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::AlreadyExists);
+    assert_eq!(
+        *targets.lock().unwrap(),
+        [
+            "GET /archie/?list-type=2&max-keys=1&prefix=a%2F",
+            "HEAD /archie/a"
+        ]
+    );
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_create_folder_below_an_object_is_not_a_directory() {
+    let (endpoint, seen) = canned(vec![
+        empty_page(),
+        empty_page(),
+        head_answer("ETag: \"a\"\r\nContent-Length: 1\r\n"),
+    ]);
+    let error = minio(endpoint)
+        .create_folder(Path::new("/a/b"))
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::NotADirectory);
+    assert_eq!(
+        requests(&seen),
+        ["GET if-match=-", "GET if-match=-", "HEAD if-match=-"]
+    );
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_create_folder_skips_a_level_that_has_keys_below_it() {
+    let (endpoint, _seen, targets) = canned_with_targets(vec![listing(&["a/f.md"], &[])]);
+    minio(endpoint).create_folder(Path::new("/a")).unwrap();
+    assert_eq!(targets.lock().unwrap().len(), 1);
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_remove_folder_deletes_every_key_and_marker_below_it() {
+    let (endpoint, _seen, targets) = canned_with_targets(vec![
+        listing(&["x/", "x/f.md", "x/y/"], &[]),
+        answer("204 No Content", "", ""),
+        answer("204 No Content", "", ""),
+        answer("204 No Content", "", ""),
+    ]);
+    minio(endpoint).remove_folder(Path::new("/x")).unwrap();
+    assert_eq!(
+        *targets.lock().unwrap(),
+        [
+            "GET /archie/?list-type=2&prefix=x%2F",
+            "DELETE /archie/x/?x-id=DeleteObject",
+            "DELETE /archie/x/f.md?x-id=DeleteObject",
+            "DELETE /archie/x/y/?x-id=DeleteObject",
+        ]
+    );
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_remove_folder_with_no_marker_and_no_key_is_not_found() {
+    let (endpoint, _seen) = canned(vec![
+        empty_page(),
+        answer("404 Not Found", "", ""),
+        answer("200 OK", "", ""),
+    ]);
+    let error = minio(endpoint).remove_folder(Path::new("/x")).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::NotFound);
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_remove_folder_of_an_object_with_nothing_below_is_not_a_directory() {
+    let (endpoint, seen) = canned(vec![
+        empty_page(),
+        head_answer("ETag: \"a\"\r\nContent-Length: 1\r\n"),
+    ]);
+    let error = minio(endpoint).remove_folder(Path::new("/x")).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::NotADirectory);
+    assert_eq!(requests(&seen), ["GET if-match=-", "HEAD if-match=-"]);
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_list_of_children_sends_the_delimiter_and_reads_folders_from_the_common_prefixes() {
+    let (endpoint, _seen, targets) = canned_with_targets(vec![listing(
+        &["vault/", "vault/b.md", "vault/a"],
+        &["vault/sub/", "vault/a/"],
+    )]);
+    let entries = minio(endpoint)
+        .list(Path::new("/vault"), Depth::Children)
+        .unwrap();
+    assert_eq!(
+        *targets.lock().unwrap(),
+        ["GET /archie/?list-type=2&delimiter=%2F&prefix=vault%2F"]
+    );
+    assert_eq!(paths(&entries), ["/vault/a", "/vault/b.md", "/vault/sub"]);
+    let kinds: Vec<(bool, bool)> = entries
+        .iter()
+        .map(|entry| (entry.is_dir, entry.is_file))
+        .collect();
+    assert_eq!(kinds, [(false, true), (false, true), (true, false)]);
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_list_of_everything_turns_markers_and_implied_levels_into_folders_once() {
+    let (endpoint, _seen, targets) = canned_with_targets(vec![listing(
+        &[
+            "vault/",
+            "vault/sub/",
+            "vault/sub/f.md",
+            "vault/deep/er/g.md",
+            "vault/a.md",
+        ],
+        &[],
+    )]);
+    let entries = minio(endpoint)
+        .list(Path::new("/vault"), Depth::All)
+        .unwrap();
+    assert_eq!(
+        *targets.lock().unwrap(),
+        ["GET /archie/?list-type=2&prefix=vault%2F"]
+    );
+    let shown: Vec<String> = entries
+        .iter()
+        .map(|entry| {
+            format!(
+                "{}{}",
+                entry.path.display(),
+                if entry.is_dir { "/" } else { "" }
+            )
+        })
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            "/vault/a.md",
+            "/vault/deep/",
+            "/vault/deep/er/",
+            "/vault/deep/er/g.md",
+            "/vault/sub/",
+            "/vault/sub/f.md",
+        ]
+    );
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_list_of_everything_gives_the_file_and_nothing_below_it_when_a_file_and_a_folder_share_a_path()
+ {
+    let (endpoint, _seen) = canned(vec![listing(
+        &["vault/a", "vault/a/", "vault/a/b", "vault/a/c/d"],
+        &[],
+    )]);
+    let entries = minio(endpoint)
+        .list(Path::new("/vault"), Depth::All)
+        .unwrap();
+    assert_eq!(paths(&entries), ["/vault/a"]);
+    assert!(entries.iter().all(|entry| entry.is_file));
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_head_of_a_folder_with_a_marker_gives_the_marker_time_and_no_revision() {
+    let (endpoint, seen) = canned(vec![
+        answer("404 Not Found", "", ""),
+        answer("200 OK", "", ""),
+        listing(&["x/", "x/f.md"], &[]),
+    ]);
+    let metadata = minio(endpoint).head(Path::new("/x")).unwrap();
+    assert_eq!(
+        (metadata.is_dir, metadata.is_file, metadata.len),
+        (true, false, 0)
+    );
+    assert_eq!(metadata.revision, None);
+    assert_eq!(
+        metadata.modified,
+        UNIX_EPOCH.checked_add(Duration::from_secs(1_000))
+    );
+    assert_eq!(
+        requests(&seen),
+        ["HEAD if-match=-", "HEAD if-match=-", "GET if-match=-"]
+    );
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_head_of_a_folder_with_keys_and_no_marker_has_no_time() {
+    let (endpoint, _seen) = canned(vec![
+        answer("404 Not Found", "", ""),
+        answer("200 OK", "", ""),
+        listing(&["x/f.md"], &[]),
+    ]);
+    let metadata = minio(endpoint).head(Path::new("/x")).unwrap();
+    assert_eq!((metadata.is_dir, metadata.modified), (true, None));
+    assert_eq!(metadata.revision, None);
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_head_of_the_root_is_a_folder_without_a_request() {
+    let (endpoint, seen) = canned(vec![]);
+    let metadata = minio(endpoint).head(Path::new("/")).unwrap();
+    assert!(metadata.is_dir && !metadata.is_file);
+    assert_eq!(requests(&seen), Vec::<String>::new());
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_put_with_keys_below_the_path_is_a_directory_and_sends_no_put() {
+    let (endpoint, seen) = canned(vec![listing(&["task.md/f"], &[])]);
+    let error = minio(endpoint)
+        .put(Path::new("/task.md"), b"x", &Condition::None)
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::IsADirectory);
+    assert_eq!(requests(&seen), ["GET if-match=-"]);
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_put_into_a_missing_parent_is_not_found_and_sends_no_put() {
+    let (endpoint, seen) = canned(vec![
+        empty_page(),
+        empty_page(),
+        answer("404 Not Found", "", ""),
+        answer("200 OK", "", ""),
+    ]);
+    let error = minio(endpoint)
+        .put(Path::new("/d/task.md"), b"x", &Condition::None)
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::NotFound);
+    assert_eq!(
+        requests(&seen),
+        [
+            "GET if-match=-",
+            "GET if-match=-",
+            "HEAD if-match=-",
+            "HEAD if-match=-"
+        ]
+    );
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_put_under_an_object_is_not_a_directory() {
+    let (endpoint, _seen) = canned(vec![
+        empty_page(),
+        empty_page(),
+        head_answer("ETag: \"a\"\r\nContent-Length: 1\r\n"),
+    ]);
+    let error = minio(endpoint)
+        .put(Path::new("/d/task.md"), b"x", &Condition::None)
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::NotADirectory);
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_append_to_a_missing_parent_is_not_found() {
+    let (endpoint, seen) = canned(vec![
+        answer("404 Not Found", "", ""),
+        empty_page(),
+        empty_page(),
+        answer("404 Not Found", "", ""),
+        answer("200 OK", "", ""),
+    ]);
+    let error = minio(endpoint)
+        .append(Path::new("/d/log.md"), b"x")
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::NotFound);
+    assert_eq!(requests(&seen).len(), 5);
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_copy_sends_copy_object_and_gives_the_length_of_the_source() {
+    let (endpoint, seen, targets) = canned_with_targets(vec![
+        head_answer("ETag: \"a\"\r\nContent-Length: 5\r\n"),
+        empty_page(),
+        copied("c"),
+    ]);
+    let length = minio(endpoint)
+        .copy(Path::new("/from me.md"), Path::new("/to.md"))
+        .unwrap();
+    assert_eq!(length, 5);
+    assert_eq!(
+        requests(&seen).last().map(String::as_str),
+        Some("PUT if-match=- copy-source=archie/from%20me.md")
+    );
+    assert_eq!(
+        targets.lock().unwrap().last().map(String::as_str),
+        Some("PUT /archie/to.md?x-id=CopyObject")
+    );
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_copy_of_a_missing_source_is_not_found_and_copies_nothing() {
+    let (endpoint, seen) = canned(vec![
+        answer("404 Not Found", "", ""),
+        answer("200 OK", "", ""),
+        empty_page(),
+    ]);
+    let error = minio(endpoint)
+        .copy(Path::new("/from.md"), Path::new("/to.md"))
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::NotFound);
+    assert!(requests(&seen).iter().all(|line| !line.starts_with("PUT")));
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_rename_of_a_file_copies_then_deletes_the_source_under_its_tag() {
+    let (endpoint, seen) = canned(vec![
+        head_answer("ETag: \"a\"\r\nContent-Length: 5\r\n"),
+        empty_page(),
+        copied("c"),
+        answer("200 OK", "ETag: \"a\"\r\n", ""),
+        answer("204 No Content", "", ""),
+    ]);
+    minio(endpoint)
+        .rename(Path::new("/from.md"), Path::new("/to.md"))
+        .unwrap();
+    assert_eq!(
+        requests(&seen),
+        [
+            "HEAD if-match=-",
+            "GET if-match=-",
+            "PUT if-match=- copy-source=archie/from.md",
+            "HEAD if-match=-",
+            "DELETE if-match=\"a\"",
+        ]
+    );
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_rename_whose_delete_finds_another_tag_removes_the_copy_again() {
+    let (endpoint, seen) = canned(vec![
+        head_answer("ETag: \"a\"\r\nContent-Length: 5\r\n"),
+        empty_page(),
+        copied("c"),
+        answer("200 OK", "ETag: \"z\"\r\n", ""),
+        answer("200 OK", "ETag: \"c\"\r\n", ""),
+        answer("204 No Content", "", ""),
+    ]);
+    let error = minio(endpoint)
+        .rename(Path::new("/from.md"), Path::new("/to.md"))
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::PreconditionFailed);
+    assert_eq!(
+        requests(&seen).last().map(String::as_str),
+        Some("DELETE if-match=\"c\"")
+    );
+}
+
+#[cfg(feature = "s3")]
+#[test]
+fn s3_rename_whose_delete_is_answered_412_deletes_the_copy_and_returns_the_failure() {
+    let (endpoint, seen, targets) = canned_with_targets(vec![
+        head_answer("ETag: \"a\"\r\nContent-Length: 5\r\n"),
+        empty_page(),
+        copied("c"),
+        answer("412 Precondition Failed", "", ""),
+        answer("204 No Content", "", ""),
+    ]);
+    let error = s3(&endpoint)
+        .rename(Path::new("/from.md"), Path::new("/to.md"))
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::PreconditionFailed);
+    assert_eq!(
+        requests(&seen),
+        [
+            "HEAD if-match=-",
+            "GET if-match=-",
+            "PUT if-match=- copy-source=archie/from.md",
+            "DELETE if-match=\"a\"",
+            "DELETE if-match=\"c\"",
+        ]
+    );
+    assert_eq!(
+        targets.lock().unwrap().last().map(String::as_str),
+        Some("DELETE /archie/to.md?x-id=DeleteObject")
+    );
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_rename_of_a_folder_moves_every_key_and_marker_below_it() {
+    let missing = || answer("404 Not Found", "", "");
+    let (endpoint, _seen, targets) = canned_with_targets(vec![
+        missing(),
+        answer("200 OK", "", ""),
+        listing(&["s/", "s/f.md"], &[]),
+        empty_page(),
+        missing(),
+        answer("200 OK", "", ""),
+        answer("200 OK", "", ""),
+        listing(&["s/", "s/f.md"], &[]),
+        head_answer("ETag: \"m\"\r\nContent-Length: 0\r\n"),
+        copied("m"),
+        head_answer("ETag: \"m\"\r\n"),
+        answer("204 No Content", "", ""),
+        head_answer("ETag: \"f\"\r\nContent-Length: 1\r\n"),
+        copied("f"),
+        head_answer("ETag: \"f\"\r\n"),
+        answer("204 No Content", "", ""),
+    ]);
+    minio(endpoint)
+        .rename(Path::new("/s"), Path::new("/t"))
+        .unwrap();
+    let log = targets.lock().unwrap().clone();
+    let copies: Vec<&String> = log
+        .iter()
+        .filter(|line| line.contains("CopyObject"))
+        .collect();
+    assert_eq!(
+        copies,
+        [
+            "PUT /archie/t/?x-id=CopyObject",
+            "PUT /archie/t/f.md?x-id=CopyObject"
+        ]
+    );
+    let deletes: Vec<&String> = log
+        .iter()
+        .filter(|line| line.starts_with("DELETE"))
+        .collect();
+    assert_eq!(
+        deletes,
+        [
+            "DELETE /archie/s/?x-id=DeleteObject",
+            "DELETE /archie/s/f.md?x-id=DeleteObject"
+        ]
+    );
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_rename_of_a_folder_into_itself_is_invalid_input() {
+    let (endpoint, _seen) = canned(vec![
+        answer("404 Not Found", "", ""),
+        answer("200 OK", "", ""),
+        listing(&["s/f.md"], &[]),
+    ]);
+    let error = minio(endpoint)
+        .rename(Path::new("/s"), Path::new("/s/inside"))
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_answers_500_502_and_504_are_unavailable_and_403_is_permission_denied() {
+    for status in [
+        "500 Internal Server Error",
+        "502 Bad Gateway",
+        "504 Gateway Timeout",
+    ] {
+        let (endpoint, _seen) = canned(vec![answer(status, "", "")]);
+        let error = minio(endpoint).get(Path::new("/task.md")).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unavailable, "{status}");
+    }
+    let (endpoint, _seen) = canned(vec![access_denied()]);
+    let error = minio(endpoint).get(Path::new("/task.md")).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_guarantees_hold_the_one_step_writes_and_empty_folders_only() {
+    let held = MinioBucket::new(minio_config("http://127.0.0.1:9".to_owned())).guarantees();
+    for guarantee in EVERY_GUARANTEE {
+        assert_eq!(
+            held.contains(guarantee),
+            SDK_GUARANTEES.contains(&guarantee),
+            "{guarantee:?}"
+        );
+    }
+}
+
+#[cfg(feature = "s3")]
+#[test]
+fn s3_guarantees_add_the_conditional_delete_to_the_minio_ones() {
+    let held = S3Bucket::new(s3_config()).guarantees();
+    for guarantee in EVERY_GUARANTEE {
+        assert_eq!(
+            held.contains(guarantee),
+            SDK_GUARANTEES.contains(&guarantee)
+                || guarantee == Guarantee::ConditionalDeleteInOneStep,
+            "{guarantee:?}"
+        );
+    }
 }
