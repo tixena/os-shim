@@ -1,49 +1,50 @@
-//! Whole objects in one bucket of an S3-compatible object store, written and
-//! deleted under conditions, with an in-memory twin for tests.
+//! Files and folders in one bucket of an object store, written and deleted
+//! under conditions, with an in-memory twin for tests.
 //!
 //! Available in every build; `MinioBucket` needs the `minio` feature,
 //! `S3Bucket` the `s3` feature, and `BlockingBucket` either of them.
 //!
 //! # What it is
 //!
-//! The module reads, writes, deletes and lists whole objects by key, and reads
-//! an object's size and tag without its bytes. It has no ranges, no streaming,
-//! no custom metadata, no copy and no versions. Every put and delete takes a
-//! [`Condition`]:
+//! The module reads, writes, appends to, copies, renames, deletes and lists
+//! files and folders by absolute path, and reads a file's kind, size,
+//! modification time and revision token without its bytes. Every put and
+//! delete takes a [`Condition`]:
 //!
 //! - [`Condition::None`]: no check. A put replaces, a delete removes.
-//! - [`Condition::Absent`]: the put succeeds only if no object is at the key.
-//! - [`Condition::ETag`]: the put or delete succeeds only if the object at the
-//!   key has this entity tag.
+//! - [`Condition::Absent`]: the put succeeds only if nothing is at the path.
+//!   A failed `Absent` is [`ErrorKind::AlreadyExists`].
+//! - [`Condition::Matches`]: the put or delete succeeds only if the file has
+//!   this [`RevisionToken`]. A failed `Matches` is
+//!   [`ErrorKind::PreconditionFailed`].
 //!
-//! A put returns the new entity tag. A get returns the bytes with their tag
-//! ([`Object`]), a head the size with the tag ([`Head`]). A failed condition is an [`ObjectError`] whose
-//! [`kind`](ObjectError::kind) is [`ObjectErrorKind::PreconditionFailed`], the
-//! same on every implementation.
+//! Every failure is a [`StorageError`] whose kind
+//! means the same on every implementation.
 //!
 //! # The pieces
 //!
-//! - `Bucket`: the asynchronous trait with `get`, `head`, `put`, `delete` and
-//!   `list`.
-//!   Its methods return `impl Future + Send`, so it cannot be a trait object;
-//!   take a generic `B: Bucket`.
+//! - `Bucket`: the asynchronous trait. Its methods return
+//!   `impl Future + Send`, so it cannot be a trait object; take a generic
+//!   `B: Bucket`. Only `delete`, `get`, `guarantees`, `head`, `list` and `put`
+//!   are required; the other methods have bodies a backend overrides when its
+//!   storage has a native form.
 //! - `MinioBucket` and `MinioConfig` (feature `minio`): a client for `MinIO`,
 //!   `RustFS` and other servers that speak its API. Path-style addressing.
 //!   `MinioBucket::ensure` creates the bucket when it is missing.
 //! - `S3Bucket` and `S3Config` (feature `s3`): a client for AWS S3.
 //!   `S3Bucket::ensure` creates the bucket when it is missing: private, in the
 //!   client's region, encrypted with a KMS key when one is given.
-//! - [`MemoryBucket`]: the same interface over a map in memory. No server, no
-//!   network. Clones share the same objects.
+//! - [`MemoryBucket`]: the same interface over files and folders in memory. No
+//!   server, no network. Clones share the same files.
 //! - [`BlockingBucket`]: wraps any `Bucket` for code that is not async. It owns
 //!   a tokio runtime.
 //!
 //! # When to use it
 //!
 //! - **Claim a lock or lease.** Put with `Condition::Absent`; only one caller
-//!   wins. Renew or release it with the tag the put returned.
+//!   wins. Renew or release it with the token the put returned.
 //! - **Edit a shared document.** Get, change the bytes, put with
-//!   `Condition::ETag(object.etag)`. On `PreconditionFailed`, get again and
+//!   `Condition::Matches(token)`. On `PreconditionFailed`, get again and
 //!   retry. No update is lost.
 //! - **Test with no server.** Write the code against a generic `B: Bucket`,
 //!   run it on `MinioBucket` or `S3Bucket` in production and on
@@ -51,56 +52,69 @@
 //!
 //! # Example
 //!
-//! Claim a key, then update it only while nobody else has changed it:
+//! Claim a key, then release it only while nobody else has changed it:
 //!
 //! ```
-//! use os_shim::bucket::{Bucket as _, Condition, MemoryBucket, ObjectErrorKind};
+//! use os_shim::bucket::{Bucket as _, Condition, Depth, MemoryBucket};
+//! use os_shim::error::ErrorKind;
+//! use std::path::Path;
+//! use std::sync::{Arc, Mutex};
+//! use std::time::{Duration, SystemTime};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let now = Arc::new(Mutex::new(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000)));
+//! let read = Arc::clone(&now);
+//! let bucket = MemoryBucket::new(Arc::new(move || *read.lock().unwrap()));
 //! let runtime = tokio::runtime::Builder::new_current_thread().build()?;
 //! runtime.block_on(async {
-//!     let ours = MemoryBucket::default();
-//!     let theirs = ours.clone();
+//!     bucket.create_folder(Path::new("/jobs")).await?;
+//!     let lock = Path::new("/jobs/42.lock");
+//!     let ours = bucket.put(lock, b"worker-a", &Condition::Absent).await?;
+//!     let theirs = bucket.put(lock, b"worker-b", &Condition::Absent).await;
+//!     assert_eq!(theirs.unwrap_err().kind(), ErrorKind::AlreadyExists);
 //!
-//!     // Create if absent: the first caller wins, the second is refused.
-//!     let first_tag = ours.put("jobs/42", b"claimed by ours", &Condition::Absent).await?;
-//!     let refused = theirs.put("jobs/42", b"claimed by theirs", &Condition::Absent).await;
-//!     assert_eq!(
-//!         refused.unwrap_err().kind(),
-//!         ObjectErrorKind::PreconditionFailed
-//!     );
+//!     *now.lock().unwrap() += Duration::from_secs(60);
+//!     bucket.append(lock, b" renewed").await?;
+//!     let stale = bucket.delete(lock, &Condition::Matches(ours)).await;
+//!     assert_eq!(stale.unwrap_err().kind(), ErrorKind::PreconditionFailed);
 //!
-//!     // Update if unchanged: the tag from the get says what we saw.
-//!     let seen = ours.get("jobs/42").await?;
-//!     assert_eq!(seen.etag, first_tag);
-//!     ours.put("jobs/42", b"done", &Condition::ETag(seen.etag.clone())).await?;
-//!
-//!     // The same tag is now stale, so a second update with it is refused.
-//!     let stale = theirs.put("jobs/42", b"overwrite", &Condition::ETag(seen.etag)).await;
-//!     assert_eq!(
-//!         stale.unwrap_err().kind(),
-//!         ObjectErrorKind::PreconditionFailed
-//!     );
-//!     assert_eq!(theirs.get("jobs/42").await?.bytes, b"done");
-//!     Ok::<_, Box<dyn std::error::Error>>(())
-//! })
+//!     let (bytes, token) = bucket.get(lock).await?;
+//!     assert_eq!(bytes, b"worker-a renewed");
+//!     bucket.delete(lock, &Condition::Matches(token)).await?;
+//!     assert!(bucket.list(Path::new("/jobs"), Depth::Children).await?.is_empty());
+//!     Ok::<_, os_shim::error::StorageError>(())
+//! })?;
+//! # Ok(())
 //! # }
 //! ```
 //!
 //! # Things that bite
 //!
 //! - The clients never retry. A network failure or a 5xx is an
-//!   [`ObjectErrorKind::Other`] error and the caller decides what to do.
+//!   [`ErrorKind::Other`] error and the caller decides what to do.
 //! - Credentials are a fixed access key and secret key. There is no session
 //!   token and no environment or profile lookup.
-//! - Entity tags differ between implementations. A tag from [`MemoryBucket`]
-//!   means nothing to a real store, and the reverse.
+//! - Revision tokens differ between implementations. A token from
+//!   [`MemoryBucket`] means nothing to a real store, and the reverse.
 //! - [`BlockingBucket`] panics when called from inside a tokio runtime.
 
 #[macro_use]
 mod interface;
 
-use alloc::collections::BTreeMap;
+mod defaults;
+mod memory;
+mod paths;
+
+use self::defaults::{
+    BufferedWriter, BytesReader, Target, append_by_rewrite, copy_by_rewrite, rename_by_copy,
+    walk_by_list,
+};
+#[cfg(any(feature = "minio", feature = "s3"))]
+use self::paths::key_of;
+use self::paths::lexical;
+use crate::error::{ErrorKind, Result, StorageError};
+use crate::{FileMetadata, WalkEntry};
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 #[cfg(feature = "s3")]
 use aws_sdk_s3::config::Builder as ConfigBuilder;
@@ -116,302 +130,244 @@ use aws_sdk_s3::{
     error::{ProvideErrorMetadata, SdkError},
     primitives::ByteStream,
 };
+#[cfg(any(feature = "minio", feature = "s3"))]
 use core::error::Error;
+#[cfg(any(feature = "minio", feature = "s3"))]
 use core::fmt;
 use core::future::ready;
-use core::hash::{Hash as _, Hasher as _};
 #[cfg(any(feature = "minio", feature = "s3"))]
 use core::iter;
-use std::hash::DefaultHasher;
+use futures_io::{AsyncRead, AsyncWrite};
+#[cfg(any(feature = "minio", feature = "s3"))]
 use std::io;
-use std::sync::{PoisonError, RwLock};
+use std::path::{Path, PathBuf};
+use std::sync::RwLock;
+use std::time::SystemTime;
 #[cfg(any(feature = "minio", feature = "s3"))]
 use tokio::runtime::{Builder, Runtime};
 
 declare_bucket!();
 
-/// What a store says about one object without sending its bytes.
-///
-/// Returned by `head`. It cannot be built outside this crate.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct Head {
-    /// The `ETag` exactly as the store gave it, quotes included.
-    pub etag: String,
-    pub size: u64,
+/// A value a backend changes every time a file's bytes change: an entity tag on `MinIO` and S3,
+/// a counter in memory, a SHA-256 hash of the bytes on disk.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RevisionToken(String);
+
+impl RevisionToken {
+    /// The token's text, as the backend gave it.
+    #[inline]
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// A token from a backend's own value; for a `Bucket` written outside this crate.
+    #[inline]
+    #[must_use]
+    pub fn new<S>(value: S) -> Self
+    where
+        S: Into<String>,
+    {
+        Self(value.into())
+    }
 }
 
-/// One object: its bytes and the entity tag the store gave it.
-///
-/// Returned by `get`. It cannot be built outside this crate. Pass `etag` back
-/// in [`Condition::ETag`] to write or delete only if the object has not changed
-/// since you read it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct Object {
-    pub bytes: Vec<u8>,
-    /// The `ETag` exactly as the store gave it, quotes included.
-    pub etag: String,
-}
-
-/// What a put or a delete waits for.
+/// What a write or a delete waits for.
 ///
 /// Import the variants by path (`Condition::None`), not with `use
 /// Condition::*`, where `None` hides `Option::None`. The enum is
 /// `non_exhaustive`: a `match` outside this crate needs a `_` arm.
-///
-/// `Absent` on a delete deletes nothing: it succeeds on an empty key and fails
-/// with `PreconditionFailed` if an object is there. `ETag` on an empty key fails
-/// with `PreconditionFailed`, not `NotFound`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Condition {
-    /// No object is at the key: `If-None-Match: *`.
+    /// Nothing is at the path. A failed `Absent` is `AlreadyExists`.
     Absent,
-    /// The object at the key has this entity tag: `If-Match`.
-    ETag(String),
-    /// Nothing: a put replaces and a delete removes whatever is there.
+    /// The file still has this token. A failed `Matches` is `PreconditionFailed`.
+    Matches(RevisionToken),
+    /// No check: a write replaces, a delete removes.
     None,
 }
 
-/// Which way a bucket operation failed.
-///
-/// Read it with [`ObjectError::kind`]. The enum is `non_exhaustive`: a `match`
-/// outside this crate needs a `_` arm.
-///
-/// Only `get` and `head` return `NotFound`; a missing bucket is `Other`. Nothing is
-/// retried for you, so a transient `Other` is yours to retry. After
-/// `PreconditionFailed` the object is unchanged: get it again and decide.
+/// How far a listing reaches below a folder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum ObjectErrorKind {
-    /// No object at the key: HTTP 404.
-    NotFound,
-    /// Any other failure: the network, a missing bucket, a 403, a 5xx, an answer that cannot be read.
-    Other,
-    /// The condition does not hold: HTTP 412.
-    PreconditionFailed,
+pub enum Depth {
+    /// Every entry at every level below the folder.
+    All,
+    /// The folder's direct children only.
+    Children,
 }
 
-/// Why a bucket operation failed.
+/// The clock a bucket stamps modification times from.
+pub type Clock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
+
+/// One promise a backend can make.
 ///
-/// Branch on [`kind`](Self::kind). The only public way to make one is
-/// `From<io::Error>`, which gives kind [`ObjectErrorKind::Other`]. `Display`
-/// shows the underlying error of an `Other` failure, else a fixed phrase for
-/// the kind.
-#[derive(Debug)]
-pub struct ObjectError {
-    /// Which way it failed.
-    kind: ObjectErrorKind,
-    /// The underlying failure of an `Other` error.
-    source: Option<io::Error>,
+/// For the disk, "atomic" means within one file system and "in one step" means
+/// among callers of os-shim, under the advisory lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Guarantee {
+    /// An append happens as one step: concurrent appends neither interleave nor lose bytes.
+    AppendIsAtomic,
+    /// An append writes only the new bytes, not the whole file again.
+    AppendWritesOnlyNewBytes,
+    /// A delete under `Matches` checks the token and removes the file in one step.
+    ConditionalDeleteInOneStep,
+    /// A put under `Matches` checks the token and writes the file in one step.
+    ConditionalWriteInOneStep,
+    /// A put under `Absent` checks the path and creates the file in one step.
+    CreateOnlyWriteInOneStep,
+    /// A writer dropped without `close` keeps the bytes written to it.
+    DroppedWriterKeepsBytes,
+    /// A folder with nothing in it exists.
+    EmptyFoldersExist,
+    /// A rename that fails leaves the destination as it was.
+    FailedRenameKeepsDestination,
+    /// A file and a folder never share a path.
+    FileAndFolderNeverShareAPath,
+    /// Renaming a file happens as one step.
+    FileRenameIsAtomic,
+    /// Renaming a folder happens as one step.
+    FolderRenameIsAtomic,
+    /// The futures of the bucket never wait: each is ready the first time it is polled.
+    FuturesNeverWait,
+    /// A put checks that the parent folder exists and writes the file in one step.
+    ParentCheckInOneStep,
+    /// A reader never sees a file half written.
+    ReadersNeverSeePartialWrites,
+    /// `walk` leaves out what a `.gitignore` file names.
+    WalkHonorsGitignore,
 }
 
-impl ObjectError {
-    /// Which way the operation failed.
+impl Guarantee {
+    /// The bit this guarantee takes in a [`Guarantees`]: a distinct power of two per variant.
+    const fn bit(self) -> u16 {
+        match self {
+            Self::AppendIsAtomic => 0x0001,
+            Self::AppendWritesOnlyNewBytes => 0x0002,
+            Self::ConditionalDeleteInOneStep => 0x0004,
+            Self::ConditionalWriteInOneStep => 0x0008,
+            Self::CreateOnlyWriteInOneStep => 0x0010,
+            Self::DroppedWriterKeepsBytes => 0x0020,
+            Self::EmptyFoldersExist => 0x0040,
+            Self::FailedRenameKeepsDestination => 0x0080,
+            Self::FileAndFolderNeverShareAPath => 0x0100,
+            Self::FileRenameIsAtomic => 0x0200,
+            Self::FolderRenameIsAtomic => 0x0400,
+            Self::FuturesNeverWait => 0x0800,
+            Self::ParentCheckInOneStep => 0x1000,
+            Self::ReadersNeverSeePartialWrites => 0x2000,
+            Self::WalkHonorsGitignore => 0x4000,
+        }
+    }
+}
+
+/// The promises a backend makes, as a set; `System::guarantees` passes on its bucket's.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Guarantees {
+    /// One bit per [`Guarantee`].
+    bits: u16,
+}
+
+impl Guarantees {
+    /// Whether the set holds `guarantee`.
     #[inline]
     #[must_use]
-    pub const fn kind(&self) -> ObjectErrorKind {
-        self.kind
+    pub const fn contains(self, guarantee: Guarantee) -> bool {
+        self.bits & guarantee.bit() != 0
     }
 
-    /// A `NotFound` error.
-    pub(crate) const fn not_found() -> Self {
-        Self {
-            kind: ObjectErrorKind::NotFound,
-            source: None,
-        }
-    }
-
-    /// A `PreconditionFailed` error.
-    pub(crate) const fn precondition_failed() -> Self {
-        Self {
-            kind: ObjectErrorKind::PreconditionFailed,
-            source: None,
-        }
-    }
-}
-
-impl From<io::Error> for ObjectError {
+    /// The empty set: no promise.
     #[inline]
-    fn from(error: io::Error) -> Self {
+    #[must_use]
+    pub const fn none() -> Self {
+        Self { bits: 0 }
+    }
+
+    /// This set with `guarantee` added.
+    #[inline]
+    #[must_use]
+    pub const fn with(self, guarantee: Guarantee) -> Self {
         Self {
-            kind: ObjectErrorKind::Other,
-            source: Some(error),
+            bits: self.bits | guarantee.bit(),
         }
     }
 }
 
-impl fmt::Display for ObjectError {
-    #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(error) = self.source.as_ref() {
-            return write!(f, "{error}");
-        }
-        match self.kind {
-            ObjectErrorKind::NotFound => f.write_str("no object at the key"),
-            ObjectErrorKind::Other => f.write_str("the operation failed"),
-            ObjectErrorKind::PreconditionFailed => f.write_str("the condition does not hold"),
-        }
-    }
-}
-
-impl Error for ObjectError {
-    #[inline]
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        self.source.as_ref().map(|error| {
-            let source: &(dyn Error + 'static) = error;
-            source
-        })
-    }
-}
-
-/// Objects in memory, for tests that reach no server.
+/// Files and folders in memory, for tests that reach no disk and no server.
 ///
 /// It follows the same rules as the real clients: [`Condition`] and
-/// [`ObjectErrorKind`] mean the same, and a condition is checked and applied in
-/// one step. Make one with `MemoryBucket::default()`. Clones share the same
-/// objects, so a test can play two clients with two clones.
+/// [`ErrorKind`] mean the same, and a condition is checked and applied in one
+/// step. Make one with [`MemoryBucket::new`] and a clock the test moves, or
+/// with `MemoryBucket::default()` on the machine's clock. Clones share the
+/// same files, so a test can play two clients with two clones.
 ///
-/// Its entity tag is a hash of the bytes in double quotes, so the same bytes
-/// give the same tag, and putting identical bytes again does not change it.
-/// Tags from a real store are not comparable. `list` returns keys sorted.
+/// Its revision tokens come from one counter for the whole bucket, so a file
+/// deleted and created again never gets a token it had before. `/` is always a
+/// folder, and a put needs its parent folder.
 ///
 /// ```
-/// use os_shim::bucket::{Bucket as _, Condition, MemoryBucket, ObjectErrorKind};
+/// use os_shim::bucket::{Bucket as _, Condition, Depth, MemoryBucket};
+/// use os_shim::error::ErrorKind;
+/// use std::path::Path;
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let runtime = tokio::runtime::Builder::new_current_thread().build()?;
 /// runtime.block_on(async {
 ///     let bucket = MemoryBucket::default();
+///     let config = Path::new("/config.json");
 ///
-///     let tag = bucket.put("config.json", b"{\"v\":1}", &Condition::Absent).await?;
-///     assert!(bucket
-///         .put("config.json", b"{\"v\":2}", &Condition::Absent)
-///         .await
-///         .is_err());
+///     let token = bucket.put(config, b"{\"v\":1}", &Condition::Absent).await?;
+///     let again = bucket.put(config, b"{\"v\":2}", &Condition::Absent).await;
+///     assert_eq!(again.unwrap_err().kind(), ErrorKind::AlreadyExists);
 ///
-///     let object = bucket.get("config.json").await?;
-///     assert_eq!(object.etag, tag);
+///     let (_bytes, seen) = bucket.get(config).await?;
+///     assert_eq!(seen, token);
 ///
-///     bucket.put("config.json", b"{\"v\":2}", &Condition::ETag(tag.clone())).await?;
-///     let stale = bucket.delete("config.json", &Condition::ETag(tag)).await;
-///     assert_eq!(
-///         stale.unwrap_err().kind(),
-///         ObjectErrorKind::PreconditionFailed
-///     );
+///     bucket.put(config, b"{\"v\":2}", &Condition::Matches(token.clone())).await?;
+///     let stale = bucket.delete(config, &Condition::Matches(token)).await;
+///     assert_eq!(stale.unwrap_err().kind(), ErrorKind::PreconditionFailed);
 ///
-///     assert_eq!(bucket.list("config").await?, ["config.json"]);
-///     Ok::<_, Box<dyn std::error::Error>>(())
-/// })
+///     assert_eq!(bucket.list(Path::new("/"), Depth::Children).await?.len(), 1);
+///     Ok::<_, os_shim::error::StorageError>(())
+/// })?;
+/// # Ok(())
 /// # }
 /// ```
-#[derive(Debug, Clone, Default)]
+#[derive(Clone)]
 pub struct MemoryBucket {
-    /// The bytes at each key.
-    objects: Arc<RwLock<BTreeMap<String, Vec<u8>>>>,
+    /// The clock that stamps modification times.
+    clock: Clock,
+    /// The files, the folders and the revision counter.
+    state: Arc<RwLock<MemoryState>>,
 }
 
-impl MemoryBucket {
-    /// Delete the object at `key` when `condition` holds.
-    fn delete_now(&self, key: &str, condition: &Condition) -> Result<(), ObjectError> {
-        let mut objects = self.objects.write().unwrap_or_else(PoisonError::into_inner);
-        if !holds(condition, objects.get(key)) {
-            return Err(ObjectError::precondition_failed());
-        }
-        objects.remove(key);
-        drop(objects);
-        Ok(())
-    }
-
-    /// The object at `key`.
-    fn get_now(&self, key: &str) -> Result<Object, ObjectError> {
-        let bytes = self
-            .objects
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(key)
-            .cloned()
-            .ok_or_else(ObjectError::not_found)?;
-        let etag = tag_of(&bytes);
-        Ok(Object { bytes, etag })
-    }
-
-    /// The size and tag of the object at `key`, read without copying its bytes.
-    fn head_now(&self, key: &str) -> Result<Head, ObjectError> {
-        let (etag, length) = self
-            .objects
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(key)
-            .map(|bytes| (tag_of(bytes), bytes.len()))
-            .ok_or_else(ObjectError::not_found)?;
-        Ok(Head {
-            etag,
-            size: u64::try_from(length).map_err(io::Error::other)?,
-        })
-    }
-
-    /// Every key that starts with `prefix`, in order.
-    fn list_now(&self, prefix: &str) -> Vec<String> {
-        let objects = self.objects.read().unwrap_or_else(PoisonError::into_inner);
-        objects
-            .keys()
-            .filter(|key| key.starts_with(prefix))
-            .cloned()
-            .collect()
-    }
-
-    /// Write `bytes` at `key` when `condition` holds, and give their tag.
-    fn put_now(
-        &self,
-        key: &str,
-        bytes: &[u8],
-        condition: &Condition,
-    ) -> Result<String, ObjectError> {
-        let mut objects = self.objects.write().unwrap_or_else(PoisonError::into_inner);
-        if !holds(condition, objects.get(key)) {
-            return Err(ObjectError::precondition_failed());
-        }
-        objects.insert(key.to_owned(), bytes.to_vec());
-        drop(objects);
-        Ok(tag_of(bytes))
-    }
+/// The tree of a [`MemoryBucket`].
+struct MemoryState {
+    /// The files, by path.
+    files: BTreeMap<PathBuf, MemoryFile>,
+    /// The folders, by path. `/` is always one.
+    folders: BTreeSet<PathBuf>,
+    /// The next revision; one counter for the whole bucket, so a token is never handed out twice.
+    next_revision: u64,
 }
 
-impl Bucket for MemoryBucket {
-    #[inline]
-    fn delete(
-        &self,
-        key: &str,
-        condition: &Condition,
-    ) -> impl Future<Output = Result<(), ObjectError>> + Send {
-        ready(self.delete_now(key, condition))
-    }
+/// One file of a [`MemoryBucket`].
+struct MemoryFile {
+    /// The bytes.
+    bytes: Vec<u8>,
+    /// The time of the last write.
+    modified: SystemTime,
+    /// The revision of the last write.
+    revision: u64,
+}
 
+impl Default for MemoryBucket {
+    /// A bucket on the machine's clock.
     #[inline]
-    fn get(&self, key: &str) -> impl Future<Output = Result<Object, ObjectError>> + Send {
-        ready(self.get_now(key))
-    }
-
-    #[inline]
-    fn head(&self, key: &str) -> impl Future<Output = Result<Head, ObjectError>> + Send {
-        ready(self.head_now(key))
-    }
-
-    #[inline]
-    fn list(&self, prefix: &str) -> impl Future<Output = Result<Vec<String>, ObjectError>> + Send {
-        ready(Ok(self.list_now(prefix)))
-    }
-
-    #[inline]
-    fn put(
-        &self,
-        key: &str,
-        bytes: &[u8],
-        condition: &Condition,
-    ) -> impl Future<Output = Result<String, ObjectError>> + Send {
-        ready(self.put_now(key, bytes, condition))
+    fn default() -> Self {
+        Self::new(Arc::new(SystemTime::now))
     }
 }
 
@@ -422,15 +378,17 @@ impl Bucket for MemoryBucket {
 ///
 /// Wrap [`MemoryBucket`], `MinioBucket` or `S3Bucket`. The methods take the
 /// same arguments and return the same results as the `Bucket` trait, without
-/// the futures. It cannot be cloned and gives no access to the bucket inside.
+/// the futures, and it has no streams. It cannot be cloned and gives no access
+/// to the bucket inside.
 ///
 /// ```
 /// use os_shim::bucket::{BlockingBucket, Condition, MemoryBucket};
+/// use std::path::Path;
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let bucket = BlockingBucket::new(MemoryBucket::default())?;
-/// bucket.put("config.json", b"{}", &Condition::Absent)?;
-/// assert_eq!(bucket.get("config.json")?.bytes, b"{}");
+/// bucket.put(Path::new("/config.json"), b"{}", &Condition::Absent)?;
+/// assert_eq!(bucket.get(Path::new("/config.json"))?.0, b"{}");
 /// # Ok(())
 /// # }
 /// ```
@@ -445,63 +403,116 @@ pub struct BlockingBucket<B> {
 
 #[cfg(any(feature = "minio", feature = "s3"))]
 impl<B: Bucket> BlockingBucket<B> {
-    /// Delete the object at `key` when `condition` holds.
+    /// Add `more` at the end of the file, creating it when missing, and give the new token.
     ///
     /// # Errors
     ///
-    /// `PreconditionFailed` when `condition` does not hold, the object unchanged.
-    /// `Other` when the store cannot be reached or refuses.
+    /// The errors of `Bucket::append`.
     ///
     /// # Panics
     ///
     /// Panics when called from inside a tokio runtime.
     #[inline]
-    pub fn delete(&self, key: &str, condition: &Condition) -> Result<(), ObjectError> {
-        self.runtime.block_on(self.bucket.delete(key, condition))
+    pub fn append(&self, path: &Path, more: &[u8]) -> Result<RevisionToken> {
+        self.runtime.block_on(self.bucket.append(path, more))
     }
 
-    /// The object at `key`.
+    /// The absolute form of `path`.
     ///
     /// # Errors
     ///
-    /// `NotFound` when no object is at `key`.
-    /// `Other` when the store cannot be reached or refuses.
+    /// The errors of `Bucket::canonicalize`.
     ///
     /// # Panics
     ///
     /// Panics when called from inside a tokio runtime.
     #[inline]
-    pub fn get(&self, key: &str) -> Result<Object, ObjectError> {
-        self.runtime.block_on(self.bucket.get(key))
+    pub fn canonicalize(&self, path: &Path) -> Result<PathBuf> {
+        self.runtime.block_on(self.bucket.canonicalize(path))
     }
 
-    /// The size and entity tag of the object at `key`, without its bytes.
+    /// Copy a file and give the number of bytes copied.
     ///
     /// # Errors
     ///
-    /// `NotFound` when no object is at `key`.
-    /// `Other` when the store cannot be reached or the bucket is missing.
+    /// The errors of `Bucket::copy`.
     ///
     /// # Panics
     ///
     /// Panics when called from inside a tokio runtime.
     #[inline]
-    pub fn head(&self, key: &str) -> Result<Head, ObjectError> {
-        self.runtime.block_on(self.bucket.head(key))
+    pub fn copy(&self, from: &Path, to: &Path) -> Result<u64> {
+        self.runtime.block_on(self.bucket.copy(from, to))
     }
 
-    /// Every key that starts with `prefix`, every page of the listing read.
+    /// Create `path` and every missing folder above it.
     ///
     /// # Errors
     ///
-    /// `Other` when a page cannot be read.
+    /// The errors of `Bucket::create_folder`.
     ///
     /// # Panics
     ///
     /// Panics when called from inside a tokio runtime.
     #[inline]
-    pub fn list(&self, prefix: &str) -> Result<Vec<String>, ObjectError> {
-        self.runtime.block_on(self.bucket.list(prefix))
+    pub fn create_folder(&self, path: &Path) -> Result<()> {
+        self.runtime.block_on(self.bucket.create_folder(path))
+    }
+
+    /// Remove the file at `path` when `condition` holds.
+    ///
+    /// # Errors
+    ///
+    /// The errors of `Bucket::delete`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from inside a tokio runtime.
+    #[inline]
+    pub fn delete(&self, path: &Path, condition: &Condition) -> Result<()> {
+        self.runtime.block_on(self.bucket.delete(path, condition))
+    }
+
+    /// The bytes at `path` and the token of that version.
+    ///
+    /// # Errors
+    ///
+    /// The errors of `Bucket::get`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from inside a tokio runtime.
+    #[inline]
+    pub fn get(&self, path: &Path) -> Result<(Vec<u8>, RevisionToken)> {
+        self.runtime.block_on(self.bucket.get(path))
+    }
+
+    /// Kind, size, modification time and token of what is at `path`, without its bytes.
+    ///
+    /// # Errors
+    ///
+    /// The errors of `Bucket::head`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from inside a tokio runtime.
+    #[inline]
+    pub fn head(&self, path: &Path) -> Result<FileMetadata> {
+        self.runtime.block_on(self.bucket.head(path))
+    }
+
+    /// The entries below `folder`, files and folders, to `depth`.
+    ///
+    /// # Errors
+    ///
+    /// The errors of `Bucket::list`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from inside a tokio runtime.
+    #[inline]
+    pub fn list(&self, folder: &Path, depth: Depth) -> Result<Vec<WalkEntry>> {
+        self.runtime.block_on(self.bucket.list(folder, depth))
     }
 
     /// A blocking bucket over `bucket`.
@@ -518,25 +529,62 @@ impl<B: Bucket> BlockingBucket<B> {
         Ok(Self { bucket, runtime })
     }
 
-    /// Write `bytes` whole at `key` when `condition` holds, and give the new entity tag.
+    /// Write `bytes` at `path` when `condition` holds, and give the new token.
     ///
     /// # Errors
     ///
-    /// `PreconditionFailed` when `condition` does not hold, the object unchanged.
-    /// `Other` when the store cannot be reached or refuses.
+    /// The errors of `Bucket::put`.
     ///
     /// # Panics
     ///
     /// Panics when called from inside a tokio runtime.
     #[inline]
-    pub fn put(
-        &self,
-        key: &str,
-        bytes: &[u8],
-        condition: &Condition,
-    ) -> Result<String, ObjectError> {
+    pub fn put(&self, path: &Path, bytes: &[u8], condition: &Condition) -> Result<RevisionToken> {
         self.runtime
-            .block_on(self.bucket.put(key, bytes, condition))
+            .block_on(self.bucket.put(path, bytes, condition))
+    }
+
+    /// Remove `path` and everything below it.
+    ///
+    /// # Errors
+    ///
+    /// The errors of `Bucket::remove_folder`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from inside a tokio runtime.
+    #[inline]
+    pub fn remove_folder(&self, path: &Path) -> Result<()> {
+        self.runtime.block_on(self.bucket.remove_folder(path))
+    }
+
+    /// Move a file or a folder.
+    ///
+    /// # Errors
+    ///
+    /// The errors of `Bucket::rename`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from inside a tokio runtime.
+    #[inline]
+    pub fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        self.runtime.block_on(self.bucket.rename(from, to))
+    }
+
+    /// Every entry below `folder`.
+    ///
+    /// # Errors
+    ///
+    /// The errors of `Bucket::walk`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from inside a tokio runtime.
+    #[inline]
+    pub fn walk(&self, folder: &Path, follow_links: bool, hidden: bool) -> Result<Vec<WalkEntry>> {
+        self.runtime
+            .block_on(self.bucket.walk(folder, follow_links, hidden))
     }
 }
 
@@ -550,12 +598,14 @@ struct SdkBucket {
     check_before_delete: bool,
     /// The SDK client every request goes through.
     client: Client,
+    /// What every key starts with, before its first `/`; empty for none.
+    prefix: String,
 }
 
 #[cfg(any(feature = "minio", feature = "s3"))]
 impl SdkBucket {
     /// Whether the bucket exists: `HEAD` on it answers 200, or 404 when it is missing.
-    async fn bucket_exists(&self) -> Result<bool, ObjectError> {
+    async fn bucket_exists(&self) -> Result<bool> {
         match self.client.head_bucket().bucket(&self.bucket).send().await {
             Ok(_) => Ok(true),
             Err(error)
@@ -571,7 +621,7 @@ impl SdkBucket {
     }
 
     /// The entity tag of the object at `key`, or `None` when no object is there.
-    async fn current_tag(&self, key: &str) -> Result<Option<String>, ObjectError> {
+    async fn current_tag(&self, key: &str) -> Result<Option<String>> {
         match self
             .client
             .head_object()
@@ -582,45 +632,47 @@ impl SdkBucket {
             .map_err(classify)
         {
             Ok(head) => Ok(head.e_tag().map(str::to_owned)),
-            Err(error) if error.kind() == ObjectErrorKind::NotFound => {
-                self.object_is_missing().await
-            }
+            Err(error) if error.kind() == ErrorKind::NotFound => self.object_is_missing().await,
             Err(error) => Err(error),
         }
     }
 
-    /// Delete the object at `key` when `condition` holds.
-    async fn delete(&self, key: &str, condition: &Condition) -> Result<(), ObjectError> {
-        let mut request = self.client.delete_object().bucket(&self.bucket).key(key);
+    /// Delete the file at `path` when `condition` holds.
+    async fn delete(&self, path: &Path, condition: &Condition) -> Result<()> {
+        let key = key_of(&self.prefix, path)?;
+        let mut request = self.client.delete_object().bucket(&self.bucket).key(&key);
         match condition.clone() {
             Condition::None => {}
             Condition::Absent => {
-                return match self.current_tag(key).await? {
+                return match self.current_tag(&key).await? {
                     None => Ok(()),
-                    Some(_) => Err(ObjectError::precondition_failed()),
+                    Some(_) => Err(StorageError::from_kind(ErrorKind::AlreadyExists)),
                 };
             }
-            Condition::ETag(tag) => {
-                if self.check_before_delete && self.current_tag(key).await?.as_ref() != Some(&tag) {
-                    return Err(ObjectError::precondition_failed());
+            Condition::Matches(token) => {
+                if self.check_before_delete
+                    && self.current_tag(&key).await?.as_deref() != Some(token.as_str())
+                {
+                    return Err(StorageError::from_kind(ErrorKind::PreconditionFailed));
                 }
-                request = request.if_match(tag);
+                request = request.if_match(token.as_str());
             }
         }
         match request.send().await.map_err(classify) {
             Ok(_) => Ok(()),
             Err(error)
-                if error.kind() == ObjectErrorKind::NotFound
-                    && matches!(*condition, Condition::ETag(_)) =>
+                if error.kind() == ErrorKind::NotFound
+                    && matches!(*condition, Condition::Matches(_)) =>
             {
-                Err(ObjectError::precondition_failed())
+                Err(StorageError::from_kind(ErrorKind::PreconditionFailed))
             }
             Err(error) => Err(error),
         }
     }
 
-    /// The object at `key`.
-    async fn get(&self, key: &str) -> Result<Object, ObjectError> {
+    /// The bytes and token of the file at `path`.
+    async fn get(&self, path: &Path) -> Result<(Vec<u8>, RevisionToken)> {
+        let key = key_of(&self.prefix, path)?;
         let output = self
             .client
             .get_object()
@@ -634,15 +686,13 @@ impl SdkBucket {
             .body
             .collect()
             .await
-            .map_err(|error| ObjectError::from(io::Error::other(error)))?;
-        Ok(Object {
-            bytes: collected.into_bytes().to_vec(),
-            etag,
-        })
+            .map_err(|error| StorageError::new(ErrorKind::Other, error))?;
+        Ok((collected.into_bytes().to_vec(), RevisionToken::new(etag)))
     }
 
-    /// The size and tag of the object at `key`, from a `HEAD` on it.
-    async fn head(&self, key: &str) -> Result<Head, ObjectError> {
+    /// The metadata of the file at `path`, from a `HEAD` on it.
+    async fn head(&self, path: &Path) -> Result<FileMetadata> {
+        let key = key_of(&self.prefix, path)?;
         match self
             .client
             .head_object()
@@ -652,65 +702,94 @@ impl SdkBucket {
             .await
             .map_err(classify)
         {
-            Ok(head) => Ok(Head {
-                etag: head.e_tag().map(str::to_owned).ok_or_else(missing_etag)?,
-                size: head
+            Ok(head) => {
+                let etag = head.e_tag().map(str::to_owned).ok_or_else(missing_etag)?;
+                let len = head
                     .content_length()
                     .and_then(|length| u64::try_from(length).ok())
                     .ok_or_else(|| {
-                        ObjectError::from(io::Error::other(
+                        StorageError::new(
+                            ErrorKind::Other,
                             "the answer carries no Content-Length header",
-                        ))
-                    })?,
-            }),
-            Err(error) if error.kind() == ObjectErrorKind::NotFound => {
+                        )
+                    })?;
+                let modified = head
+                    .last_modified()
+                    .and_then(|time| SystemTime::try_from(*time).ok());
+                Ok(FileMetadata::new(
+                    false,
+                    true,
+                    len,
+                    modified,
+                    Some(RevisionToken::new(etag)),
+                ))
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
                 self.object_is_missing().await?;
-                Err(ObjectError::not_found())
+                Err(StorageError::from_kind(ErrorKind::NotFound))
             }
             Err(error) => Err(error),
         }
     }
 
-    /// Every key that starts with `prefix`, every page of the listing read.
-    async fn list(&self, prefix: &str) -> Result<Vec<String>, ObjectError> {
-        let mut keys = Vec::new();
+    /// The entries below `folder`, every page of the listing read.
+    async fn list(&self, folder: &Path, depth: Depth) -> Result<Vec<WalkEntry>> {
+        let base = lexical(folder)?;
+        let key = key_of(&self.prefix, &base)?;
+        let listed = if key.is_empty() {
+            key
+        } else {
+            format!("{key}/")
+        };
+        let mut entries = Vec::new();
+        let mut folders = BTreeSet::new();
         let mut pages = self
             .client
             .list_objects_v2()
             .bucket(&self.bucket)
-            .prefix(prefix)
+            .prefix(&listed)
             .into_paginator()
             .send();
         while let Some(answer) = pages.next().await {
             let page = answer.map_err(classify)?;
-            keys.extend(
-                page.contents()
-                    .iter()
-                    .filter_map(|object| object.key().map(str::to_owned)),
-            );
+            for relative in page
+                .contents()
+                .iter()
+                .filter_map(|object| object.key())
+                .filter_map(|object_key| object_key.strip_prefix(listed.as_str()))
+                .filter(|relative| !relative.is_empty())
+            {
+                match (depth, relative.split_once('/')) {
+                    (Depth::Children, Some((name, _rest))) => {
+                        if folders.insert(name.to_owned()) {
+                            entries.push(WalkEntry::new(base.join(name), true, false));
+                        }
+                    }
+                    (Depth::All | Depth::Children, _) if relative.ends_with('/') => {}
+                    (Depth::All | Depth::Children, _) => {
+                        entries.push(WalkEntry::new(base.join(relative), false, true));
+                    }
+                }
+            }
         }
-        Ok(keys)
+        Ok(entries)
     }
 
     /// `Ok(None)` when the bucket exists, since a `HEAD` 404 carries no S3 code to say which of
     /// the object and the bucket is missing.
-    async fn object_is_missing(&self) -> Result<Option<String>, ObjectError> {
+    async fn object_is_missing(&self) -> Result<Option<String>> {
         if self.bucket_exists().await? {
             return Ok(None);
         }
-        Err(ObjectError::from(io::Error::other(format!(
-            "404: the bucket {} does not exist",
-            self.bucket
-        ))))
+        Err(StorageError::new(
+            ErrorKind::Other,
+            format!("404: the bucket {} does not exist", self.bucket),
+        ))
     }
 
-    /// Write `bytes` whole at `key` when `condition` holds, and give the new entity tag.
-    async fn put(
-        &self,
-        key: &str,
-        bytes: &[u8],
-        condition: &Condition,
-    ) -> Result<String, ObjectError> {
+    /// Write `bytes` at `path` when `condition` holds, and give the new token.
+    async fn put(&self, path: &Path, bytes: &[u8], condition: &Condition) -> Result<RevisionToken> {
+        let key = key_of(&self.prefix, path)?;
         let unconditional = self
             .client
             .put_object()
@@ -720,15 +799,24 @@ impl SdkBucket {
         let request = match condition.clone() {
             Condition::None => unconditional,
             Condition::Absent => unconditional.if_none_match("*"),
-            Condition::ETag(tag) => unconditional.if_match(tag),
+            Condition::Matches(token) => unconditional.if_match(token.as_str()),
         };
         match request.send().await.map_err(classify) {
-            Ok(output) => output.e_tag().map(str::to_owned).ok_or_else(missing_etag),
+            Ok(output) => output
+                .e_tag()
+                .map(RevisionToken::new)
+                .ok_or_else(missing_etag),
             Err(error)
-                if error.kind() == ObjectErrorKind::NotFound
-                    && matches!(*condition, Condition::ETag(_)) =>
+                if error.kind() == ErrorKind::PreconditionFailed
+                    && matches!(*condition, Condition::Absent) =>
             {
-                Err(ObjectError::precondition_failed())
+                Err(StorageError::from_kind(ErrorKind::AlreadyExists))
+            }
+            Err(error)
+                if error.kind() == ErrorKind::NotFound
+                    && matches!(*condition, Condition::Matches(_)) =>
+            {
+                Err(StorageError::from_kind(ErrorKind::PreconditionFailed))
             }
             Err(error) => Err(error),
         }
@@ -747,13 +835,15 @@ pub struct MinioConfig {
     pub access_key: String,
     pub bucket: String,
     pub endpoint: String,
+    /// What every key starts with, before its first `/`.
+    pub prefix: Option<String>,
     pub region: String,
     pub secret_key: String,
 }
 
 #[cfg(feature = "minio")]
 impl MinioConfig {
-    /// A configuration from its five parts.
+    /// A configuration from its five parts, with no key prefix.
     #[inline]
     #[must_use]
     pub const fn new(
@@ -767,9 +857,21 @@ impl MinioConfig {
             access_key,
             bucket,
             endpoint,
+            prefix: None,
             region,
             secret_key,
         }
+    }
+
+    /// The same configuration with every key under `prefix`; a trailing `/` is dropped.
+    #[inline]
+    #[must_use]
+    pub fn with_prefix<S>(mut self, prefix: S) -> Self
+    where
+        S: Into<String>,
+    {
+        self.prefix = Some(prefix.into().trim_end_matches('/').to_owned());
+        self
     }
 }
 
@@ -781,6 +883,7 @@ impl fmt::Debug for MinioConfig {
             .field("access_key", &self.access_key)
             .field("bucket", &self.bucket)
             .field("endpoint", &self.endpoint)
+            .field("prefix", &self.prefix)
             .field("region", &self.region)
             .field("secret_key", &"<redacted>")
             .finish()
@@ -789,7 +892,7 @@ impl fmt::Debug for MinioConfig {
 
 /// A client for a server that speaks `MinIO`'s API: `MinIO`, `RustFS` and the like.
 ///
-/// A delete with an entity-tag condition reads the object's tag first, because
+/// A delete with a token condition reads the object's tag first, because
 /// `MinIO`'s server ignores `If-Match` on a delete, and sends `If-Match` as well.
 /// The read and the delete are two requests, so a write between them can slip through
 /// on servers that ignore `If-Match`.
@@ -813,7 +916,7 @@ impl MinioBucket {
     /// `Other` when the store cannot be reached, or refuses to say whether the
     /// bucket exists or to create it.
     #[inline]
-    pub async fn ensure(&self) -> Result<(), ObjectError> {
+    pub async fn ensure(&self) -> Result<()> {
         if self.0.bucket_exists().await? {
             return Ok(());
         }
@@ -845,6 +948,7 @@ impl MinioBucket {
             bucket: config.bucket,
             check_before_delete: true,
             client: Client::from_conf(sdk),
+            prefix: config.prefix.unwrap_or_default(),
         })
     }
 }
@@ -854,35 +958,44 @@ impl Bucket for MinioBucket {
     #[inline]
     fn delete(
         &self,
-        key: &str,
+        path: &Path,
         condition: &Condition,
-    ) -> impl Future<Output = Result<(), ObjectError>> + Send {
-        self.0.delete(key, condition)
+    ) -> impl Future<Output = Result<()>> + Send {
+        self.0.delete(path, condition)
     }
 
     #[inline]
-    fn get(&self, key: &str) -> impl Future<Output = Result<Object, ObjectError>> + Send {
-        self.0.get(key)
+    fn get(&self, path: &Path) -> impl Future<Output = Result<(Vec<u8>, RevisionToken)>> + Send {
+        self.0.get(path)
     }
 
     #[inline]
-    fn head(&self, key: &str) -> impl Future<Output = Result<Head, ObjectError>> + Send {
-        self.0.head(key)
+    fn guarantees(&self) -> Guarantees {
+        sdk_guarantees(false)
     }
 
     #[inline]
-    fn list(&self, prefix: &str) -> impl Future<Output = Result<Vec<String>, ObjectError>> + Send {
-        self.0.list(prefix)
+    fn head(&self, path: &Path) -> impl Future<Output = Result<FileMetadata>> + Send {
+        self.0.head(path)
+    }
+
+    #[inline]
+    fn list(
+        &self,
+        folder: &Path,
+        depth: Depth,
+    ) -> impl Future<Output = Result<Vec<WalkEntry>>> + Send {
+        self.0.list(folder, depth)
     }
 
     #[inline]
     fn put(
         &self,
-        key: &str,
+        path: &Path,
         bytes: &[u8],
         condition: &Condition,
-    ) -> impl Future<Output = Result<String, ObjectError>> + Send {
-        self.0.put(key, bytes, condition)
+    ) -> impl Future<Output = Result<RevisionToken>> + Send {
+        self.0.put(path, bytes, condition)
     }
 }
 
@@ -897,13 +1010,15 @@ impl Bucket for MinioBucket {
 pub struct S3Config {
     pub access_key: String,
     pub bucket: String,
+    /// What every key starts with, before its first `/`.
+    pub prefix: Option<String>,
     pub region: String,
     pub secret_key: String,
 }
 
 #[cfg(feature = "s3")]
 impl S3Config {
-    /// A configuration from its four parts.
+    /// A configuration from its four parts, with no key prefix.
     #[inline]
     #[must_use]
     pub const fn new(
@@ -915,9 +1030,21 @@ impl S3Config {
         Self {
             access_key,
             bucket,
+            prefix: None,
             region,
             secret_key,
         }
+    }
+
+    /// The same configuration with every key under `prefix`; a trailing `/` is dropped.
+    #[inline]
+    #[must_use]
+    pub fn with_prefix<S>(mut self, prefix: S) -> Self
+    where
+        S: Into<String>,
+    {
+        self.prefix = Some(prefix.into().trim_end_matches('/').to_owned());
+        self
     }
 }
 
@@ -928,6 +1055,7 @@ impl fmt::Debug for S3Config {
         f.debug_struct("S3Config")
             .field("access_key", &self.access_key)
             .field("bucket", &self.bucket)
+            .field("prefix", &self.prefix)
             .field("region", &self.region)
             .field("secret_key", &"<redacted>")
             .finish()
@@ -936,7 +1064,7 @@ impl fmt::Debug for S3Config {
 
 /// A client for an AWS S3 bucket, over AWS's SDK.
 ///
-/// A delete with an entity-tag condition sends `If-Match` and lets AWS check it.
+/// A delete with a token condition sends `If-Match` and lets AWS check it.
 ///
 /// Available with the `s3` feature. It uses a fixed access key and secret key
 /// and never retries. It implements `Bucket`; wrap it in [`BlockingBucket`] for
@@ -958,7 +1086,7 @@ impl S3Bucket {
     /// `Other` when AWS cannot be reached, or refuses to say whether the bucket
     /// exists, to create it or to set its encryption.
     #[inline]
-    pub async fn ensure(&self, kms_key_arn: Option<&str>) -> Result<(), ObjectError> {
+    pub async fn ensure(&self, kms_key_arn: Option<&str>) -> Result<()> {
         if self.0.bucket_exists().await? {
             return Ok(());
         }
@@ -986,7 +1114,7 @@ impl S3Bucket {
             .sse_algorithm(ServerSideEncryption::AwsKms)
             .kms_master_key_id(key_arn)
             .build()
-            .map_err(|error| ObjectError::from(io::Error::other(error)))?;
+            .map_err(|error| StorageError::new(ErrorKind::Other, error))?;
         let encryption = ServerSideEncryptionConfiguration::builder()
             .rules(
                 ServerSideEncryptionRule::builder()
@@ -995,7 +1123,7 @@ impl S3Bucket {
                     .build(),
             )
             .build()
-            .map_err(|error| ObjectError::from(io::Error::other(error)))?;
+            .map_err(|error| StorageError::new(ErrorKind::Other, error))?;
         self.0
             .client
             .put_bucket_encryption()
@@ -1011,7 +1139,12 @@ impl S3Bucket {
     #[inline]
     #[must_use]
     pub fn new(config: S3Config) -> Self {
-        Self::with_sdk_config(config.bucket.clone(), Self::sdk_config(config).build())
+        let prefix = config.prefix.clone().unwrap_or_default();
+        Self::with_sdk_config(
+            config.bucket.clone(),
+            prefix,
+            Self::sdk_config(config).build(),
+        )
     }
 
     /// The SDK configuration for `config`, before any endpoint is set.
@@ -1025,12 +1158,13 @@ impl S3Bucket {
             .retry_config(RetryConfig::disabled())
     }
 
-    /// A client for `bucket` over the SDK configuration `sdk`.
-    fn with_sdk_config(bucket: String, sdk: Config) -> Self {
+    /// A client for `bucket`, with every key under `prefix`, over the SDK configuration `sdk`.
+    fn with_sdk_config(bucket: String, prefix: String, sdk: Config) -> Self {
         Self(SdkBucket {
             bucket,
             check_before_delete: false,
             client: Client::from_conf(sdk),
+            prefix,
         })
     }
 }
@@ -1040,35 +1174,44 @@ impl Bucket for S3Bucket {
     #[inline]
     fn delete(
         &self,
-        key: &str,
+        path: &Path,
         condition: &Condition,
-    ) -> impl Future<Output = Result<(), ObjectError>> + Send {
-        self.0.delete(key, condition)
+    ) -> impl Future<Output = Result<()>> + Send {
+        self.0.delete(path, condition)
     }
 
     #[inline]
-    fn get(&self, key: &str) -> impl Future<Output = Result<Object, ObjectError>> + Send {
-        self.0.get(key)
+    fn get(&self, path: &Path) -> impl Future<Output = Result<(Vec<u8>, RevisionToken)>> + Send {
+        self.0.get(path)
     }
 
     #[inline]
-    fn head(&self, key: &str) -> impl Future<Output = Result<Head, ObjectError>> + Send {
-        self.0.head(key)
+    fn guarantees(&self) -> Guarantees {
+        sdk_guarantees(true)
     }
 
     #[inline]
-    fn list(&self, prefix: &str) -> impl Future<Output = Result<Vec<String>, ObjectError>> + Send {
-        self.0.list(prefix)
+    fn head(&self, path: &Path) -> impl Future<Output = Result<FileMetadata>> + Send {
+        self.0.head(path)
+    }
+
+    #[inline]
+    fn list(
+        &self,
+        folder: &Path,
+        depth: Depth,
+    ) -> impl Future<Output = Result<Vec<WalkEntry>>> + Send {
+        self.0.list(folder, depth)
     }
 
     #[inline]
     fn put(
         &self,
-        key: &str,
+        path: &Path,
         bytes: &[u8],
         condition: &Condition,
-    ) -> impl Future<Output = Result<String, ObjectError>> + Send {
-        self.0.put(key, bytes, condition)
+    ) -> impl Future<Output = Result<RevisionToken>> + Send {
+        self.0.put(path, bytes, condition)
     }
 }
 
@@ -1099,7 +1242,7 @@ impl Error for SdkFailure {
 /// The error for an SDK failure: 404 is `NotFound` unless its S3 code is `NoSuchBucket`, 412 is
 /// `PreconditionFailed`, anything else is `Other`.
 #[cfg(any(feature = "minio", feature = "s3"))]
-fn classify<E>(error: SdkError<E>) -> ObjectError
+fn classify<E>(error: SdkError<E>) -> StorageError
 where
     E: Error + ProvideErrorMetadata + Send + Sync + 'static,
 {
@@ -1113,13 +1256,16 @@ where
                 .and_then(ProvideErrorMetadata::code)
                 != Some("NoSuchBucket") =>
         {
-            ObjectError::not_found()
+            StorageError::from_kind(ErrorKind::NotFound)
         }
-        Some(412) => ObjectError::precondition_failed(),
-        _ => ObjectError::from(io::Error::other(SdkFailure {
-            message: describe(&error),
-            source: Box::new(error),
-        })),
+        Some(412) => StorageError::from_kind(ErrorKind::PreconditionFailed),
+        _ => StorageError::new(
+            ErrorKind::Other,
+            SdkFailure {
+                message: describe(&error),
+                source: Box::new(error),
+            },
+        ),
     }
 }
 
@@ -1146,26 +1292,23 @@ where
     }
 }
 
-/// Whether `condition` holds for the object now at the key, if any.
-fn holds(condition: &Condition, current: Option<&Vec<u8>>) -> bool {
-    match (condition.clone(), current) {
-        (Condition::None, _) | (Condition::Absent, None) => true,
-        (Condition::ETag(tag), Some(bytes)) => tag == tag_of(bytes),
-        (Condition::Absent, Some(_)) | (Condition::ETag(_), None) => false,
-    }
-}
-
 /// The error for an answer that should carry an `ETag` header and does not.
 #[cfg(any(feature = "minio", feature = "s3"))]
-fn missing_etag() -> ObjectError {
-    ObjectError::from(io::Error::other("the answer carries no ETag header"))
+fn missing_etag() -> StorageError {
+    StorageError::new(ErrorKind::Other, "the answer carries no ETag header")
 }
 
-/// The entity tag of `bytes`: sixteen hex digits in double quotes, the same for the same bytes.
-fn tag_of(bytes: &[u8]) -> String {
-    let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    format!("\"{:016x}\"", hasher.finish())
+/// What the SDK clients promise: only the one-step writes, and the delete when `S3` checks `If-Match`.
+#[cfg(any(feature = "minio", feature = "s3"))]
+const fn sdk_guarantees(conditional_delete: bool) -> Guarantees {
+    let writes = Guarantees::none()
+        .with(Guarantee::ConditionalWriteInOneStep)
+        .with(Guarantee::CreateOnlyWriteInOneStep);
+    if conditional_delete {
+        writes.with(Guarantee::ConditionalDeleteInOneStep)
+    } else {
+        writes
+    }
 }
 
 #[cfg(test)]

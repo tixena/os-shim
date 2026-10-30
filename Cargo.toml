@@ -27,6 +27,9 @@ zip = { version = "9.0.0", default-features = false, features = [
 ], optional = true }
 time = { version = "0.3.47", optional = true }
 
+# Async readers and writers of the bucket streams
+futures-io = "0.3.34"
+
 # Process operations (optional)
 libc = { version = "0.2.183", optional = true }
 

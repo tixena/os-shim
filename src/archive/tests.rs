@@ -394,7 +394,7 @@ fn entry_carries_the_source_modification_time() {
     let mut archive = Vec::new();
     to_zip_writer(&system, &file, &mut archive, ZipOptions::default()).unwrap();
 
-    let modified = system.metadata(&file).unwrap().modified;
+    let modified = system.metadata(&file).unwrap().modified.unwrap();
     let expected = OffsetDateTime::from(modified);
     let expected_year = u16::try_from(expected.year()).unwrap();
     assert_eq!(entry_year(&archive, "fresh.txt"), expected_year);

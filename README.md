@@ -53,31 +53,34 @@ assert_eq!(loaded.read_to_string(Path::new("/src/main.rs"))?, "fn main() {}");
 
 ## Buckets (`minio`, `s3`, `async`)
 
-Whole objects in one bucket, each put and delete under an optional condition:
+Files and folders in one bucket, each put and delete under an optional condition:
 
 | `Condition` | A put or delete goes ahead only if |
 |---|---|
 | `None` | always |
-| `Absent` | no object is at the key |
-| `ETag(tag)` | the object at the key still has this entity tag |
+| `Absent` | nothing is at the path |
+| `Matches(token)` | the file at the path still has this revision token |
 
-A failed condition is an error whose `kind()` is `ObjectErrorKind::PreconditionFailed`; a missing object is `ObjectErrorKind::NotFound`.
+A failed `Absent` is an error whose `kind()` is `ErrorKind::AlreadyExists`, a failed `Matches` is `ErrorKind::PreconditionFailed`, and a missing file is `ErrorKind::NotFound`.
 
 ```rust
-use os_shim::bucket::{BlockingBucket, Condition, MemoryBucket, ObjectErrorKind};
+use os_shim::bucket::{BlockingBucket, Condition, MemoryBucket};
+use os_shim::error::ErrorKind;
+use std::path::Path;
 
 let bucket = BlockingBucket::new(MemoryBucket::default())?;
+let task = Path::new("/task.md");
 
-let first = bucket.put("notes/task.md", b"# Task\n", &Condition::Absent)?;
-let refused = bucket.put("notes/task.md", b"# Other\n", &Condition::Absent);
-assert_eq!(refused.unwrap_err().kind(), ObjectErrorKind::PreconditionFailed);
+let first = bucket.put(task, b"# Task\n", &Condition::Absent)?;
+let refused = bucket.put(task, b"# Other\n", &Condition::Absent);
+assert_eq!(refused.unwrap_err().kind(), ErrorKind::AlreadyExists);
 
-let second = bucket.put("notes/task.md", b"# Done\n", &Condition::ETag(first.clone()))?;
-let stale = bucket.delete("notes/task.md", &Condition::ETag(first));
-assert_eq!(stale.unwrap_err().kind(), ObjectErrorKind::PreconditionFailed);
+let second = bucket.put(task, b"# Done\n", &Condition::Matches(first.clone()))?;
+let stale = bucket.delete(task, &Condition::Matches(first));
+assert_eq!(stale.unwrap_err().kind(), ErrorKind::PreconditionFailed);
 
-bucket.delete("notes/task.md", &Condition::ETag(second))?;
-assert_eq!(bucket.get("notes/task.md").unwrap_err().kind(), ObjectErrorKind::NotFound);
+bucket.delete(task, &Condition::Matches(second))?;
+assert_eq!(bucket.get(task).unwrap_err().kind(), ErrorKind::NotFound);
 ```
 
 The clients reach a server through AWS's SDK, `aws-sdk-s3`, and never retry a request:
@@ -98,16 +101,18 @@ let config = MinioConfig::new(
 let bucket = BlockingBucket::new(MinioBucket::new(config))?;
 ```
 
-`S3Config::new(region, bucket, access_key, secret_key)` builds an `S3Bucket` the same way. Both configurations print the secret key as `<redacted>` in `Debug`.
+`S3Config::new(region, bucket, access_key, secret_key)` builds an `S3Bucket` the same way. `with_prefix` on either configuration puts every key under a prefix. Both configurations print the secret key as `<redacted>` in `Debug`.
 
 `BlockingBucket` runs each call on a tokio runtime of its own, so synchronous code needs no runtime; calling it from inside a tokio runtime panics. With the `async` feature, the `Bucket` trait itself is public and asynchronous code awaits the clients directly; it also turns on `System::sleep_async`, which `RealSystem` awaits on tokio's timer, inside a tokio runtime with its timer on. A bucket example:
 
 ```rust
 use os_shim::bucket::{Bucket as _, Condition, MemoryBucket};
+use std::path::Path;
 
 let bucket = MemoryBucket::default();
-let tag = bucket.put("notes/a.md", b"a", &Condition::None).await?;
-assert_eq!(bucket.get("notes/a.md").await?.etag, tag);
+bucket.create_folder(Path::new("/notes")).await?;
+let token = bucket.put(Path::new("/notes/a.md"), b"a", &Condition::None).await?;
+assert_eq!(bucket.get(Path::new("/notes/a.md")).await?.1, token);
 ```
 
 `Bucket` is not `dyn`-compatible: a program that picks its backend at run time builds the concrete client in each branch.

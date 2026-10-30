@@ -106,6 +106,7 @@ use crate::System;
 use alloc::collections::BTreeSet;
 use std::io::{self, Cursor, Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
+use std::time::SystemTime;
 use time::{OffsetDateTime, PrimitiveDateTime};
 use zip::read::{ZipFile, read_zipfile_from_stream};
 use zip::write::{SimpleFileOptions, StreamWriter, ZipWriter};
@@ -305,7 +306,10 @@ fn entry_options<S>(system: &S, path: &Path) -> io::Result<SimpleFileOptions>
 where
     S: System + ?Sized,
 {
-    let modified = system.metadata(path)?.modified;
+    let modified = system
+        .metadata(path)?
+        .modified
+        .unwrap_or(SystemTime::UNIX_EPOCH);
     let offset = OffsetDateTime::from(modified);
     let civil = PrimitiveDateTime::new(offset.date(), offset.time());
     let stamp = DateTime::try_from(civil).unwrap_or_else(|_ignored| {

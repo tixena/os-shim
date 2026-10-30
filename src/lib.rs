@@ -33,7 +33,7 @@
 //! | Async sleep | [`RealSystem`](real::RealSystem) uses tokio's timer | `MemorySystem` moves its clock | `async` |
 //! | Is a process alive | `kill(pid, 0)` on Unix | `MemorySystem::with_pid` | `process` |
 //! | Zip a tree, unzip into a system | `to_zip_*` methods, the `archive` module | `MemorySystem::from_zip_reader`, `MemorySystem::from_zip_stream` | `zip` |
-//! | Whole-object storage with conditional writes | `MinioBucket` (`MinIO`, `RustFS`), `S3Bucket` (AWS) in the `bucket` module | `MemoryBucket`, plus `BlockingBucket` for sync code | `minio` or `s3` for the clients |
+//! | Files and folders in a bucket with conditional writes | `MinioBucket` (`MinIO`, `RustFS`), `S3Bucket` (AWS) in the `bucket` module | `MemoryBucket`, plus `BlockingBucket` for sync code | `minio` or `s3` for the clients |
 //!
 //! # What `System` offers
 //!
@@ -176,7 +176,7 @@
 //! }
 //!
 //! fn is_stale(system: &dyn System, path: &Path) -> io::Result<bool> {
-//!     let modified = system.metadata(path)?.modified;
+//!     let modified = system.metadata(path)?.modified.unwrap_or(std::time::UNIX_EPOCH);
 //!     Ok(system.now().duration_since(modified).is_ok_and(|age| age > LIMIT))
 //! }
 //!
@@ -391,14 +391,14 @@
 //! ```
 //! # #[cfg(all(feature = "async", feature = "minio"))]
 //! # {
-//! use os_shim::bucket::{
-//!     Bucket, Condition, MemoryBucket, MinioBucket, MinioConfig, ObjectError, ObjectErrorKind,
-//! };
+//! use os_shim::bucket::{Bucket, Condition, MemoryBucket, MinioBucket, MinioConfig};
+//! use os_shim::error::{ErrorKind, StorageError};
+//! use std::path::Path;
 //!
-//! async fn claim<B: Bucket>(bucket: &B, key: &str, owner: &str) -> Result<bool, ObjectError> {
-//!     match bucket.put(key, owner.as_bytes(), &Condition::Absent).await {
+//! async fn claim<B: Bucket>(bucket: &B, path: &Path, owner: &str) -> Result<bool, StorageError> {
+//!     match bucket.put(path, owner.as_bytes(), &Condition::Absent).await {
 //!         Ok(_) => Ok(true),
-//!         Err(error) if error.kind() == ObjectErrorKind::PreconditionFailed => Ok(false),
+//!         Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(false),
 //!         Err(error) => Err(error),
 //!     }
 //! }
@@ -418,9 +418,11 @@
 //! let bucket = MemoryBucket::default();
 //! let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
 //! runtime.block_on(async {
-//!     assert!(claim(&bucket, "jobs/42", "worker-a").await.unwrap());
-//!     assert!(!claim(&bucket, "jobs/42", "worker-b").await.unwrap());
-//!     assert_eq!(bucket.get("jobs/42").await.unwrap().bytes, b"worker-a");
+//!     bucket.create_folder(Path::new("/jobs")).await.unwrap();
+//!     let lock = Path::new("/jobs/42");
+//!     assert!(claim(&bucket, lock, "worker-a").await.unwrap());
+//!     assert!(!claim(&bucket, lock, "worker-b").await.unwrap());
+//!     assert_eq!(bucket.get(lock).await.unwrap().0, b"worker-a");
 //! });
 //! # }
 //! ```
@@ -501,6 +503,8 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use crate::bucket::RevisionToken;
+
 /// One entry found by [`System::walk_dir`].
 ///
 /// Exactly one of `is_dir` and `is_file` is `true` for an ordinary file or
@@ -547,29 +551,39 @@ pub struct FileMetadata {
     pub is_dir: bool,
     pub is_file: bool,
     pub len: u64,
-    pub modified: SystemTime,
+    /// `None` for a folder a store keeps no time for, such as a `MinIO` or S3 folder with no marker.
+    pub modified: Option<SystemTime>,
+    /// `None` where the token is not cheap to get: on disk, and for every folder.
+    pub revision: Option<RevisionToken>,
 }
 
 impl FileMetadata {
-    /// Metadata from its four parts, for a [`System`] written outside this crate.
+    /// Metadata from its five parts, for a [`System`] written outside this crate.
     ///
     /// ```
     /// use os_shim::FileMetadata;
     /// use std::time::{Duration, UNIX_EPOCH};
     ///
     /// let modified = UNIX_EPOCH + Duration::from_millis(1_320_173_277_227);
-    /// let metadata = FileMetadata::new(false, true, 1200, modified);
+    /// let metadata = FileMetadata::new(false, true, 1200, Some(modified), None);
     /// assert!(metadata.is_file && !metadata.is_dir);
-    /// assert_eq!((metadata.len, metadata.modified), (1200, modified));
+    /// assert_eq!((metadata.len, metadata.modified), (1200, Some(modified)));
     /// ```
     #[inline]
     #[must_use]
-    pub const fn new(is_dir: bool, is_file: bool, len: u64, modified: SystemTime) -> Self {
+    pub const fn new(
+        is_dir: bool,
+        is_file: bool,
+        len: u64,
+        modified: Option<SystemTime>,
+        revision: Option<RevisionToken>,
+    ) -> Self {
         Self {
             is_dir,
             is_file,
             len,
             modified,
+            revision,
         }
     }
 }
