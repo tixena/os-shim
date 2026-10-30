@@ -1,7 +1,7 @@
 //! Tests for `DiskBucket`: task 02's scenarios run over a temporary folder and over the memory
 //! bucket, and the behaviour only the disk has.
 
-use super::{DiskBucket, token_of};
+use super::{DiskBucket, delete_opened, token_of};
 use crate::WalkEntry;
 use crate::bucket::core_tests::{
     Observed, assert_observed, conditions_on_a_missing_file, dropped_writers, every_operation,
@@ -329,6 +329,77 @@ fn a_put_waits_for_the_lock_and_then_compares() {
             "PreconditionFailed",
             "[119, 111, 114, 107, 101, 114, 45, 98]",
         ],
+    );
+}
+
+#[test]
+fn a_delete_leaves_a_different_file_made_after_the_open() {
+    fn scenario(root: &Path) -> Observed {
+        let path = root.join("job.lock");
+        fs::write(&path, b"worker-a")?;
+        let opened = File::open(&path)?;
+        fs::remove_file(&path)?;
+        fs::write(&path, b"worker-b")?;
+        let outcome = delete_opened(opened, &path, &token_of(b"worker-a"));
+        Ok(vec![
+            format!("{:?}", outcome.map_err(|error| error.kind())),
+            format!("{:?}", fs::read(&path)?),
+        ])
+    }
+    let folder = TempDir::new();
+    assert_observed(
+        folder
+            .map_err(Into::into)
+            .and_then(|dir| scenario(dir.path())),
+        &[
+            "Err(PreconditionFailed)",
+            "[119, 111, 114, 107, 101, 114, 45, 98]",
+        ],
+    );
+}
+
+#[test]
+fn a_delete_leaves_a_file_made_after_the_open_with_the_same_bytes() {
+    fn scenario(root: &Path) -> Observed {
+        let path = root.join("job.lock");
+        fs::write(&path, b"worker-a")?;
+        let opened = File::open(&path)?;
+        fs::remove_file(&path)?;
+        fs::write(&path, b"worker-a")?;
+        let outcome = delete_opened(opened, &path, &token_of(b"worker-a"));
+        Ok(vec![
+            format!("{:?}", outcome.map_err(|error| error.kind())),
+            format!("{}", path.exists()),
+        ])
+    }
+    let folder = TempDir::new();
+    assert_observed(
+        folder
+            .map_err(Into::into)
+            .and_then(|dir| scenario(dir.path())),
+        &["Err(PreconditionFailed)", "true"],
+    );
+}
+
+#[test]
+fn a_delete_leaves_the_path_empty_when_the_file_was_removed_after_the_open() {
+    fn scenario(root: &Path) -> Observed {
+        let path = root.join("job.lock");
+        fs::write(&path, b"worker-a")?;
+        let opened = File::open(&path)?;
+        fs::remove_file(&path)?;
+        let outcome = delete_opened(opened, &path, &token_of(b"worker-a"));
+        Ok(vec![
+            format!("{:?}", outcome.map_err(|error| error.kind())),
+            format!("{}", path.exists()),
+        ])
+    }
+    let folder = TempDir::new();
+    assert_observed(
+        folder
+            .map_err(Into::into)
+            .and_then(|dir| scenario(dir.path())),
+        &["Err(PreconditionFailed)", "false"],
     );
 }
 
