@@ -13,7 +13,7 @@ include = ["/src/**/*.rs", "/README.md", "/LICENSE"]
 
 [dependencies]
 # Real filesystem implementation
-tempfile = "3.7.0"
+tempfile = "3.20.0"
 ignore = "0.4.17"
 same-file = "1.0.6"
 
