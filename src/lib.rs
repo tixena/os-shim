@@ -514,6 +514,28 @@ pub struct WalkEntry {
     pub path: PathBuf,
 }
 
+impl WalkEntry {
+    /// An entry from its three parts, for a [`System`] written outside this crate.
+    ///
+    /// ```
+    /// use os_shim::WalkEntry;
+    /// use std::path::{Path, PathBuf};
+    ///
+    /// let entry = WalkEntry::new(PathBuf::from("/org/templates/t1/v1.docx"), false, true);
+    /// assert!(entry.is_file && !entry.is_dir);
+    /// assert_eq!(entry.path, Path::new("/org/templates/t1/v1.docx"));
+    /// ```
+    #[inline]
+    #[must_use]
+    pub const fn new(path: PathBuf, is_dir: bool, is_file: bool) -> Self {
+        Self {
+            is_dir,
+            is_file,
+            path,
+        }
+    }
+}
+
 /// What [`System::metadata`] returns about a path.
 ///
 /// This is os-shim's own type, not `std::fs::Metadata`, which cannot be built
@@ -526,6 +548,30 @@ pub struct FileMetadata {
     pub is_file: bool,
     pub len: u64,
     pub modified: SystemTime,
+}
+
+impl FileMetadata {
+    /// Metadata from its four parts, for a [`System`] written outside this crate.
+    ///
+    /// ```
+    /// use os_shim::FileMetadata;
+    /// use std::time::{Duration, UNIX_EPOCH};
+    ///
+    /// let modified = UNIX_EPOCH + Duration::from_millis(1_320_173_277_227);
+    /// let metadata = FileMetadata::new(false, true, 1200, modified);
+    /// assert!(metadata.is_file && !metadata.is_dir);
+    /// assert_eq!((metadata.len, metadata.modified), (1200, modified));
+    /// ```
+    #[inline]
+    #[must_use]
+    pub const fn new(is_dir: bool, is_file: bool, len: u64, modified: SystemTime) -> Self {
+        Self {
+            is_dir,
+            is_file,
+            len,
+            modified,
+        }
+    }
 }
 
 /// How [`System::write`] treats a file already at the path.
