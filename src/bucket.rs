@@ -1,8 +1,8 @@
 //! Whole objects in one bucket of an S3-compatible object store, written and
 //! deleted under conditions, with an in-memory twin for tests.
 //!
-//! Available with the `minio` or the `s3` feature. The `Bucket` trait can be
-//! named and implemented only with the `async` feature as well.
+//! Available in every build; `MinioBucket` needs the `minio` feature,
+//! `S3Bucket` the `s3` feature, and `BlockingBucket` either of them.
 //!
 //! # What it is
 //!
@@ -54,34 +54,36 @@
 //! Claim a key, then update it only while nobody else has changed it:
 //!
 //! ```
-//! use os_shim::bucket::{BlockingBucket, Condition, MemoryBucket, ObjectErrorKind};
+//! use os_shim::bucket::{Bucket as _, Condition, MemoryBucket, ObjectErrorKind};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let shared = MemoryBucket::default();
-//! let ours = BlockingBucket::new(shared.clone())?;
-//! let theirs = BlockingBucket::new(shared)?;
+//! let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+//! runtime.block_on(async {
+//!     let ours = MemoryBucket::default();
+//!     let theirs = ours.clone();
 //!
-//! // Create if absent: the first caller wins, the second is refused.
-//! let first_tag = ours.put("jobs/42", b"claimed by ours", &Condition::Absent)?;
-//! let refused = theirs.put("jobs/42", b"claimed by theirs", &Condition::Absent);
-//! assert_eq!(
-//!     refused.unwrap_err().kind(),
-//!     ObjectErrorKind::PreconditionFailed
-//! );
+//!     // Create if absent: the first caller wins, the second is refused.
+//!     let first_tag = ours.put("jobs/42", b"claimed by ours", &Condition::Absent).await?;
+//!     let refused = theirs.put("jobs/42", b"claimed by theirs", &Condition::Absent).await;
+//!     assert_eq!(
+//!         refused.unwrap_err().kind(),
+//!         ObjectErrorKind::PreconditionFailed
+//!     );
 //!
-//! // Update if unchanged: the tag from the get says what we saw.
-//! let seen = ours.get("jobs/42")?;
-//! assert_eq!(seen.etag, first_tag);
-//! ours.put("jobs/42", b"done", &Condition::ETag(seen.etag.clone()))?;
+//!     // Update if unchanged: the tag from the get says what we saw.
+//!     let seen = ours.get("jobs/42").await?;
+//!     assert_eq!(seen.etag, first_tag);
+//!     ours.put("jobs/42", b"done", &Condition::ETag(seen.etag.clone())).await?;
 //!
-//! // The same tag is now stale, so a second update with it is refused.
-//! let stale = theirs.put("jobs/42", b"overwrite", &Condition::ETag(seen.etag));
-//! assert_eq!(
-//!     stale.unwrap_err().kind(),
-//!     ObjectErrorKind::PreconditionFailed
-//! );
-//! assert_eq!(theirs.get("jobs/42")?.bytes, b"done");
-//! # Ok(())
+//!     // The same tag is now stale, so a second update with it is refused.
+//!     let stale = theirs.put("jobs/42", b"overwrite", &Condition::ETag(seen.etag)).await;
+//!     assert_eq!(
+//!         stale.unwrap_err().kind(),
+//!         ObjectErrorKind::PreconditionFailed
+//!     );
+//!     assert_eq!(theirs.get("jobs/42").await?.bytes, b"done");
+//!     Ok::<_, Box<dyn std::error::Error>>(())
+//! })
 //! # }
 //! ```
 //!
@@ -120,14 +122,12 @@ use core::future::ready;
 use core::hash::{Hash as _, Hasher as _};
 #[cfg(any(feature = "minio", feature = "s3"))]
 use core::iter;
-#[cfg(not(feature = "async"))]
-use interface::Bucket;
 use std::hash::DefaultHasher;
 use std::io;
 use std::sync::{PoisonError, RwLock};
+#[cfg(any(feature = "minio", feature = "s3"))]
 use tokio::runtime::{Builder, Runtime};
 
-#[cfg(feature = "async")]
 declare_bucket!();
 
 /// What a store says about one object without sending its bytes.
@@ -278,28 +278,32 @@ impl Error for ObjectError {
 /// Tags from a real store are not comparable. `list` returns keys sorted.
 ///
 /// ```
-/// use os_shim::bucket::{BlockingBucket, Condition, MemoryBucket, ObjectErrorKind};
+/// use os_shim::bucket::{Bucket as _, Condition, MemoryBucket, ObjectErrorKind};
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// let bucket = BlockingBucket::new(MemoryBucket::default())?;
+/// let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+/// runtime.block_on(async {
+///     let bucket = MemoryBucket::default();
 ///
-/// let tag = bucket.put("config.json", b"{\"v\":1}", &Condition::Absent)?;
-/// assert!(bucket
-///     .put("config.json", b"{\"v\":2}", &Condition::Absent)
-///     .is_err());
+///     let tag = bucket.put("config.json", b"{\"v\":1}", &Condition::Absent).await?;
+///     assert!(bucket
+///         .put("config.json", b"{\"v\":2}", &Condition::Absent)
+///         .await
+///         .is_err());
 ///
-/// let object = bucket.get("config.json")?;
-/// assert_eq!(object.etag, tag);
+///     let object = bucket.get("config.json").await?;
+///     assert_eq!(object.etag, tag);
 ///
-/// bucket.put("config.json", b"{\"v\":2}", &Condition::ETag(tag.clone()))?;
-/// let stale = bucket.delete("config.json", &Condition::ETag(tag));
-/// assert_eq!(
-///     stale.unwrap_err().kind(),
-///     ObjectErrorKind::PreconditionFailed
-/// );
+///     bucket.put("config.json", b"{\"v\":2}", &Condition::ETag(tag.clone())).await?;
+///     let stale = bucket.delete("config.json", &Condition::ETag(tag)).await;
+///     assert_eq!(
+///         stale.unwrap_err().kind(),
+///         ObjectErrorKind::PreconditionFailed
+///     );
 ///
-/// assert_eq!(bucket.list("config")?, ["config.json"]);
-/// # Ok(())
+///     assert_eq!(bucket.list("config").await?, ["config.json"]);
+///     Ok::<_, Box<dyn std::error::Error>>(())
+/// })
 /// # }
 /// ```
 #[derive(Debug, Clone, Default)]
@@ -419,6 +423,18 @@ impl Bucket for MemoryBucket {
 /// Wrap [`MemoryBucket`], `MinioBucket` or `S3Bucket`. The methods take the
 /// same arguments and return the same results as the `Bucket` trait, without
 /// the futures. It cannot be cloned and gives no access to the bucket inside.
+///
+/// ```
+/// use os_shim::bucket::{BlockingBucket, Condition, MemoryBucket};
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let bucket = BlockingBucket::new(MemoryBucket::default())?;
+/// bucket.put("config.json", b"{}", &Condition::Absent)?;
+/// assert_eq!(bucket.get("config.json")?.bytes, b"{}");
+/// # Ok(())
+/// # }
+/// ```
+#[cfg(any(feature = "minio", feature = "s3"))]
 #[derive(Debug)]
 pub struct BlockingBucket<B> {
     /// The bucket each call reaches.
@@ -427,6 +443,7 @@ pub struct BlockingBucket<B> {
     runtime: Runtime,
 }
 
+#[cfg(any(feature = "minio", feature = "s3"))]
 impl<B: Bucket> BlockingBucket<B> {
     /// Delete the object at `key` when `condition` holds.
     ///
@@ -1150,6 +1167,9 @@ fn tag_of(bytes: &[u8]) -> String {
     bytes.hash(&mut hasher);
     format!("\"{:016x}\"", hasher.finish())
 }
+
+#[cfg(test)]
+mod core_tests;
 
 #[cfg(test)]
 #[expect(

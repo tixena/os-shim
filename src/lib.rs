@@ -33,7 +33,7 @@
 //! | Async sleep | [`RealSystem`](real::RealSystem) uses tokio's timer | `MemorySystem` moves its clock | `async` |
 //! | Is a process alive | `kill(pid, 0)` on Unix | `MemorySystem::with_pid` | `process` |
 //! | Zip a tree, unzip into a system | `to_zip_*` methods, the `archive` module | `MemorySystem::from_zip_reader`, `MemorySystem::from_zip_stream` | `zip` |
-//! | Whole-object storage with conditional writes | `MinioBucket` (`MinIO`, `RustFS`), `S3Bucket` (AWS) in the `bucket` module | `MemoryBucket`, plus `BlockingBucket` for sync code | `minio` or `s3`; `async` to name the `Bucket` trait |
+//! | Whole-object storage with conditional writes | `MinioBucket` (`MinIO`, `RustFS`), `S3Bucket` (AWS) in the `bucket` module | `MemoryBucket`, plus `BlockingBucket` for sync code | `minio` or `s3` for the clients |
 //!
 //! # What `System` offers
 //!
@@ -451,7 +451,7 @@
 //!
 //! No feature is on by default. docs.rs builds with all of them.
 //!
-//! - `async`: adds `System::sleep_async` and makes the `Bucket` trait public.
+//! - `async`: adds `System::sleep_async`.
 //!   Needs tokio; `RealSystem` waits on tokio's timer.
 //! - `process`: adds `System::is_pid_alive` and `MemorySystem::with_pid`. Uses
 //!   `libc`, so it is for Unix.
@@ -469,7 +469,7 @@
 //! - [`real`]: [`RealSystem`](real::RealSystem), the `System` for production.
 //! - `archive` (feature `zip`): zip building and loading, including
 //!   `ZipOptions` and `ZipStreamWriter`.
-//! - `bucket` (feature `minio` or `s3`): the `Bucket` trait with its
+//! - `bucket`: the `Bucket` trait with its
 //!   conditional `put` and `delete`, the real clients and `MemoryBucket`.
 
 #![expect(
@@ -481,8 +481,8 @@ extern crate alloc;
 
 #[cfg(feature = "zip")]
 pub mod archive;
-#[cfg(any(feature = "minio", feature = "s3"))]
 pub mod bucket;
+pub mod error;
 pub mod mock;
 pub mod real;
 

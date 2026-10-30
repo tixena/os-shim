@@ -1,5 +1,7 @@
 //! Tests for the in-memory bucket, the blocking wrapper, the bucket error and the `MinIO` and AWS S3 clients.
 
+#![cfg(any(feature = "minio", feature = "s3"))]
+
 use super::{
     BlockingBucket, Bucket, Condition, Head, MemoryBucket, Object, ObjectError, ObjectErrorKind,
 };

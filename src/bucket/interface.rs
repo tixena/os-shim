@@ -1,8 +1,4 @@
-//! The `Bucket` trait's single declaration: invoked at `os_shim::bucket` with the
-//! `async` feature, and in this private module without it, where it cannot be named.
-
-#[cfg(not(feature = "async"))]
-use super::{Condition, Head, Object, ObjectError};
+//! The `Bucket` trait's single declaration. A macro places it at `os_shim::bucket` without a `pub use`.
 
 /// Declares the `Bucket` trait where it is invoked.
 macro_rules! declare_bucket {
@@ -13,8 +9,7 @@ macro_rules! declare_bucket {
         /// ranges, no streaming. Write code against a generic `B: Bucket`, use
         /// `MinioBucket` or `S3Bucket` in production and `MemoryBucket` in tests.
         /// The methods return `impl Future + Send`, so the trait cannot be a
-        /// trait object. It can be named and implemented only with the `async`
-        /// feature. Code that is not async wraps a bucket in `BlockingBucket`.
+        /// trait object. Code that is not async wraps a bucket in `BlockingBucket`.
         pub trait Bucket: Send + Sync {
             /// Delete the object at `key` when `condition` holds.
             ///
@@ -98,6 +93,3 @@ macro_rules! declare_bucket {
         }
     };
 }
-
-#[cfg(not(feature = "async"))]
-declare_bucket!();
