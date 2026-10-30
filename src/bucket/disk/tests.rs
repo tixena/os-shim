@@ -15,7 +15,7 @@ use core::pin::{Pin, pin};
 use core::task::{Context, Poll, Waker};
 use futures_io::{AsyncRead, AsyncWrite};
 use std::fs::{self, File};
-use std::io::Write as _;
+use std::io::{self, Write as _};
 use std::path::Path;
 use std::thread;
 use tempfile::TempDir;
@@ -245,6 +245,78 @@ async fn a_folder_is_not_deleted_under_any_condition() {
     assert_observed(
         on_disk(scenario).await,
         &["IsADirectory", "IsADirectory", "IsADirectory", "true"],
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_folder_is_not_written_under_any_condition() {
+    async fn scenario(bucket: &DiskBucket, root: &Path) -> Observed {
+        let folder = root.join("folder");
+        bucket.create_folder(&folder).await?;
+        let token = RevisionToken::new("1");
+        Ok(vec![
+            shape(&bucket.put(&folder, b"x", &Condition::None).await),
+            shape(&bucket.put(&folder, b"x", &Condition::Absent).await),
+            shape(
+                &bucket
+                    .put(&folder, b"x", &Condition::Matches(token.clone()))
+                    .await,
+            ),
+            shape(&bucket.write_stream(&folder, Condition::None).await),
+            shape(&bucket.write_stream(&folder, Condition::Absent).await),
+            shape(
+                &bucket
+                    .write_stream(&folder, Condition::Matches(token))
+                    .await,
+            ),
+            format!("{}", folder.is_dir()),
+        ])
+    }
+    assert_observed(
+        on_disk(scenario).await,
+        &[
+            "IsADirectory",
+            "IsADirectory",
+            "IsADirectory",
+            "IsADirectory",
+            "IsADirectory",
+            "IsADirectory",
+            "true",
+        ],
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_folder_renamed_onto_a_non_empty_folder_is_already_exists() {
+    async fn scenario(bucket: &DiskBucket, root: &Path) -> Observed {
+        for name in ["d2", "e2"] {
+            bucket.create_folder(&root.join(name)).await?;
+        }
+        bucket
+            .put(&root.join("d2").join("a.md"), b"a", &Condition::None)
+            .await?;
+        bucket
+            .put(&root.join("e2").join("x.md"), b"x", &Condition::None)
+            .await?;
+        let refused = bucket
+            .rename(&root.join("d2"), &root.join("e2"))
+            .await
+            .err()
+            .ok_or("the rename was not refused")?;
+        let source = refused
+            .source()
+            .and_then(|inner| inner.downcast_ref::<io::Error>())
+            .ok_or("the refusal has no io error as its source")?;
+        Ok(vec![
+            format!("{:?}", refused.kind()),
+            format!("{:?}", source.kind()),
+            format!("{}", root.join("d2").join("a.md").is_file()),
+            format!("{}", root.join("e2").join("x.md").is_file()),
+        ])
+    }
+    assert_observed(
+        on_disk(scenario).await,
+        &["AlreadyExists", "DirectoryNotEmpty", "true", "true"],
     );
 }
 
