@@ -614,6 +614,20 @@ struct SdkBucket {
 
 #[cfg(any(feature = "minio", feature = "s3"))]
 impl SdkBucket {
+    /// Why no object is at `path`: a file above it, a folder at it, or nothing.
+    async fn absence(&self, path: &Path) -> Result<StorageError> {
+        let resolved = lexical(path)?;
+        Ok(StorageError::from_kind(
+            if self.file_above(&resolved).await? {
+                ErrorKind::NotADirectory
+            } else if self.has_keys_below(&resolved).await? {
+                ErrorKind::IsADirectory
+            } else {
+                ErrorKind::NotFound
+            },
+        ))
+    }
+
     /// Whether the bucket exists: `HEAD` on it answers 200, or 404 when it is missing.
     async fn bucket_exists(&self) -> Result<bool> {
         match self.client.head_bucket().bucket(&self.bucket).send().await {
@@ -723,10 +737,27 @@ impl SdkBucket {
         }
     }
 
-    /// Delete the file at `path` when `condition` holds.
+    /// Delete the file at `path` when `condition` holds; a folder, or a path below a file, is refused.
     async fn delete(&self, path: &Path, condition: &Condition) -> Result<()> {
         let key = key_of(&self.prefix, path)?;
-        self.delete_key(&key, condition).await
+        match *condition {
+            Condition::None | Condition::Absent => {
+                if self.current_tag(&key).await?.is_none() {
+                    return self.refuse_folder(path).await;
+                }
+                self.delete_key(&key, condition).await
+            }
+            Condition::Matches(_) => match self.delete_key(&key, condition).await {
+                Err(error)
+                    if error.kind() == ErrorKind::PreconditionFailed
+                        && self.current_tag(&key).await?.is_none() =>
+                {
+                    self.refuse_folder(path).await?;
+                    Err(error)
+                }
+                other => other,
+            },
+        }
     }
 
     /// Delete the object at `key` when `condition` holds.
@@ -761,6 +792,20 @@ impl SdkBucket {
         }
     }
 
+    /// Whether an object sits at the key of a folder above `path`.
+    async fn file_above(&self, path: &Path) -> Result<bool> {
+        for level in path
+            .ancestors()
+            .skip(1)
+            .filter(|level| level.parent().is_some())
+        {
+            if self.is_object(level).await? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// The first object whose key starts with the folder's prefix, which is its marker when it has one.
     async fn first_below(&self, folder: &Path) -> Result<Option<Object>> {
         let page = self
@@ -788,14 +833,21 @@ impl SdkBucket {
     /// The bytes and token of the file at `path`.
     async fn get(&self, path: &Path) -> Result<(Vec<u8>, RevisionToken)> {
         let key = key_of(&self.prefix, path)?;
-        let output = self
+        let output = match self
             .client
             .get_object()
             .bucket(&self.bucket)
             .key(key)
             .send()
             .await
-            .map_err(classify)?;
+            .map_err(classify)
+        {
+            Ok(output) => output,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return Err(self.absence(path).await?);
+            }
+            Err(error) => return Err(error),
+        };
         let etag = output.e_tag().map(str::to_owned).ok_or_else(missing_etag)?;
         let collected = output
             .body
@@ -851,7 +903,13 @@ impl SdkBucket {
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 self.object_is_missing().await?;
                 let Some(below) = self.first_below(&resolved).await? else {
-                    return Err(StorageError::from_kind(ErrorKind::NotFound));
+                    return Err(StorageError::from_kind(
+                        if self.file_above(&resolved).await? {
+                            ErrorKind::NotADirectory
+                        } else {
+                            ErrorKind::NotFound
+                        },
+                    ));
                 };
                 let modified = below
                     .key()
@@ -1067,20 +1125,29 @@ impl SdkBucket {
             .ok_or_else(missing_etag)
     }
 
+    /// `Ok` unless a folder is at `path` or a file above it, which a delete refuses.
+    async fn refuse_folder(&self, path: &Path) -> Result<()> {
+        let absence = self.absence(path).await?;
+        if absence.kind() == ErrorKind::NotFound {
+            Ok(())
+        } else {
+            Err(absence)
+        }
+    }
+
     /// Delete every key below the folder at `path`, markers included.
     async fn remove_folder(&self, path: &Path) -> Result<()> {
         let base = lexical(path)?;
         let keys = self.keys_under(&self.folder_prefix(&base)?).await?;
         if keys.is_empty() {
-            return if base.parent().is_none() {
-                Ok(())
+            if base.parent().is_none() {
+                return Ok(());
+            }
+            return Err(if self.is_object(&base).await? {
+                StorageError::from_kind(ErrorKind::NotADirectory)
             } else {
-                Err(StorageError::from_kind(if self.is_object(&base).await? {
-                    ErrorKind::NotADirectory
-                } else {
-                    ErrorKind::NotFound
-                }))
-            };
+                self.absence(&base).await?
+            });
         }
         for key in &keys {
             self.client
@@ -1117,12 +1184,29 @@ impl SdkBucket {
 
     /// Create the folder at `target`, then move every key below `source` under it, markers included.
     async fn rename_folder(&self, source: &Path, target: &Path) -> Result<()> {
+        let from_prefix = self.folder_prefix(source)?;
+        let to_prefix = self.folder_prefix(target)?;
+        if self.file_above(target).await? || self.is_object(target).await? {
+            return Err(StorageError::from_kind(ErrorKind::NotADirectory));
+        }
+        if let Some(parent) = target.parent()
+            && parent.parent().is_some()
+            && !self.has_keys_below(parent).await?
+        {
+            return Err(StorageError::from_kind(ErrorKind::NotFound));
+        }
         if target.starts_with(source) {
             return Err(StorageError::from_kind(ErrorKind::InvalidInput));
         }
+        if self
+            .keys_under(&to_prefix)
+            .await?
+            .iter()
+            .any(|key| *key != to_prefix)
+        {
+            return Err(StorageError::from_kind(ErrorKind::AlreadyExists));
+        }
         self.create_folder(target).await?;
-        let from_prefix = self.folder_prefix(source)?;
-        let to_prefix = self.folder_prefix(target)?;
         for key in self.keys_under(&from_prefix).await? {
             let Some(relative) = key.strip_prefix(from_prefix.as_str()) else {
                 continue;
@@ -1307,7 +1391,14 @@ impl Bucket for MinioBucket {
 
     #[inline]
     fn guarantees(&self) -> Guarantees {
-        sdk_guarantees(false)
+        const PROMISED: Guarantees = Guarantees::none()
+            // If-Match on PutObject: https://docs.min.io/community/minio-object-store/reference/s3-api-compatibility.html
+            .with(Guarantee::ConditionalWriteInOneStep)
+            // If-None-Match on PutObject: https://docs.min.io/community/minio-object-store/reference/s3-api-compatibility.html
+            .with(Guarantee::CreateOnlyWriteInOneStep)
+            // A folder is an object whose key ends with `/` and holds no data: https://docs.min.io/enterprise/aistor-object-store/administration/objects-and-versioning/versioning/ignore-folders
+            .with(Guarantee::EmptyFoldersExist);
+        PROMISED
     }
 
     #[inline]
@@ -1573,7 +1664,16 @@ impl Bucket for S3Bucket {
 
     #[inline]
     fn guarantees(&self) -> Guarantees {
-        sdk_guarantees(true)
+        const PROMISED: Guarantees = Guarantees::none()
+            // If-Match on DeleteObject: https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObject.html
+            .with(Guarantee::ConditionalDeleteInOneStep)
+            // If-Match on PutObject: https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html
+            .with(Guarantee::ConditionalWriteInOneStep)
+            // If-None-Match on PutObject: https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html
+            .with(Guarantee::CreateOnlyWriteInOneStep)
+            // The console makes a folder as a 0-byte object whose key ends with `/`: https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-folders.html
+            .with(Guarantee::EmptyFoldersExist);
+        PROMISED
     }
 
     #[inline]
@@ -1743,21 +1843,6 @@ where
 #[cfg(any(feature = "minio", feature = "s3"))]
 fn missing_etag() -> StorageError {
     StorageError::new(ErrorKind::Other, "the answer carries no ETag header")
-}
-
-/// What the SDK clients promise: the one-step writes, folders that exist when empty, and the delete
-/// when `S3` checks `If-Match`.
-#[cfg(any(feature = "minio", feature = "s3"))]
-const fn sdk_guarantees(conditional_delete: bool) -> Guarantees {
-    let writes = Guarantees::none()
-        .with(Guarantee::ConditionalWriteInOneStep)
-        .with(Guarantee::CreateOnlyWriteInOneStep)
-        .with(Guarantee::EmptyFoldersExist);
-    if conditional_delete {
-        writes.with(Guarantee::ConditionalDeleteInOneStep)
-    } else {
-        writes
-    }
 }
 
 #[cfg(test)]

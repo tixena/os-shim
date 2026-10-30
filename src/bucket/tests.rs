@@ -440,10 +440,10 @@ fn minio(endpoint: String) -> BlockingBucket<MinioBucket> {
 #[cfg(feature = "minio")]
 #[test]
 fn minio_get_answered_404_is_not_found() {
-    let (endpoint, seen) = canned(vec![answer("404 Not Found", "", "")]);
+    let (endpoint, seen) = canned(vec![answer("404 Not Found", "", ""), empty_page()]);
     let error = minio(endpoint).get(Path::new("/task.md")).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::NotFound);
-    assert_eq!(requests(&seen), ["GET if-match=-"]);
+    assert_eq!(requests(&seen), ["GET if-match=-", "GET if-match=-"]);
 }
 
 #[cfg(feature = "minio")]
@@ -503,7 +503,10 @@ fn minio_get_gives_the_bytes_and_the_tag() {
 #[cfg(feature = "minio")]
 #[test]
 fn minio_delete_with_a_stale_tag_fails_without_deleting() {
-    let (endpoint, seen) = canned(vec![answer("200 OK", "ETag: \"b\"\r\n", "")]);
+    let (endpoint, seen) = canned(vec![
+        answer("200 OK", "ETag: \"b\"\r\n", ""),
+        answer("200 OK", "ETag: \"b\"\r\n", ""),
+    ]);
     let error = minio(endpoint)
         .delete(
             Path::new("/task.md"),
@@ -511,7 +514,7 @@ fn minio_delete_with_a_stale_tag_fails_without_deleting() {
         )
         .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::PreconditionFailed);
-    assert_eq!(requests(&seen), ["HEAD if-match=-"]);
+    assert_eq!(requests(&seen), ["HEAD if-match=-", "HEAD if-match=-"]);
 }
 
 #[cfg(feature = "minio")]
@@ -539,6 +542,9 @@ fn minio_delete_with_a_tag_of_a_missing_object_fails_without_deleting() {
     let (endpoint, seen) = canned(vec![
         answer("404 Not Found", "", ""),
         answer("200 OK", "", ""),
+        answer("404 Not Found", "", ""),
+        answer("200 OK", "", ""),
+        empty_page(),
     ]);
     let error = minio(endpoint)
         .delete(
@@ -547,17 +553,58 @@ fn minio_delete_with_a_tag_of_a_missing_object_fails_without_deleting() {
         )
         .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::PreconditionFailed);
-    assert_eq!(requests(&seen), ["HEAD if-match=-", "HEAD if-match=-"]);
+    assert_eq!(
+        requests(&seen),
+        [
+            "HEAD if-match=-",
+            "HEAD if-match=-",
+            "HEAD if-match=-",
+            "HEAD if-match=-",
+            "GET if-match=-"
+        ]
+    );
 }
 
 #[cfg(feature = "minio")]
 #[test]
-fn minio_delete_with_no_condition_sends_one_delete() {
-    let (endpoint, seen) = canned(vec![answer("204 No Content", "", "")]);
+fn minio_get_of_a_folder_is_a_directory() {
+    let (endpoint, _seen) = canned(vec![
+        answer("404 Not Found", "", ""),
+        listing(&["d/f.md"], &[]),
+    ]);
+    let error = minio(endpoint).get(Path::new("/d")).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::IsADirectory);
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_delete_of_a_folder_is_a_directory_and_sends_no_delete() {
+    let (endpoint, seen) = canned(vec![
+        answer("404 Not Found", "", ""),
+        answer("200 OK", "", ""),
+        listing(&["d/f.md"], &[]),
+    ]);
+    let error = minio(endpoint)
+        .delete(Path::new("/d"), &Condition::None)
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::IsADirectory);
+    assert_eq!(
+        requests(&seen),
+        ["HEAD if-match=-", "HEAD if-match=-", "GET if-match=-"]
+    );
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_delete_with_no_condition_checks_the_object_then_sends_one_delete() {
+    let (endpoint, seen) = canned(vec![
+        answer("200 OK", "ETag: \"a\"\r\n", ""),
+        answer("204 No Content", "", ""),
+    ]);
     minio(endpoint)
         .delete(Path::new("/task.md"), &Condition::None)
         .unwrap();
-    assert_eq!(requests(&seen), ["DELETE if-match=-"]);
+    assert_eq!(requests(&seen), ["HEAD if-match=-", "DELETE if-match=-"]);
 }
 
 #[cfg(feature = "minio")]
@@ -682,10 +729,10 @@ fn minio_get_answered_404_no_such_bucket_is_other_naming_the_answer() {
 #[cfg(feature = "minio")]
 #[test]
 fn minio_get_answered_404_no_such_key_is_not_found() {
-    let (endpoint, _seen) = canned(vec![not_found_answer(
-        "NoSuchKey",
-        "The specified key does not exist.",
-    )]);
+    let (endpoint, _seen) = canned(vec![
+        not_found_answer("NoSuchKey", "The specified key does not exist."),
+        empty_page(),
+    ]);
     let error = minio(endpoint).get(Path::new("/task.md")).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::NotFound);
 }
@@ -696,11 +743,15 @@ fn minio_delete_absent_of_a_missing_key_in_an_existing_bucket_succeeds() {
     let (endpoint, seen) = canned(vec![
         answer("404 Not Found", "", ""),
         answer("200 OK", "", ""),
+        empty_page(),
     ]);
     minio(endpoint)
         .delete(Path::new("/task.md"), &Condition::Absent)
         .unwrap();
-    assert_eq!(requests(&seen), ["HEAD if-match=-", "HEAD if-match=-"]);
+    assert_eq!(
+        requests(&seen),
+        ["HEAD if-match=-", "HEAD if-match=-", "GET if-match=-"]
+    );
 }
 
 #[cfg(feature = "minio")]
@@ -919,7 +970,10 @@ fn s3_delete_with_the_current_tag_sends_one_delete_with_if_match() {
 #[cfg(feature = "s3")]
 #[test]
 fn s3_delete_with_a_stale_tag_answered_412_is_precondition_failed() {
-    let (endpoint, seen) = canned(vec![answer("412 Precondition Failed", "", "")]);
+    let (endpoint, seen) = canned(vec![
+        answer("412 Precondition Failed", "", ""),
+        answer("200 OK", "ETag: \"b\"\r\n", ""),
+    ]);
     let error = s3(&endpoint)
         .delete(
             Path::new("/task.md"),
@@ -927,13 +981,21 @@ fn s3_delete_with_a_stale_tag_answered_412_is_precondition_failed() {
         )
         .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::PreconditionFailed);
-    assert_eq!(requests(&seen), ["DELETE if-match=\"a\""]);
+    assert_eq!(
+        requests(&seen),
+        ["DELETE if-match=\"a\"", "HEAD if-match=-"]
+    );
 }
 
 #[cfg(feature = "s3")]
 #[test]
 fn s3_delete_with_a_tag_of_a_missing_object_is_precondition_failed() {
-    let (endpoint, seen) = canned(vec![answer("404 Not Found", "", "")]);
+    let (endpoint, seen) = canned(vec![
+        answer("404 Not Found", "", ""),
+        answer("404 Not Found", "", ""),
+        answer("200 OK", "", ""),
+        empty_page(),
+    ]);
     let error = s3(&endpoint)
         .delete(
             Path::new("/task.md"),
@@ -941,7 +1003,15 @@ fn s3_delete_with_a_tag_of_a_missing_object_is_precondition_failed() {
         )
         .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::PreconditionFailed);
-    assert_eq!(requests(&seen), ["DELETE if-match=\"a\""]);
+    assert_eq!(
+        requests(&seen),
+        [
+            "DELETE if-match=\"a\"",
+            "HEAD if-match=-",
+            "HEAD if-match=-",
+            "GET if-match=-"
+        ]
+    );
 }
 
 #[cfg(feature = "s3")]
@@ -960,18 +1030,21 @@ fn s3_delete_with_a_tag_answered_404_no_such_bucket_is_other() {
 
 #[cfg(feature = "s3")]
 #[test]
-fn s3_delete_with_no_condition_sends_one_delete() {
-    let (endpoint, seen) = canned(vec![answer("204 No Content", "", "")]);
+fn s3_delete_with_no_condition_checks_the_object_then_sends_one_delete() {
+    let (endpoint, seen) = canned(vec![
+        answer("200 OK", "ETag: \"a\"\r\n", ""),
+        answer("204 No Content", "", ""),
+    ]);
     s3(&endpoint)
         .delete(Path::new("/task.md"), &Condition::None)
         .unwrap();
-    assert_eq!(requests(&seen), ["DELETE if-match=-"]);
+    assert_eq!(requests(&seen), ["HEAD if-match=-", "DELETE if-match=-"]);
 }
 
 #[cfg(feature = "s3")]
 #[test]
 fn s3_get_answered_404_is_not_found() {
-    let (endpoint, _seen) = canned(vec![answer("404 Not Found", "", "")]);
+    let (endpoint, _seen) = canned(vec![answer("404 Not Found", "", ""), empty_page()]);
     let error = s3(&endpoint).get(Path::new("/task.md")).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::NotFound);
 }
@@ -1151,12 +1224,15 @@ fn minio_put_under_a_prefix_puts_every_key_under_it() {
 #[cfg(feature = "minio")]
 #[test]
 fn minio_delete_absent_over_an_object_is_already_exists() {
-    let (endpoint, seen) = canned(vec![answer("200 OK", "ETag: \"a\"\r\n", "")]);
+    let (endpoint, seen) = canned(vec![
+        answer("200 OK", "ETag: \"a\"\r\n", ""),
+        answer("200 OK", "ETag: \"a\"\r\n", ""),
+    ]);
     let error = minio(endpoint)
         .delete(Path::new("/task.md"), &Condition::Absent)
         .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::AlreadyExists);
-    assert_eq!(requests(&seen), ["HEAD if-match=-"]);
+    assert_eq!(requests(&seen), ["HEAD if-match=-", "HEAD if-match=-"]);
 }
 
 #[cfg(feature = "minio")]
@@ -1215,7 +1291,10 @@ fn s3_put_under_a_prefix_puts_every_key_under_it() {
 #[cfg(feature = "s3")]
 #[test]
 fn s3_delete_absent_over_an_object_is_already_exists() {
-    let (endpoint, _seen) = canned(vec![answer("200 OK", "ETag: \"a\"\r\n", "")]);
+    let (endpoint, _seen) = canned(vec![
+        answer("200 OK", "ETag: \"a\"\r\n", ""),
+        answer("200 OK", "ETag: \"a\"\r\n", ""),
+    ]);
     let error = s3(&endpoint)
         .delete(Path::new("/task.md"), &Condition::Absent)
         .unwrap_err();
@@ -1324,6 +1403,7 @@ fn minio_remove_folder_with_no_marker_and_no_key_is_not_found() {
         empty_page(),
         answer("404 Not Found", "", ""),
         answer("200 OK", "", ""),
+        empty_page(),
     ]);
     let error = minio(endpoint).remove_folder(Path::new("/x")).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::NotFound);
@@ -1521,6 +1601,9 @@ fn minio_put_under_an_object_is_not_a_directory() {
 fn minio_append_to_a_missing_parent_is_not_found() {
     let (endpoint, seen) = canned(vec![
         answer("404 Not Found", "", ""),
+        answer("404 Not Found", "", ""),
+        answer("200 OK", "", ""),
+        empty_page(),
         empty_page(),
         empty_page(),
         answer("404 Not Found", "", ""),
@@ -1530,7 +1613,7 @@ fn minio_append_to_a_missing_parent_is_not_found() {
         .append(Path::new("/d/log.md"), b"x")
         .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::NotFound);
-    assert_eq!(requests(&seen).len(), 5);
+    assert_eq!(requests(&seen).len(), 8);
 }
 
 #[cfg(feature = "minio")]
@@ -1654,6 +1737,9 @@ fn minio_rename_of_a_folder_moves_every_key_and_marker_below_it() {
         missing(),
         answer("200 OK", "", ""),
         listing(&["s/", "s/f.md"], &[]),
+        missing(),
+        answer("200 OK", "", ""),
+        empty_page(),
         empty_page(),
         missing(),
         answer("200 OK", "", ""),
@@ -1700,6 +1786,11 @@ fn minio_rename_of_a_folder_moves_every_key_and_marker_below_it() {
 #[test]
 fn minio_rename_of_a_folder_into_itself_is_invalid_input() {
     let (endpoint, _seen) = canned(vec![
+        answer("404 Not Found", "", ""),
+        answer("200 OK", "", ""),
+        listing(&["s/f.md"], &[]),
+        answer("404 Not Found", "", ""),
+        answer("200 OK", "", ""),
         answer("404 Not Found", "", ""),
         answer("200 OK", "", ""),
         listing(&["s/f.md"], &[]),

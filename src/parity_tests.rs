@@ -6,15 +6,180 @@
 //! that silently diverges from real is the dangerous failure mode -- green
 //! tests, broken production -- so this harness is the highest-value guard.
 
+#[macro_use]
+mod sequences;
+
+parity_sequence!(copy_from_a_dir_is_invalid_input);
+parity_sequence!(copy_missing_parent_is_not_found);
+parity_sequence!(copy_missing_source_is_not_found);
+parity_sequence!(copy_onto_dir_is_a_directory);
+parity_sequence!(copy_returns_len_and_contents);
+parity_sequence!(create_dir_all_idempotent_nested);
+parity_sequence!(create_dir_all_over_a_file_already_exists);
+parity_sequence!(create_empties_an_existing_file_when_closed);
+parity_sequence!(create_makes_the_file_when_closed);
+parity_sequence!(create_over_dir_is_a_directory);
+parity_sequence!(create_writes_via_returned_stream);
+parity_sequence!(exists_is_dir_is_file);
+parity_sequence!(folders_and_moves_below_a_file_are_refused);
+parity_sequence!(metadata_len_for_known_and_empty_files);
+parity_sequence!(open_append_appends);
+parity_sequence!(open_append_keeps_an_existing_file_when_opened);
+parity_sequence!(open_append_makes_the_file_when_closed);
+parity_sequence!(open_append_over_dir_is_a_directory);
+parity_sequence!(open_append_parent_missing_is_not_found);
+parity_sequence!(open_missing_file_is_not_found);
+parity_sequence!(open_of_a_dir_fails_on_read_with_is_a_directory);
+parity_sequence!(open_reads_same_contents);
+parity_sequence!(path_below_a_file_is_not_a_directory);
+parity_sequence!(read_dir_lists_same_children);
+parity_sequence!(read_dir_missing_is_not_found);
+parity_sequence!(read_dir_of_a_file_is_not_a_directory);
+parity_sequence!(read_dir_of_a_missing_folder_and_of_a_file);
+parity_sequence!(read_missing_file_is_not_found);
+parity_sequence!(read_to_string_of_a_dir_is_a_directory);
+parity_sequence!(remove_dir_all_missing_is_not_found);
+parity_sequence!(remove_dir_all_of_a_file_is_not_a_directory);
+parity_sequence!(remove_dir_all_removes_populated_tree);
+parity_sequence!(remove_file_if_below_a_file_is_not_a_directory);
+parity_sequence!(remove_file_if_current_token_removes);
+parity_sequence!(remove_file_if_missing_is_not_found);
+parity_sequence!(remove_file_if_missing_parent_is_not_found);
+parity_sequence!(remove_file_if_of_a_dir_is_a_directory);
+parity_sequence!(remove_file_if_stale_token_keeps);
+parity_sequence!(remove_file_missing_is_not_found);
+parity_sequence!(remove_file_of_a_dir_is_a_directory);
+parity_sequence!(remove_file_success_then_missing);
+parity_sequence!(rename_dest_parent_missing_is_not_found);
+parity_sequence!(rename_dir_into_itself_is_invalid_input);
+parity_sequence!(rename_dir_onto_empty_dir_replaces_it);
+parity_sequence!(rename_dir_onto_file_is_not_a_directory);
+parity_sequence!(rename_dir_onto_non_empty_dir_fails_and_keeps_both);
+parity_sequence!(rename_dir_to_missing_parent_is_not_found);
+parity_sequence!(rename_dir_to_sibling_with_shared_prefix_succeeds);
+parity_sequence!(rename_directory_moves_subtree);
+parity_sequence!(rename_file_onto_dir_is_a_directory);
+parity_sequence!(rename_keeps_the_modification_time);
+parity_sequence!(rename_missing_source_is_not_found);
+parity_sequence!(rename_over_existing_overwrites);
+parity_sequence!(walk_dir_follow_links_agrees_without_symlinks);
+parity_sequence!(walk_dir_hidden_flag_includes_dotfiles);
+parity_sequence!(walk_dir_missing_yields_empty);
+parity_sequence!(walk_dir_visible_tree);
+parity_sequence!(write_absent_over_a_dir_fails_and_keeps_the_dir);
+parity_sequence!(write_create_new_missing_parent_is_not_found);
+parity_sequence!(write_create_new_over_file_is_already_exists);
+parity_sequence!(write_create_new_writes_missing_file);
+parity_sequence!(write_read_roundtrip);
+parity_sequence!(write_replace_over_dir_is_a_directory);
+parity_sequence!(write_truncates);
+
 use crate::System;
-use crate::bucket::{Condition, RevisionToken};
+#[cfg(any(minio_tests, s3_tests))]
+use crate::bucket::Bucket as _;
+use crate::bucket::{Condition, Guarantee, RevisionToken};
+#[cfg(minio_tests)]
+use crate::bucket::{MinioBucket, MinioConfig};
+#[cfg(s3_tests)]
+use crate::bucket::{S3Bucket, S3Config};
 use crate::error::{ErrorKind, Result};
 use crate::mock::MemorySystem;
 use crate::real::RealSystem;
 use crate::streams::{close, read_to_end, write_all};
 use core::time::Duration;
+#[cfg(any(minio_tests, s3_tests))]
+use std::env;
 use std::env::VarError;
 use std::path::{Path, PathBuf};
+#[cfg(any(minio_tests, s3_tests))]
+use std::process;
+#[cfg(minio_tests)]
+use std::sync::OnceLock;
+#[cfg(minio_tests)]
+use std::thread;
+#[cfg(minio_tests)]
+use tokio::runtime::Builder;
+
+#[cfg(any(minio_tests, s3_tests))]
+/// A key prefix no other run or sequence shares.
+fn run_prefix(name: &str) -> String {
+    format!("os-shim-tests/{}-system-{name}", process::id())
+}
+
+#[cfg(minio_tests)]
+/// The server's address and keys from the environment, with every key under a prefix of its own.
+fn server_config(name: &str) -> MinioConfig {
+    MinioConfig::new(
+        env::var("OS_SHIM_MINIO_ENDPOINT").unwrap(),
+        "us-east-1".to_owned(),
+        "os-shim-tests".to_owned(),
+        env::var("OS_SHIM_MINIO_ACCESS_KEY").unwrap(),
+        env::var("OS_SHIM_MINIO_SECRET_KEY").unwrap(),
+    )
+    .with_prefix(run_prefix(name))
+}
+
+#[cfg(minio_tests)]
+/// Create the server's bucket once per test binary, on a runtime of its own.
+fn ensure_server_bucket(config: &MinioConfig) {
+    static CREATED: OnceLock<()> = OnceLock::new();
+    CREATED.get_or_init(|| {
+        let bucket = MinioBucket::new(config.clone());
+        thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(bucket.ensure())
+                        .unwrap();
+                })
+                .join()
+                .unwrap();
+        });
+    });
+}
+
+#[cfg(minio_tests)]
+/// Run `sequence` on the server with `/` as its root, then remove the prefix it wrote under.
+async fn run_on_the_server(name: &str, sequence: impl AsyncFn(&dyn System, &Path)) {
+    let config = server_config(name);
+    ensure_server_bucket(&config);
+    let system = RealSystem::with_bucket(MinioBucket::new(config.clone()));
+    sequence(&system, Path::new("/")).await;
+    drop(MinioBucket::new(config).remove_folder(Path::new("/")).await);
+}
+
+#[cfg(s3_tests)]
+/// The value of an environment variable the S3 tests need.
+fn aws_variable(name: &str) -> String {
+    env::var(name).unwrap()
+}
+
+#[cfg(s3_tests)]
+/// The AWS bucket the environment names, with every key under a prefix of its own.
+fn aws_config(name: &str) -> S3Config {
+    S3Config::new(
+        aws_variable("OS_SHIM_S3_REGION"),
+        aws_variable("OS_SHIM_S3_BUCKET"),
+        aws_variable("AWS_ACCESS_KEY_ID"),
+        aws_variable("AWS_SECRET_ACCESS_KEY"),
+    )
+    .with_prefix(run_prefix(name))
+}
+
+#[cfg(s3_tests)]
+/// Run `sequence` on AWS with `/` as its root, then remove the prefix it wrote under.
+async fn run_on_aws(name: &str, sequence: impl AsyncFn(&dyn System, &Path)) {
+    let system = RealSystem::with_bucket(S3Bucket::new(aws_config(name)));
+    sequence(&system, Path::new("/")).await;
+    drop(
+        S3Bucket::new(aws_config(name))
+            .remove_folder(Path::new("/"))
+            .await,
+    );
+}
 
 /// Assert both results failed with the same `ErrorKind`.
 fn assert_both_err_kind<L, R>(left: Result<L>, right: Result<R>, kind: ErrorKind) {
@@ -73,11 +238,8 @@ fn relative_names(paths: &[PathBuf], root: &Path) -> Vec<String> {
     names
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_write_read_roundtrip() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    let real_file = tmp.path().join("file.txt");
+async fn write_read_roundtrip(real: &dyn System, root: &Path) {
+    let real_file = root.join("file.txt");
     real.write(&real_file, b"payload", Condition::None)
         .await
         .unwrap();
@@ -94,14 +256,11 @@ async fn parity_write_read_roundtrip() {
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_metadata_len_for_known_and_empty_files() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    real.write(&tmp.path().join("known.txt"), b"12345", Condition::None)
+async fn metadata_len_for_known_and_empty_files(real: &dyn System, root: &Path) {
+    real.write(&root.join("known.txt"), b"12345", Condition::None)
         .await
         .unwrap();
-    real.write(&tmp.path().join("empty.txt"), b"", Condition::None)
+    real.write(&root.join("empty.txt"), b"", Condition::None)
         .await
         .unwrap();
 
@@ -113,17 +272,14 @@ async fn parity_metadata_len_for_known_and_empty_files() {
         .await
         .unwrap();
 
-    let real_known = real.metadata(&tmp.path().join("known.txt")).await.unwrap();
+    let real_known = real.metadata(&root.join("known.txt")).await.unwrap();
     let mock_known = mock.metadata(Path::new("/work/known.txt")).await.unwrap();
     assert_eq!(real_known.len, mock_known.len);
     assert_eq!(real_known.is_file, mock_known.is_file);
     assert_eq!(real_known.is_dir, mock_known.is_dir);
 
     assert_eq!(
-        real.metadata(&tmp.path().join("empty.txt"))
-            .await
-            .unwrap()
-            .len,
+        real.metadata(&root.join("empty.txt")).await.unwrap().len,
         mock.metadata(Path::new("/work/empty.txt"))
             .await
             .unwrap()
@@ -131,15 +287,12 @@ async fn parity_metadata_len_for_known_and_empty_files() {
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_copy_returns_len_and_contents() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    real.write(&tmp.path().join("src.txt"), b"payload", Condition::None)
+async fn copy_returns_len_and_contents(real: &dyn System, root: &Path) {
+    real.write(&root.join("src.txt"), b"payload", Condition::None)
         .await
         .unwrap();
     let real_len = real
-        .copy(&tmp.path().join("src.txt"), &tmp.path().join("dest.txt"))
+        .copy(&root.join("src.txt"), &root.join("dest.txt"))
         .await
         .unwrap();
 
@@ -154,25 +307,20 @@ async fn parity_copy_returns_len_and_contents() {
 
     assert_eq!(real_len, mock_len);
     assert_eq!(
-        real.read_to_string(&tmp.path().join("dest.txt"))
-            .await
-            .unwrap(),
+        real.read_to_string(&root.join("dest.txt")).await.unwrap(),
         mock.read_to_string(Path::new("/work/dest.txt"))
             .await
             .unwrap()
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_exists_is_dir_is_file() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    populate(&real, tmp.path()).await;
+async fn exists_is_dir_is_file(real: &dyn System, root: &Path) {
+    populate(real, root).await;
 
     let mock = MemorySystem::new();
     populate(&mock, Path::new("/work")).await;
 
-    let real_file = tmp.path().join("alpha.txt");
+    let real_file = root.join("alpha.txt");
     let mock_file = Path::new("/work/alpha.txt");
     assert_eq!(
         real.is_file(&real_file).await.unwrap(),
@@ -183,7 +331,7 @@ async fn parity_exists_is_dir_is_file() {
         mock.is_dir(mock_file).await.unwrap()
     );
 
-    let real_dir = tmp.path().join("sub");
+    let real_dir = root.join("sub");
     let mock_dir = Path::new("/work/sub");
     assert_eq!(
         real.is_dir(&real_dir).await.unwrap(),
@@ -194,7 +342,7 @@ async fn parity_exists_is_dir_is_file() {
         mock.is_file(mock_dir).await.unwrap()
     );
 
-    let real_missing = tmp.path().join("nope");
+    let real_missing = root.join("nope");
     let mock_missing = Path::new("/work/nope");
     assert_eq!(
         real.exists(&real_missing).await.unwrap(),
@@ -202,52 +350,39 @@ async fn parity_exists_is_dir_is_file() {
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_read_missing_file_is_not_found() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
+async fn read_missing_file_is_not_found(real: &dyn System, root: &Path) {
     let mock = MemorySystem::new().with_dir("/work").unwrap();
 
     assert_both_err_kind(
-        real.read_to_string(&tmp.path().join("missing.txt")).await,
+        real.read_to_string(&root.join("missing.txt")).await,
         mock.read_to_string(Path::new("/work/missing.txt")).await,
         ErrorKind::NotFound,
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_remove_file_missing_is_not_found() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
+async fn remove_file_missing_is_not_found(real: &dyn System, root: &Path) {
     let mock = MemorySystem::new().with_dir("/work").unwrap();
 
     assert_both_err_kind(
-        real.remove_file(&tmp.path().join("missing.txt")).await,
+        real.remove_file(&root.join("missing.txt")).await,
         mock.remove_file(Path::new("/work/missing.txt")).await,
         ErrorKind::NotFound,
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_rename_missing_source_is_not_found() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
+async fn rename_missing_source_is_not_found(real: &dyn System, root: &Path) {
     let mock = MemorySystem::new().with_dir("/work").unwrap();
 
     assert_both_err_kind(
-        real.rename(&tmp.path().join("a"), &tmp.path().join("b"))
-            .await,
+        real.rename(&root.join("a"), &root.join("b")).await,
         mock.rename(Path::new("/work/a"), Path::new("/work/b"))
             .await,
         ErrorKind::NotFound,
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_copy_missing_parent_is_not_found() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    real.write(&tmp.path().join("src.txt"), b"x", Condition::None)
+async fn copy_missing_parent_is_not_found(real: &dyn System, root: &Path) {
+    real.write(&root.join("src.txt"), b"x", Condition::None)
         .await
         .unwrap();
 
@@ -257,8 +392,8 @@ async fn parity_copy_missing_parent_is_not_found() {
 
     assert_both_err_kind(
         real.copy(
-            &tmp.path().join("src.txt"),
-            &tmp.path().join("no").join("dir").join("dest.txt"),
+            &root.join("src.txt"),
+            &root.join("no").join("dir").join("dest.txt"),
         )
         .await,
         mock.copy(
@@ -270,17 +405,14 @@ async fn parity_copy_missing_parent_is_not_found() {
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_rename_over_existing_overwrites() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    real.write(&tmp.path().join("src.txt"), b"new", Condition::None)
+async fn rename_over_existing_overwrites(real: &dyn System, root: &Path) {
+    real.write(&root.join("src.txt"), b"new", Condition::None)
         .await
         .unwrap();
-    real.write(&tmp.path().join("dest.txt"), b"old", Condition::None)
+    real.write(&root.join("dest.txt"), b"old", Condition::None)
         .await
         .unwrap();
-    real.rename(&tmp.path().join("src.txt"), &tmp.path().join("dest.txt"))
+    real.rename(&root.join("src.txt"), &root.join("dest.txt"))
         .await
         .unwrap();
 
@@ -296,29 +428,24 @@ async fn parity_rename_over_existing_overwrites() {
         .unwrap();
 
     assert_eq!(
-        real.read_to_string(&tmp.path().join("dest.txt"))
-            .await
-            .unwrap(),
+        real.read_to_string(&root.join("dest.txt")).await.unwrap(),
         mock.read_to_string(Path::new("/work/dest.txt"))
             .await
             .unwrap()
     );
     assert_eq!(
-        real.exists(&tmp.path().join("src.txt")).await.unwrap(),
+        real.exists(&root.join("src.txt")).await.unwrap(),
         mock.exists(Path::new("/work/src.txt")).await.unwrap()
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_read_dir_lists_same_children() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    populate(&real, tmp.path()).await;
+async fn read_dir_lists_same_children(real: &dyn System, root: &Path) {
+    populate(real, root).await;
 
     let mock = MemorySystem::new();
     populate(&mock, Path::new("/work")).await;
 
-    let real_names = relative_names(&real.read_dir(tmp.path()).await.unwrap(), tmp.path());
+    let real_names = relative_names(&real.read_dir(root).await.unwrap(), root);
     let mock_names = relative_names(
         &mock.read_dir(Path::new("/work")).await.unwrap(),
         Path::new("/work"),
@@ -328,14 +455,11 @@ async fn parity_read_dir_lists_same_children() {
     assert_eq!(real_names, vec!["alpha.txt", "empty.txt", "sub"]);
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_open_append_appends() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    real.write(&tmp.path().join("log.txt"), b"head", Condition::None)
+async fn open_append_appends(real: &dyn System, root: &Path) {
+    real.write(&root.join("log.txt"), b"head", Condition::None)
         .await
         .unwrap();
-    let real_log = tmp.path().join("log.txt");
+    let real_log = root.join("log.txt");
     let mut real_writer = real.open_append(&real_log).await.unwrap();
     write_all(&mut *real_writer, b"-tail").await.unwrap();
     close(&mut *real_writer).await.unwrap();
@@ -350,32 +474,23 @@ async fn parity_open_append_appends() {
     drop(mock_writer);
 
     assert_eq!(
-        real.read_to_string(&tmp.path().join("log.txt"))
-            .await
-            .unwrap(),
+        real.read_to_string(&root.join("log.txt")).await.unwrap(),
         mock.read_to_string(Path::new("/work/log.txt"))
             .await
             .unwrap()
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_open_reads_same_contents() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    real.write(
-        &tmp.path().join("file.txt"),
-        b"shared bytes",
-        Condition::None,
-    )
-    .await
-    .unwrap();
+async fn open_reads_same_contents(real: &dyn System, root: &Path) {
+    real.write(&root.join("file.txt"), b"shared bytes", Condition::None)
+        .await
+        .unwrap();
 
     let mock = MemorySystem::new()
         .with_file("/work/file.txt", b"shared bytes")
         .unwrap();
 
-    let real_contents = read_through_open(&real, &tmp.path().join("file.txt"))
+    let real_contents = read_through_open(real, &root.join("file.txt"))
         .await
         .unwrap();
     let mock_contents = read_through_open(&mock, Path::new("/work/file.txt"))
@@ -385,18 +500,11 @@ async fn parity_open_reads_same_contents() {
     assert_eq!(real_contents, mock_contents);
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_write_truncates() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    real.write(
-        &tmp.path().join("file.txt"),
-        b"long original",
-        Condition::None,
-    )
-    .await
-    .unwrap();
-    real.write(&tmp.path().join("file.txt"), b"short", Condition::None)
+async fn write_truncates(real: &dyn System, root: &Path) {
+    real.write(&root.join("file.txt"), b"long original", Condition::None)
+        .await
+        .unwrap();
+    real.write(&root.join("file.txt"), b"short", Condition::None)
         .await
         .unwrap();
 
@@ -413,20 +521,15 @@ async fn parity_write_truncates() {
         .unwrap();
 
     assert_eq!(
-        real.read_to_string(&tmp.path().join("file.txt"))
-            .await
-            .unwrap(),
+        real.read_to_string(&root.join("file.txt")).await.unwrap(),
         mock.read_to_string(Path::new("/work/file.txt"))
             .await
             .unwrap()
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_write_create_new_writes_missing_file() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    let real_file = tmp.path().join("file.lock");
+async fn write_create_new_writes_missing_file(real: &dyn System, root: &Path) {
+    let real_file = root.join("file.lock");
     real.write(&real_file, b"payload", Condition::Absent)
         .await
         .unwrap();
@@ -441,11 +544,8 @@ async fn parity_write_create_new_writes_missing_file() {
     assert_eq!(mock.read_to_string(mock_file).await.unwrap(), "payload");
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_write_create_new_over_file_is_already_exists() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    let real_file = tmp.path().join("file.lock");
+async fn write_create_new_over_file_is_already_exists(real: &dyn System, root: &Path) {
+    let real_file = root.join("file.lock");
     real.write(&real_file, b"first", Condition::None)
         .await
         .unwrap();
@@ -465,11 +565,8 @@ async fn parity_write_create_new_over_file_is_already_exists() {
     assert_eq!(mock.read_to_string(mock_file).await.unwrap(), "first");
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_write_absent_over_a_dir_fails_and_keeps_the_dir() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    let real_dir = tmp.path().join("sub");
+async fn write_absent_over_a_dir_fails_and_keeps_the_dir(real: &dyn System, root: &Path) {
+    let real_dir = root.join("sub");
     real.create_dir_all(&real_dir).await.unwrap();
 
     let mock = MemorySystem::new().with_dir("/work/sub").unwrap();
@@ -493,11 +590,8 @@ async fn parity_write_absent_over_a_dir_fails_and_keeps_the_dir() {
     assert!(mock.is_dir(mock_dir).await.unwrap());
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_write_replace_over_dir_is_a_directory() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    let real_dir = tmp.path().join("sub");
+async fn write_replace_over_dir_is_a_directory(real: &dyn System, root: &Path) {
+    let real_dir = root.join("sub");
     real.create_dir_all(&real_dir).await.unwrap();
 
     let mock = MemorySystem::new().with_dir("/work/sub").unwrap();
@@ -513,18 +607,15 @@ async fn parity_write_replace_over_dir_is_a_directory() {
     assert!(!mock.is_file(mock_dir).await.unwrap());
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_create_over_dir_is_a_directory() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    let real_dir = tmp.path().join("sub");
+async fn create_over_dir_is_a_directory(real: &dyn System, root: &Path) {
+    let real_dir = root.join("sub");
     real.create_dir_all(&real_dir).await.unwrap();
 
     let mock = MemorySystem::new().with_dir("/work/sub").unwrap();
     let mock_dir = Path::new("/work/sub");
 
     assert_both_err_kind(
-        create_and_close(&real, &real_dir).await,
+        create_and_close(real, &real_dir).await,
         create_and_close(&mock, mock_dir).await,
         ErrorKind::IsADirectory,
     );
@@ -533,18 +624,15 @@ async fn parity_create_over_dir_is_a_directory() {
     assert!(!mock.is_file(mock_dir).await.unwrap());
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_open_append_over_dir_is_a_directory() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    let real_dir = tmp.path().join("sub");
+async fn open_append_over_dir_is_a_directory(real: &dyn System, root: &Path) {
+    let real_dir = root.join("sub");
     real.create_dir_all(&real_dir).await.unwrap();
 
     let mock = MemorySystem::new().with_dir("/work/sub").unwrap();
     let mock_dir = Path::new("/work/sub");
 
     assert_both_err_kind(
-        append_and_close(&real, &real_dir).await,
+        append_and_close(real, &real_dir).await,
         append_and_close(&mock, mock_dir).await,
         ErrorKind::IsADirectory,
     );
@@ -553,12 +641,9 @@ async fn parity_open_append_over_dir_is_a_directory() {
     assert!(!mock.is_file(mock_dir).await.unwrap());
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_copy_from_a_dir_is_invalid_input() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    let real_dir = tmp.path().join("d");
-    let real_to = tmp.path().join("c.md");
+async fn copy_from_a_dir_is_invalid_input(real: &dyn System, root: &Path) {
+    let real_dir = root.join("d");
+    let real_to = root.join("c.md");
     real.create_dir_all(&real_dir).await.unwrap();
 
     let mock = MemorySystem::new().with_dir("/work/d").unwrap();
@@ -576,11 +661,8 @@ async fn parity_copy_from_a_dir_is_invalid_input() {
     assert!(!mock.exists(mock_to).await.unwrap());
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_create_makes_the_file_when_closed() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    let real_path = tmp.path().join("new.md");
+async fn create_makes_the_file_when_closed(real: &dyn System, root: &Path) {
+    let real_path = root.join("new.md");
     let mock = MemorySystem::new().with_dir("/work").unwrap();
     let mock_path = Path::new("/work/new.md");
 
@@ -600,11 +682,8 @@ async fn parity_create_makes_the_file_when_closed() {
     drop(mock_writer);
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_create_empties_an_existing_file_when_closed() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    let real_path = tmp.path().join("old.md");
+async fn create_empties_an_existing_file_when_closed(real: &dyn System, root: &Path) {
+    let real_path = root.join("old.md");
     real.write(&real_path, b"old", Condition::None)
         .await
         .unwrap();
@@ -625,11 +704,8 @@ async fn parity_create_empties_an_existing_file_when_closed() {
     drop(mock_writer);
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_open_append_makes_the_file_when_closed() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    let real_path = tmp.path().join("log.md");
+async fn open_append_makes_the_file_when_closed(real: &dyn System, root: &Path) {
+    let real_path = root.join("log.md");
     let mock = MemorySystem::new().with_dir("/work").unwrap();
     let mock_path = Path::new("/work/log.md");
 
@@ -651,11 +727,8 @@ async fn parity_open_append_makes_the_file_when_closed() {
     drop(mock_writer);
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_open_append_keeps_an_existing_file_when_opened() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    let real_path = tmp.path().join("log.md");
+async fn open_append_keeps_an_existing_file_when_opened(real: &dyn System, root: &Path) {
+    let real_path = root.join("log.md");
     real.write(&real_path, b"old", Condition::None)
         .await
         .unwrap();
@@ -678,13 +751,10 @@ async fn parity_open_append_keeps_an_existing_file_when_opened() {
     assert_eq!(mock.read_to_string(mock_path).await.unwrap(), "old+new");
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_copy_onto_dir_is_a_directory() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    let real_dir = tmp.path().join("sub");
+async fn copy_onto_dir_is_a_directory(real: &dyn System, root: &Path) {
+    let real_dir = root.join("sub");
     real.create_dir_all(&real_dir).await.unwrap();
-    real.write(&tmp.path().join("src.txt"), b"x", Condition::None)
+    real.write(&root.join("src.txt"), b"x", Condition::None)
         .await
         .unwrap();
 
@@ -695,7 +765,7 @@ async fn parity_copy_onto_dir_is_a_directory() {
         .unwrap();
 
     assert_both_err_kind(
-        real.copy(&tmp.path().join("src.txt"), &real_dir).await,
+        real.copy(&root.join("src.txt"), &real_dir).await,
         mock.copy(Path::new("/work/src.txt"), mock_dir).await,
         ErrorKind::IsADirectory,
     );
@@ -704,31 +774,21 @@ async fn parity_copy_onto_dir_is_a_directory() {
     assert!(!mock.is_file(mock_dir).await.unwrap());
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_write_create_new_missing_parent_is_not_found() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
+async fn write_create_new_missing_parent_is_not_found(real: &dyn System, root: &Path) {
     let mock = MemorySystem::new().with_dir("/work").unwrap();
 
     assert_both_err_kind(
-        real.write(
-            &tmp.path().join("no").join("file.lock"),
-            b"x",
-            Condition::Absent,
-        )
-        .await,
+        real.write(&root.join("no").join("file.lock"), b"x", Condition::Absent)
+            .await,
         mock.write(Path::new("/work/no/file.lock"), b"x", Condition::Absent)
             .await,
         ErrorKind::NotFound,
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_path_below_a_file_is_not_a_directory() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
+async fn path_below_a_file_is_not_a_directory(real: &dyn System, root: &Path) {
     let mock = MemorySystem::new().with_dir("/work").unwrap();
-    real.write(&tmp.path().join("a.md"), b"a", Condition::None)
+    real.write(&root.join("a.md"), b"a", Condition::None)
         .await
         .unwrap();
     mock.write(Path::new("/work/a.md"), b"a", Condition::None)
@@ -736,81 +796,90 @@ async fn parity_path_below_a_file_is_not_a_directory() {
         .unwrap();
 
     assert_both_err_kind(
-        real.read_to_string(&tmp.path().join("a.md/b.md")).await,
+        real.read_to_string(&root.join("a.md/b.md")).await,
         mock.read_to_string(Path::new("/work/a.md/b.md")).await,
         ErrorKind::NotADirectory,
     );
     assert_both_err_kind(
-        real.write(&tmp.path().join("a.md/b.md"), b"b", Condition::None)
+        real.write(&root.join("a.md/b.md"), b"b", Condition::None)
             .await,
         mock.write(Path::new("/work/a.md/b.md"), b"b", Condition::None)
             .await,
         ErrorKind::NotADirectory,
     );
     assert_both_err_kind(
-        real.remove_file(&tmp.path().join("a.md/b.md")).await,
+        real.remove_file(&root.join("a.md/b.md")).await,
         mock.remove_file(Path::new("/work/a.md/b.md")).await,
         ErrorKind::NotADirectory,
     );
     assert_both_err_kind(
-        real.create_dir_all(&tmp.path().join("a.md/b")).await,
+        real.create_dir_all(&root.join("a.md/b")).await,
         mock.create_dir_all(Path::new("/work/a.md/b")).await,
         ErrorKind::NotADirectory,
     );
     assert_both_err_kind(
-        real.open(&tmp.path().join("a.md/b.md")).await,
+        real.open(&root.join("a.md/b.md")).await,
         mock.open(Path::new("/work/a.md/b.md")).await,
         ErrorKind::NotADirectory,
     );
     assert_both_err_kind(
-        real.metadata(&tmp.path().join("a.md/b.md")).await,
+        real.metadata(&root.join("a.md/b.md")).await,
         mock.metadata(Path::new("/work/a.md/b.md")).await,
         ErrorKind::NotADirectory,
     );
     assert_both_err_kind(
-        create_and_close(&real, &tmp.path().join("a.md/b.md")).await,
+        create_and_close(real, &root.join("a.md/b.md")).await,
         create_and_close(&mock, Path::new("/work/a.md/b.md")).await,
         ErrorKind::NotADirectory,
     );
     assert_both_err_kind(
-        append_and_close(&real, &tmp.path().join("a.md/b.md")).await,
+        append_and_close(real, &root.join("a.md/b.md")).await,
         append_and_close(&mock, Path::new("/work/a.md/b.md")).await,
         ErrorKind::NotADirectory,
     );
+}
+
+async fn folders_and_moves_below_a_file_are_refused(real: &dyn System, root: &Path) {
+    let mock = MemorySystem::new().with_dir("/work").unwrap();
+    real.write(&root.join("a.md"), b"a", Condition::None)
+        .await
+        .unwrap();
+    mock.write(Path::new("/work/a.md"), b"a", Condition::None)
+        .await
+        .unwrap();
+
     assert_both_err_kind(
-        real.read_dir(&tmp.path().join("a.md/b")).await,
+        real.read_dir(&root.join("a.md/b")).await,
         mock.read_dir(Path::new("/work/a.md/b")).await,
         ErrorKind::NotADirectory,
     );
     assert_both_err_kind(
-        real.remove_dir_all(&tmp.path().join("a.md/b")).await,
+        real.remove_dir_all(&root.join("a.md/b")).await,
         mock.remove_dir_all(Path::new("/work/a.md/b")).await,
         ErrorKind::NotADirectory,
     );
     assert_both_err_kind(
-        real.rename(&tmp.path().join("a.md/b.md"), &tmp.path().join("c.md"))
+        real.rename(&root.join("a.md/b.md"), &root.join("c.md"))
             .await,
         mock.rename(Path::new("/work/a.md/b.md"), Path::new("/work/c.md"))
             .await,
         ErrorKind::NotADirectory,
     );
     assert_both_err_kind(
-        real.rename(&tmp.path().join("a.md"), &tmp.path().join("a.md/b.md"))
+        real.rename(&root.join("a.md"), &root.join("a.md/b.md"))
             .await,
         mock.rename(Path::new("/work/a.md"), Path::new("/work/a.md/b.md"))
             .await,
         ErrorKind::NotADirectory,
     );
     assert_both_err_kind(
-        real.copy(&tmp.path().join("a.md/b.md"), &tmp.path().join("c.md"))
-            .await,
+        real.copy(&root.join("a.md/b.md"), &root.join("c.md")).await,
         mock.copy(Path::new("/work/a.md/b.md"), Path::new("/work/c.md"))
             .await,
         ErrorKind::NotADirectory,
     );
     assert_both_err_kind(
-        real.copy(&tmp.path().join("a.md"), &tmp.path().join("a.md/b.md"))
-            .await,
+        real.copy(&root.join("a.md"), &root.join("a.md/b.md")).await,
         mock.copy(Path::new("/work/a.md"), Path::new("/work/a.md/b.md"))
             .await,
         ErrorKind::NotADirectory,
@@ -823,12 +892,9 @@ async fn parity_path_below_a_file_is_not_a_directory() {
     assert!(!mock.exists(Path::new("/work/a.md/b.md")).await.unwrap());
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_create_dir_all_over_a_file_already_exists() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
+async fn create_dir_all_over_a_file_already_exists(real: &dyn System, root: &Path) {
     let mock = MemorySystem::new().with_dir("/work").unwrap();
-    real.write(&tmp.path().join("a.md"), b"a", Condition::None)
+    real.write(&root.join("a.md"), b"a", Condition::None)
         .await
         .unwrap();
     mock.write(Path::new("/work/a.md"), b"a", Condition::None)
@@ -836,19 +902,16 @@ async fn parity_create_dir_all_over_a_file_already_exists() {
         .unwrap();
 
     assert_both_err_kind(
-        real.create_dir_all(&tmp.path().join("a.md")).await,
+        real.create_dir_all(&root.join("a.md")).await,
         mock.create_dir_all(Path::new("/work/a.md")).await,
         ErrorKind::AlreadyExists,
     );
     assert!(!mock.is_dir(Path::new("/work/a.md")).await.unwrap());
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_read_dir_of_a_file_is_not_a_directory() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
+async fn read_dir_of_a_file_is_not_a_directory(real: &dyn System, root: &Path) {
     let mock = MemorySystem::new().with_dir("/work").unwrap();
-    real.write(&tmp.path().join("a.md"), b"a", Condition::None)
+    real.write(&root.join("a.md"), b"a", Condition::None)
         .await
         .unwrap();
     mock.write(Path::new("/work/a.md"), b"a", Condition::None)
@@ -856,14 +919,11 @@ async fn parity_read_dir_of_a_file_is_not_a_directory() {
         .unwrap();
 
     assert_both_err_kind(
-        real.read_dir(&tmp.path().join("a.md")).await,
+        real.read_dir(&root.join("a.md")).await,
         mock.read_dir(Path::new("/work/a.md")).await,
         ErrorKind::NotADirectory,
     );
-    assert_eq!(
-        real.read_to_string(&tmp.path().join("a.md")).await.unwrap(),
-        "a"
-    );
+    assert_eq!(real.read_to_string(&root.join("a.md")).await.unwrap(), "a");
     assert_eq!(
         mock.read_to_string(Path::new("/work/a.md")).await.unwrap(),
         "a"
@@ -871,12 +931,9 @@ async fn parity_read_dir_of_a_file_is_not_a_directory() {
     assert!(!mock.is_dir(Path::new("/work/a.md")).await.unwrap());
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_remove_dir_all_of_a_file_is_not_a_directory() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
+async fn remove_dir_all_of_a_file_is_not_a_directory(real: &dyn System, root: &Path) {
     let mock = MemorySystem::new().with_dir("/work").unwrap();
-    real.write(&tmp.path().join("a.md"), b"a", Condition::None)
+    real.write(&root.join("a.md"), b"a", Condition::None)
         .await
         .unwrap();
     mock.write(Path::new("/work/a.md"), b"a", Condition::None)
@@ -884,14 +941,11 @@ async fn parity_remove_dir_all_of_a_file_is_not_a_directory() {
         .unwrap();
 
     assert_both_err_kind(
-        real.remove_dir_all(&tmp.path().join("a.md")).await,
+        real.remove_dir_all(&root.join("a.md")).await,
         mock.remove_dir_all(Path::new("/work/a.md")).await,
         ErrorKind::NotADirectory,
     );
-    assert_eq!(
-        real.read_to_string(&tmp.path().join("a.md")).await.unwrap(),
-        "a"
-    );
+    assert_eq!(real.read_to_string(&root.join("a.md")).await.unwrap(), "a");
     assert_eq!(
         mock.read_to_string(Path::new("/work/a.md")).await.unwrap(),
         "a"
@@ -899,11 +953,8 @@ async fn parity_remove_dir_all_of_a_file_is_not_a_directory() {
     assert!(!mock.is_dir(Path::new("/work/a.md")).await.unwrap());
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_remove_file_of_a_dir_is_a_directory() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    let real_dir = tmp.path().join("d");
+async fn remove_file_of_a_dir_is_a_directory(real: &dyn System, root: &Path) {
+    let real_dir = root.join("d");
     real.create_dir_all(&real_dir).await.unwrap();
 
     let mock = MemorySystem::new().with_dir("/work/d").unwrap();
@@ -919,11 +970,8 @@ async fn parity_remove_file_of_a_dir_is_a_directory() {
     assert!(!mock.is_file(mock_dir).await.unwrap());
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_read_to_string_of_a_dir_is_a_directory() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    let real_dir = tmp.path().join("d");
+async fn read_to_string_of_a_dir_is_a_directory(real: &dyn System, root: &Path) {
+    let real_dir = root.join("d");
     real.create_dir_all(&real_dir).await.unwrap();
 
     let mock = MemorySystem::new().with_dir("/work/d").unwrap();
@@ -939,18 +987,15 @@ async fn parity_read_to_string_of_a_dir_is_a_directory() {
     assert!(!mock.is_file(mock_dir).await.unwrap());
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_open_of_a_dir_fails_on_read_with_is_a_directory() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    let real_dir = tmp.path().join("d");
+async fn open_of_a_dir_fails_on_read_with_is_a_directory(real: &dyn System, root: &Path) {
+    let real_dir = root.join("d");
     real.create_dir_all(&real_dir).await.unwrap();
 
     let mock = MemorySystem::new().with_dir("/work/d").unwrap();
     let mock_dir = Path::new("/work/d");
 
     assert_both_err_kind(
-        read_through_open(&real, &real_dir).await,
+        read_through_open(real, &real_dir).await,
         read_through_open(&mock, mock_dir).await,
         ErrorKind::IsADirectory,
     );
@@ -959,11 +1004,8 @@ async fn parity_open_of_a_dir_fails_on_read_with_is_a_directory() {
     assert!(!mock.is_file(mock_dir).await.unwrap());
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_create_dir_all_idempotent_nested() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    let real_nested = tmp.path().join("a").join("b").join("c");
+async fn create_dir_all_idempotent_nested(real: &dyn System, root: &Path) {
+    let real_nested = root.join("a").join("b").join("c");
     real.create_dir_all(&real_nested).await.unwrap();
     real.create_dir_all(&real_nested).await.unwrap();
 
@@ -998,17 +1040,14 @@ fn parity_env_var_roundtrip_and_missing() {
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_walk_dir_visible_tree() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    populate(&real, tmp.path()).await;
+async fn walk_dir_visible_tree(real: &dyn System, root: &Path) {
+    populate(real, root).await;
 
     let mock = MemorySystem::new();
     populate(&mock, Path::new("/work")).await;
 
     let real_walk: Vec<PathBuf> = real
-        .walk_dir(tmp.path(), false, false)
+        .walk_dir(root, false, false)
         .await
         .unwrap()
         .into_iter()
@@ -1022,7 +1061,7 @@ async fn parity_walk_dir_visible_tree() {
         .map(|entry| entry.path)
         .collect();
 
-    let real_names = relative_names(&real_walk, tmp.path());
+    let real_names = relative_names(&real_walk, root);
     let mock_names = relative_names(&mock_walk, Path::new("/work"));
 
     assert_eq!(real_names, mock_names);
@@ -1032,11 +1071,8 @@ async fn parity_walk_dir_visible_tree() {
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_create_writes_via_returned_stream() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    let real_file = tmp.path().join("made.txt");
+async fn create_writes_via_returned_stream(real: &dyn System, root: &Path) {
+    let real_file = root.join("made.txt");
     let mut real_writer = real.create(&real_file).await.unwrap();
     write_all(&mut *real_writer, b"streamed").await.unwrap();
     close(&mut *real_writer).await.unwrap();
@@ -1055,55 +1091,40 @@ async fn parity_create_writes_via_returned_stream() {
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_copy_missing_source_is_not_found() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
+async fn copy_missing_source_is_not_found(real: &dyn System, root: &Path) {
     let mock = MemorySystem::new().with_dir("/work").unwrap();
 
     assert_both_err_kind(
-        real.copy(
-            &tmp.path().join("missing.txt"),
-            &tmp.path().join("dest.txt"),
-        )
-        .await,
+        real.copy(&root.join("missing.txt"), &root.join("dest.txt"))
+            .await,
         mock.copy(Path::new("/work/missing.txt"), Path::new("/work/dest.txt"))
             .await,
         ErrorKind::NotFound,
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_open_missing_file_is_not_found() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
+async fn open_missing_file_is_not_found(real: &dyn System, root: &Path) {
     let mock = MemorySystem::new().with_dir("/work").unwrap();
 
     assert_both_err_kind(
-        real.open(&tmp.path().join("missing.txt")).await,
+        real.open(&root.join("missing.txt")).await,
         mock.open(Path::new("/work/missing.txt")).await,
         ErrorKind::NotFound,
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_read_dir_missing_is_not_found() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
+async fn read_dir_missing_is_not_found(real: &dyn System, root: &Path) {
     let mock = MemorySystem::new().with_dir("/work").unwrap();
 
     assert_both_err_kind(
-        real.read_dir(&tmp.path().join("missing")).await,
+        real.read_dir(&root.join("missing")).await,
         mock.read_dir(Path::new("/work/missing")).await,
         ErrorKind::NotFound,
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_rename_dest_parent_missing_is_not_found() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    real.write(&tmp.path().join("src.txt"), b"x", Condition::None)
+async fn rename_dest_parent_missing_is_not_found(real: &dyn System, root: &Path) {
+    real.write(&root.join("src.txt"), b"x", Condition::None)
         .await
         .unwrap();
 
@@ -1112,19 +1133,14 @@ async fn parity_rename_dest_parent_missing_is_not_found() {
         .unwrap();
 
     assert_both_err_kind(
-        real.rename(
-            &tmp.path().join("src.txt"),
-            &tmp.path().join("no").join("dest.txt"),
-        )
-        .await,
+        real.rename(&root.join("src.txt"), &root.join("no").join("dest.txt"))
+            .await,
         mock.rename(Path::new("/work/src.txt"), Path::new("/work/no/dest.txt"))
             .await,
         ErrorKind::NotFound,
     );
     assert_eq!(
-        real.read_to_string(&tmp.path().join("src.txt"))
-            .await
-            .unwrap(),
+        real.read_to_string(&root.join("src.txt")).await.unwrap(),
         "x"
     );
     assert_eq!(
@@ -1135,14 +1151,11 @@ async fn parity_rename_dest_parent_missing_is_not_found() {
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_rename_file_onto_dir_is_a_directory() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    real.write(&tmp.path().join("a.md"), b"a", Condition::None)
+async fn rename_file_onto_dir_is_a_directory(real: &dyn System, root: &Path) {
+    real.write(&root.join("a.md"), b"a", Condition::None)
         .await
         .unwrap();
-    real.create_dir_all(&tmp.path().join("d")).await.unwrap();
+    real.create_dir_all(&root.join("d")).await.unwrap();
 
     let mock = MemorySystem::new()
         .with_file("/work/a.md", b"a")
@@ -1151,28 +1164,24 @@ async fn parity_rename_file_onto_dir_is_a_directory() {
         .unwrap();
 
     assert_both_err_kind(
-        real.rename(&tmp.path().join("a.md"), &tmp.path().join("d"))
-            .await,
+        real.rename(&root.join("a.md"), &root.join("d")).await,
         mock.rename(Path::new("/work/a.md"), Path::new("/work/d"))
             .await,
         ErrorKind::IsADirectory,
     );
-    assert!(real.is_file(&tmp.path().join("a.md")).await.unwrap());
+    assert!(real.is_file(&root.join("a.md")).await.unwrap());
     assert!(mock.is_file(Path::new("/work/a.md")).await.unwrap());
-    assert!(real.is_dir(&tmp.path().join("d")).await.unwrap());
+    assert!(real.is_dir(&root.join("d")).await.unwrap());
     assert!(mock.is_dir(Path::new("/work/d")).await.unwrap());
-    assert!(!real.is_file(&tmp.path().join("d")).await.unwrap());
+    assert!(!real.is_file(&root.join("d")).await.unwrap());
     assert!(!mock.is_file(Path::new("/work/d")).await.unwrap());
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_rename_dir_onto_file_is_not_a_directory() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    real.write(&tmp.path().join("a.md"), b"a", Condition::None)
+async fn rename_dir_onto_file_is_not_a_directory(real: &dyn System, root: &Path) {
+    real.write(&root.join("a.md"), b"a", Condition::None)
         .await
         .unwrap();
-    real.create_dir_all(&tmp.path().join("d")).await.unwrap();
+    real.create_dir_all(&root.join("d")).await.unwrap();
 
     let mock = MemorySystem::new()
         .with_file("/work/a.md", b"a")
@@ -1181,51 +1190,38 @@ async fn parity_rename_dir_onto_file_is_not_a_directory() {
         .unwrap();
 
     assert_both_err_kind(
-        real.rename(&tmp.path().join("d"), &tmp.path().join("a.md"))
-            .await,
+        real.rename(&root.join("d"), &root.join("a.md")).await,
         mock.rename(Path::new("/work/d"), Path::new("/work/a.md"))
             .await,
         ErrorKind::NotADirectory,
     );
-    assert!(real.is_file(&tmp.path().join("a.md")).await.unwrap());
+    assert!(real.is_file(&root.join("a.md")).await.unwrap());
     assert!(mock.is_file(Path::new("/work/a.md")).await.unwrap());
-    assert!(!real.is_dir(&tmp.path().join("a.md")).await.unwrap());
+    assert!(!real.is_dir(&root.join("a.md")).await.unwrap());
     assert!(!mock.is_dir(Path::new("/work/a.md")).await.unwrap());
-    assert!(real.is_dir(&tmp.path().join("d")).await.unwrap());
+    assert!(real.is_dir(&root.join("d")).await.unwrap());
     assert!(mock.is_dir(Path::new("/work/d")).await.unwrap());
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_rename_dir_to_missing_parent_is_not_found() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    real.create_dir_all(&tmp.path().join("d")).await.unwrap();
+async fn rename_dir_to_missing_parent_is_not_found(real: &dyn System, root: &Path) {
+    real.create_dir_all(&root.join("d")).await.unwrap();
 
     let mock = MemorySystem::new().with_dir("/work/d").unwrap();
 
     assert_both_err_kind(
-        real.rename(&tmp.path().join("d"), &tmp.path().join("nope").join("d3"))
+        real.rename(&root.join("d"), &root.join("nope").join("d3"))
             .await,
         mock.rename(Path::new("/work/d"), Path::new("/work/nope/d3"))
             .await,
         ErrorKind::NotFound,
     );
-    assert!(real.exists(&tmp.path().join("d")).await.unwrap());
+    assert!(real.exists(&root.join("d")).await.unwrap());
     assert!(mock.exists(Path::new("/work/d")).await.unwrap());
-    assert!(
-        !real
-            .exists(&tmp.path().join("nope").join("d3"))
-            .await
-            .unwrap()
-    );
+    assert!(!real.exists(&root.join("nope").join("d3")).await.unwrap());
     assert!(!mock.exists(Path::new("/work/nope/d3")).await.unwrap());
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_rename_dir_onto_non_empty_dir_fails_and_keeps_both() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    let root = tmp.path();
+async fn rename_dir_onto_non_empty_dir_fails_and_keeps_both(real: &dyn System, root: &Path) {
     real.create_dir_all(&root.join("d2")).await.unwrap();
     real.create_dir_all(&root.join("e2")).await.unwrap();
     real.write(&root.join("d2").join("a.md"), b"a", Condition::None)
@@ -1264,11 +1260,7 @@ async fn parity_rename_dir_onto_non_empty_dir_fails_and_keeps_both() {
     assert!(mock.is_file(Path::new("/work/e2/x.md")).await.unwrap());
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_rename_dir_onto_empty_dir_replaces_it() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    let root = tmp.path();
+async fn rename_dir_onto_empty_dir_replaces_it(real: &dyn System, root: &Path) {
     real.create_dir_all(&root.join("d1")).await.unwrap();
     real.create_dir_all(&root.join("e1")).await.unwrap();
     real.write(&root.join("d1").join("a.md"), b"a", Condition::None)
@@ -1294,11 +1286,7 @@ async fn parity_rename_dir_onto_empty_dir_replaces_it() {
     assert!(!mock.exists(Path::new("/work/d1")).await.unwrap());
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_rename_dir_into_itself_is_invalid_input() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    let root = tmp.path();
+async fn rename_dir_into_itself_is_invalid_input(real: &dyn System, root: &Path) {
     real.create_dir_all(&root.join("d3")).await.unwrap();
     real.write(&root.join("d3").join("f.md"), b"f", Condition::None)
         .await
@@ -1333,11 +1321,7 @@ async fn parity_rename_dir_into_itself_is_invalid_input() {
     assert!(!mock.exists(Path::new("/work/d3/sub")).await.unwrap());
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_rename_dir_to_sibling_with_shared_prefix_succeeds() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    let root = tmp.path();
+async fn rename_dir_to_sibling_with_shared_prefix_succeeds(real: &dyn System, root: &Path) {
     real.create_dir_all(&root.join("d3")).await.unwrap();
     real.write(&root.join("d3").join("f.md"), b"f", Condition::None)
         .await
@@ -1360,11 +1344,7 @@ async fn parity_rename_dir_to_sibling_with_shared_prefix_succeeds() {
     assert!(!mock.exists(Path::new("/work/d3")).await.unwrap());
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_rename_keeps_the_modification_time() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    let root = tmp.path();
+async fn rename_keeps_the_modification_time(real: &dyn System, root: &Path) {
     real.write(&root.join("m.md"), b"m", Condition::None)
         .await
         .unwrap();
@@ -1388,10 +1368,13 @@ async fn parity_rename_keeps_the_modification_time() {
         .await
         .unwrap();
 
-    assert_eq!(
-        real.metadata(&root.join("n.md")).await.unwrap().modified,
-        real_before
-    );
+    let real_after = real.metadata(&root.join("n.md")).await.unwrap().modified;
+    // A rename by copy and delete gives the file the time of the copy.
+    if real.guarantees().contains(Guarantee::FileRenameIsAtomic) {
+        assert_eq!(real_after, real_before);
+    } else {
+        assert!(real_after.is_some());
+    }
     assert_eq!(
         mock.metadata(Path::new("/work/n.md"))
             .await
@@ -1401,29 +1384,21 @@ async fn parity_rename_keeps_the_modification_time() {
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_open_append_parent_missing_is_not_found() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
+async fn open_append_parent_missing_is_not_found(real: &dyn System, root: &Path) {
     let mock = MemorySystem::new().with_dir("/work").unwrap();
 
     assert_both_err_kind(
-        append_and_close(&real, &tmp.path().join("no").join("log.txt")).await,
+        append_and_close(real, &root.join("no").join("log.txt")).await,
         append_and_close(&mock, Path::new("/work/no/log.txt")).await,
         ErrorKind::NotFound,
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_remove_file_success_then_missing() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    real.write(&tmp.path().join("doomed.txt"), b"x", Condition::None)
+async fn remove_file_success_then_missing(real: &dyn System, root: &Path) {
+    real.write(&root.join("doomed.txt"), b"x", Condition::None)
         .await
         .unwrap();
-    real.remove_file(&tmp.path().join("doomed.txt"))
-        .await
-        .unwrap();
+    real.remove_file(&root.join("doomed.txt")).await.unwrap();
 
     let mock = MemorySystem::new()
         .with_file("/work/doomed.txt", b"x")
@@ -1433,38 +1408,31 @@ async fn parity_remove_file_success_then_missing() {
         .unwrap();
 
     assert_eq!(
-        real.exists(&tmp.path().join("doomed.txt")).await.unwrap(),
+        real.exists(&root.join("doomed.txt")).await.unwrap(),
         mock.exists(Path::new("/work/doomed.txt")).await.unwrap()
     );
     assert_both_err_kind(
-        real.remove_file(&tmp.path().join("doomed.txt")).await,
+        real.remove_file(&root.join("doomed.txt")).await,
         mock.remove_file(Path::new("/work/doomed.txt")).await,
         ErrorKind::NotFound,
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_rename_directory_moves_subtree() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    real.create_dir_all(&tmp.path().join("from").join("nested"))
+async fn rename_directory_moves_subtree(real: &dyn System, root: &Path) {
+    real.create_dir_all(&root.join("from").join("nested"))
+        .await
+        .unwrap();
+    real.write(&root.join("from").join("a.txt"), b"a", Condition::None)
         .await
         .unwrap();
     real.write(
-        &tmp.path().join("from").join("a.txt"),
-        b"a",
-        Condition::None,
-    )
-    .await
-    .unwrap();
-    real.write(
-        &tmp.path().join("from").join("nested").join("b.txt"),
+        &root.join("from").join("nested").join("b.txt"),
         b"b",
         Condition::None,
     )
     .await
     .unwrap();
-    real.rename(&tmp.path().join("from"), &tmp.path().join("to"))
+    real.rename(&root.join("from"), &root.join("to"))
         .await
         .unwrap();
 
@@ -1483,11 +1451,11 @@ async fn parity_rename_directory_moves_subtree() {
         .unwrap();
 
     assert_eq!(
-        real.exists(&tmp.path().join("from")).await.unwrap(),
+        real.exists(&root.join("from")).await.unwrap(),
         mock.exists(Path::new("/work/from")).await.unwrap()
     );
     let real_walk: Vec<PathBuf> = real
-        .walk_dir(&tmp.path().join("to"), false, false)
+        .walk_dir(&root.join("to"), false, false)
         .await
         .unwrap()
         .into_iter()
@@ -1501,11 +1469,11 @@ async fn parity_rename_directory_moves_subtree() {
         .map(|entry| entry.path)
         .collect();
     assert_eq!(
-        relative_names(&real_walk, &tmp.path().join("to")),
+        relative_names(&real_walk, &root.join("to")),
         relative_names(&mock_walk, Path::new("/work/to"))
     );
     assert_eq!(
-        real.read_to_string(&tmp.path().join("to").join("nested").join("b.txt"))
+        real.read_to_string(&root.join("to").join("nested").join("b.txt"))
             .await
             .unwrap(),
         mock.read_to_string(Path::new("/work/to/nested/b.txt"))
@@ -1515,26 +1483,20 @@ async fn parity_rename_directory_moves_subtree() {
 }
 
 /// `remove_dir_all` on a missing path returns `NotFound` on both.
-#[tokio::test(flavor = "current_thread")]
-async fn parity_remove_dir_all_missing_is_not_found() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
+async fn remove_dir_all_missing_is_not_found(real: &dyn System, root: &Path) {
     let mock = MemorySystem::new().with_dir("/work").unwrap();
 
     assert_both_err_kind(
-        real.remove_dir_all(&tmp.path().join("missing")).await,
+        real.remove_dir_all(&root.join("missing")).await,
         mock.remove_dir_all(Path::new("/work/missing")).await,
         ErrorKind::NotFound,
     );
 }
 
 /// `remove_dir_all` on a populated tree removes the root and every descendant on both.
-#[tokio::test(flavor = "current_thread")]
-async fn parity_remove_dir_all_removes_populated_tree() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    let real_root = tmp.path().join("tree");
-    populate(&real, &real_root).await;
+async fn remove_dir_all_removes_populated_tree(real: &dyn System, root: &Path) {
+    let real_root = root.join("tree");
+    populate(real, &real_root).await;
 
     let mock = MemorySystem::new();
     let mock_root = Path::new("/work/tree");
@@ -1556,14 +1518,11 @@ async fn parity_remove_dir_all_removes_populated_tree() {
 }
 
 /// `walk_dir` on a missing path yields an empty list on both.
-#[tokio::test(flavor = "current_thread")]
-async fn parity_walk_dir_missing_yields_empty() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
+async fn walk_dir_missing_yields_empty(real: &dyn System, root: &Path) {
     let mock = MemorySystem::new().with_dir("/work").unwrap();
 
     assert!(
-        real.walk_dir(&tmp.path().join("missing"), false, false)
+        real.walk_dir(&root.join("missing"), false, false)
             .await
             .unwrap()
             .is_empty()
@@ -1577,14 +1536,11 @@ async fn parity_walk_dir_missing_yields_empty() {
 }
 
 /// `hidden` true includes dotfiles and false excludes them, on both.
-#[tokio::test(flavor = "current_thread")]
-async fn parity_walk_dir_hidden_flag_includes_dotfiles() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    real.write(&tmp.path().join("visible.txt"), b"v", Condition::None)
+async fn walk_dir_hidden_flag_includes_dotfiles(real: &dyn System, root: &Path) {
+    real.write(&root.join("visible.txt"), b"v", Condition::None)
         .await
         .unwrap();
-    real.write(&tmp.path().join(".secret"), b"s", Condition::None)
+    real.write(&root.join(".secret"), b"s", Condition::None)
         .await
         .unwrap();
 
@@ -1599,13 +1555,13 @@ async fn parity_walk_dir_hidden_flag_includes_dotfiles() {
     let walk_names = async |hidden: bool| {
         let real_names = relative_names(
             &real
-                .walk_dir(tmp.path(), false, hidden)
+                .walk_dir(root, false, hidden)
                 .await
                 .unwrap()
                 .into_iter()
                 .map(|entry| entry.path)
                 .collect::<Vec<_>>(),
-            tmp.path(),
+            root,
         );
         let mock_names = relative_names(
             &mock
@@ -1627,11 +1583,8 @@ async fn parity_walk_dir_hidden_flag_includes_dotfiles() {
 }
 
 /// On a tree without symlinks, `follow_links` yields the same entries on both.
-#[tokio::test(flavor = "current_thread")]
-async fn parity_walk_dir_follow_links_agrees_without_symlinks() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    populate(&real, tmp.path()).await;
+async fn walk_dir_follow_links_agrees_without_symlinks(real: &dyn System, root: &Path) {
+    populate(real, root).await;
 
     let mock = MemorySystem::new();
     populate(&mock, Path::new("/work")).await;
@@ -1639,13 +1592,13 @@ async fn parity_walk_dir_follow_links_agrees_without_symlinks() {
     let walk_names = async |follow_links: bool| {
         let real_names = relative_names(
             &real
-                .walk_dir(tmp.path(), follow_links, false)
+                .walk_dir(root, follow_links, false)
                 .await
                 .unwrap()
                 .into_iter()
                 .map(|entry| entry.path)
                 .collect::<Vec<_>>(),
-            tmp.path(),
+            root,
         );
         let mock_names = relative_names(
             &mock
@@ -1668,11 +1621,8 @@ async fn parity_walk_dir_follow_links_agrees_without_symlinks() {
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_remove_file_if_current_token_removes() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    let real_file = tmp.path().join("lock");
+async fn remove_file_if_current_token_removes(real: &dyn System, root: &Path) {
+    let real_file = root.join("lock");
     let real_token = real
         .write(&real_file, b"a", Condition::Absent)
         .await
@@ -1690,11 +1640,8 @@ async fn parity_remove_file_if_current_token_removes() {
     assert!(!mock.exists(mock_file).await.unwrap());
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_remove_file_if_stale_token_keeps() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    let real_file = tmp.path().join("lock");
+async fn remove_file_if_stale_token_keeps(real: &dyn System, root: &Path) {
+    let real_file = root.join("lock");
     let real_stale = real
         .write(&real_file, b"a", Condition::Absent)
         .await
@@ -1714,31 +1661,24 @@ async fn parity_remove_file_if_stale_token_keeps() {
     assert_eq!(mock.read_to_string(mock_file).await.unwrap(), "b");
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_remove_file_if_missing_is_not_found() {
+async fn remove_file_if_missing_is_not_found(real: &dyn System, root: &Path) {
     let token = RevisionToken::new("any");
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
     let mock = MemorySystem::new().with_dir("/work").unwrap();
 
     assert_both_err_kind(
-        real.remove_file_if(&tmp.path().join("missing"), &token)
-            .await,
+        real.remove_file_if(&root.join("missing"), &token).await,
         mock.remove_file_if(Path::new("/work/missing"), &token)
             .await,
         ErrorKind::NotFound,
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_remove_file_if_missing_parent_is_not_found() {
+async fn remove_file_if_missing_parent_is_not_found(real: &dyn System, root: &Path) {
     let token = RevisionToken::new("any");
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
     let mock = MemorySystem::new().with_dir("/work").unwrap();
 
     assert_both_err_kind(
-        real.remove_file_if(&tmp.path().join("missing/lock"), &token)
+        real.remove_file_if(&root.join("missing/lock"), &token)
             .await,
         mock.remove_file_if(Path::new("/work/missing/lock"), &token)
             .await,
@@ -1746,12 +1686,9 @@ async fn parity_remove_file_if_missing_parent_is_not_found() {
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_remove_file_if_of_a_dir_is_a_directory() {
+async fn remove_file_if_of_a_dir_is_a_directory(real: &dyn System, root: &Path) {
     let token = RevisionToken::new("any");
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    let real_dir = tmp.path().join("d");
+    let real_dir = root.join("d");
     real.create_dir_all(&real_dir).await.unwrap();
     let mock = MemorySystem::new().with_dir("/work/d").unwrap();
 
@@ -1762,13 +1699,10 @@ async fn parity_remove_file_if_of_a_dir_is_a_directory() {
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_remove_file_if_below_a_file_is_not_a_directory() {
+async fn remove_file_if_below_a_file_is_not_a_directory(real: &dyn System, root: &Path) {
     let token = RevisionToken::new("any");
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
     let mock = MemorySystem::new().with_dir("/work").unwrap();
-    real.write(&tmp.path().join("a.md"), b"a", Condition::None)
+    real.write(&root.join("a.md"), b"a", Condition::None)
         .await
         .unwrap();
     mock.write(Path::new("/work/a.md"), b"a", Condition::None)
@@ -1776,8 +1710,7 @@ async fn parity_remove_file_if_below_a_file_is_not_a_directory() {
         .unwrap();
 
     assert_both_err_kind(
-        real.remove_file_if(&tmp.path().join("a.md/b.md"), &token)
-            .await,
+        real.remove_file_if(&root.join("a.md/b.md"), &token).await,
         mock.remove_file_if(Path::new("/work/a.md/b.md"), &token)
             .await,
         ErrorKind::NotADirectory,
@@ -1858,23 +1791,100 @@ async fn parity_remove_file_if_after_a_rewrite_keeps_the_new_file() {
     assert_eq!(from_disk, "two");
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parity_read_dir_of_a_missing_folder_and_of_a_file() {
-    let real = RealSystem::new();
-    let tmp = real.create_temp_dir().await.unwrap();
-    real.write(&tmp.path().join("f.txt"), b"f", Condition::None)
+async fn read_dir_of_a_missing_folder_and_of_a_file(real: &dyn System, root: &Path) {
+    real.write(&root.join("f.txt"), b"f", Condition::None)
         .await
         .unwrap();
     let mock = MemorySystem::new().with_file("/work/f.txt", b"f").unwrap();
 
     assert_both_err_kind(
-        real.read_dir(&tmp.path().join("missing")).await,
+        real.read_dir(&root.join("missing")).await,
         mock.read_dir(Path::new("/work/missing")).await,
         ErrorKind::NotFound,
     );
     assert_both_err_kind(
-        real.read_dir(&tmp.path().join("f.txt")).await,
+        real.read_dir(&root.join("f.txt")).await,
         mock.read_dir(Path::new("/work/f.txt")).await,
         ErrorKind::NotADirectory,
     );
+}
+
+#[cfg(minio_tests)]
+#[tokio::test(flavor = "current_thread")]
+async fn the_same_code_runs_on_the_server() {
+    run_on_the_server("release_lock", async |system: &dyn System, root: &Path| {
+        release_lock(system, root).await.unwrap();
+    })
+    .await;
+}
+
+#[cfg(minio_tests)]
+#[tokio::test(flavor = "current_thread")]
+async fn boxed_systems_answer_the_same_through_dyn_system_on_the_server() {
+    run_on_the_server("read_back", async |system: &dyn System, root: &Path| {
+        let memory: Box<dyn System> = Box::new(MemorySystem::new());
+        assert_eq!(
+            read_back(system, root).await,
+            read_back(&*memory, Path::new("/work")).await
+        );
+    })
+    .await;
+}
+
+#[cfg(minio_tests)]
+#[tokio::test(flavor = "current_thread")]
+async fn parity_remove_file_if_after_a_rewrite_keeps_the_new_file_on_the_server() {
+    run_on_the_server(
+        "rewrite_then_release",
+        async |system: &dyn System, root: &Path| {
+            let from_memory =
+                rewrite_then_release_with_the_first_token(&MemorySystem::new(), Path::new("/"))
+                    .await;
+            assert_eq!(
+                rewrite_then_release_with_the_first_token(system, root).await,
+                from_memory
+            );
+        },
+    )
+    .await;
+}
+
+#[cfg(s3_tests)]
+#[tokio::test(flavor = "current_thread")]
+async fn the_same_code_runs_on_aws() {
+    run_on_aws("release_lock", async |system: &dyn System, root: &Path| {
+        release_lock(system, root).await.unwrap();
+    })
+    .await;
+}
+
+#[cfg(s3_tests)]
+#[tokio::test(flavor = "current_thread")]
+async fn boxed_systems_answer_the_same_through_dyn_system_on_aws() {
+    run_on_aws("read_back", async |system: &dyn System, root: &Path| {
+        let memory: Box<dyn System> = Box::new(MemorySystem::new());
+        assert_eq!(
+            read_back(system, root).await,
+            read_back(&*memory, Path::new("/work")).await
+        );
+    })
+    .await;
+}
+
+#[cfg(s3_tests)]
+#[tokio::test(flavor = "current_thread")]
+async fn parity_remove_file_if_after_a_rewrite_keeps_the_new_file_on_aws() {
+    run_on_aws(
+        "rewrite_then_release",
+        async |system: &dyn System, root: &Path| {
+            let from_memory =
+                rewrite_then_release_with_the_first_token(&MemorySystem::new(), Path::new("/"))
+                    .await;
+            assert_eq!(
+                rewrite_then_release_with_the_first_token(system, root).await,
+                from_memory
+            );
+        },
+    )
+    .await;
 }

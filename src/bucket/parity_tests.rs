@@ -11,7 +11,7 @@ use crate::error::Result;
 #[cfg(minio_tests)]
 use crate::error::{ErrorKind, StorageError};
 use crate::{FileMetadata, WalkEntry};
-#[cfg(minio_tests)]
+#[cfg(any(minio_tests, s3_tests))]
 use aws_sdk_s3::primitives::ByteStream;
 #[cfg(s3_tests)]
 use aws_sdk_s3::types::BucketLocationConstraint;
@@ -28,6 +28,8 @@ use std::path::{Path, PathBuf};
 use std::process;
 #[cfg(minio_tests)]
 use std::sync::OnceLock;
+#[cfg(minio_tests)]
+use std::thread;
 use tokio::runtime::{Builder, Runtime};
 
 #[cfg(minio_tests)]
@@ -69,14 +71,21 @@ fn runtime() -> Runtime {
 }
 
 #[cfg(minio_tests)]
-/// The configuration of a server whose bucket exists, made by `ensure` once per test binary.
+/// The configuration of a server whose bucket exists, made by `ensure` once per test binary on a thread of its own.
 fn ready_config() -> MinioConfig {
     static CREATED: OnceLock<()> = OnceLock::new();
     let config = config();
     CREATED.get_or_init(|| {
-        runtime()
-            .block_on(MinioBucket::new(config.clone()).ensure())
-            .unwrap();
+        thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    runtime()
+                        .block_on(MinioBucket::new(config.clone()).ensure())
+                        .unwrap();
+                })
+                .join()
+                .unwrap();
+        });
     });
     config
 }
@@ -1474,4 +1483,99 @@ fn observe_a_put_with_the_tag_stripped_of_its_quotes_on_aws() {
     eprintln!("put with an unquoted tag: {}", put_line(&answer));
     eprintln!("object afterwards: {}", get_line(&bucket.get(&path)));
     remove_prefix(&bucket, &prefix);
+}
+
+/// Every object written, copied or renamed has a modification time when read back.
+fn modification_times<B>(bucket: &BlockingBucket<B>, base: &str) -> Vec<String>
+where
+    B: Bucket,
+{
+    ensure_folder(bucket, base);
+    let note = at(base, "note.md");
+    let empty = at(base, "empty.md");
+    let copied = at(base, "copied.md");
+    let moved = at(base, "moved.md");
+    bucket.put(&note, b"# Note\n", &Condition::None).unwrap();
+    bucket.put(&empty, b"", &Condition::None).unwrap();
+    bucket.copy(&note, &copied).unwrap();
+    bucket.rename(&copied, &moved).unwrap();
+    [note, empty, moved]
+        .iter()
+        .map(|path| {
+            format!(
+                "{} modified {}",
+                path.display(),
+                bucket.head(path).unwrap().modified.is_some()
+            )
+        })
+        .collect()
+}
+
+#[cfg(any(minio_tests, s3_tests))]
+#[test]
+fn every_object_has_a_modification_time() {
+    #[cfg(minio_tests)]
+    {
+        let bucket = server();
+        let transcript = modification_times(&bucket, "/modification-times");
+        drop(bucket.remove_folder(Path::new("/modification-times")));
+        assert_eq!(
+            transcript,
+            [
+                "/modification-times/note.md modified true",
+                "/modification-times/empty.md modified true",
+                "/modification-times/moved.md modified true",
+            ]
+        );
+    }
+    #[cfg(s3_tests)]
+    {
+        let bucket = aws();
+        let prefix = run_prefix("modification-times");
+        let transcript = modification_times(&bucket, &prefix);
+        remove_prefix(&bucket, &prefix);
+        assert_eq!(
+            transcript,
+            [
+                format!("{prefix}/note.md modified true"),
+                format!("{prefix}/empty.md modified true"),
+                format!("{prefix}/moved.md modified true"),
+            ]
+        );
+    }
+}
+
+/// A file and a folder under one path: puts at `a` and `a/b` both succeed, and `/a` reads as the file.
+#[cfg(s3_tests)]
+#[test]
+fn a_file_and_a_folder_share_a_path_on_aws() {
+    let bucket = aws();
+    let sdk = aws_client();
+    let prefix = run_prefix("file-and-folder");
+    ensure_folder(&bucket, &prefix);
+    let key_base = prefix.trim_start_matches('/').to_owned();
+    let puts: Vec<bool> = [format!("{key_base}/a"), format!("{key_base}/a/b")]
+        .iter()
+        .map(|key| {
+            runtime()
+                .block_on(
+                    sdk.put_object()
+                        .bucket(aws_variable("OS_SHIM_S3_BUCKET"))
+                        .key(key)
+                        .body(ByteStream::from_static(b"x"))
+                        .send(),
+                )
+                .is_ok()
+        })
+        .collect();
+    let transcript = vec![
+        kind_line(&bucket.head(&at(&prefix, "a"))),
+        get_line(&bucket.get(&at(&prefix, "a/b"))),
+    ];
+    remove_prefix(&bucket, &prefix);
+    assert_eq!(puts, [true, true]);
+    assert_eq!(
+        transcript,
+        ["file true dir false size 1 token true", "bytes [120]"]
+    );
 }
