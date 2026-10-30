@@ -11,7 +11,7 @@ A mockable layer between Rust code and the machine it runs on. Code written agai
 | Zip archives of a tree, and trees loaded from archives | `archive`, `System::to_zip_*` | the same, over `MemorySystem` | `zip` |
 | Files and folders in a bucket (`Bucket`) | `DiskBucket`, and `MinioBucket`, `S3Bucket` for S3-compatible stores | `MemoryBucket` | always; `minio`, `s3` for the two clients |
 
-No feature is on by default.
+No feature is on by default. os-shim needs Rust 1.89 or newer; the `minio` and `s3` features need 1.94.1, because of the AWS crates.
 
 ## The system
 

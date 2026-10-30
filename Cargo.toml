@@ -2,6 +2,7 @@
 name = "os-shim"
 version = "0.2.0"
 edition = "2024"
+rust-version = "1.89"
 authors = ["Eduardo Burgos <eduardo@tixena.com>"]
 description = "Mockable abstraction over the environment, filesystem, processes, zip archives and S3-compatible buckets, with in-memory twins for tests"
 license = "MIT"
