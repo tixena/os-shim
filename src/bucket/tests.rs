@@ -3,6 +3,7 @@
 #![cfg(any(feature = "minio", feature = "s3"))]
 
 use super::paths::key_of;
+use super::streams::{COPY_MAX_BYTES, COPY_MIN_BYTES, copy_ranges};
 use super::{
     BlockingBucket, Bucket as _, Condition, Depth, Guarantee, MemoryBucket, RevisionToken,
 };
@@ -275,6 +276,7 @@ fn read_request(request_line: &str, reader: &mut BufReader<TcpStream>) -> String
     let mut acl = None;
     let mut copy_source = None;
     let mut range = None;
+    let mut copy_range = None;
     loop {
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
@@ -287,6 +289,7 @@ fn read_request(request_line: &str, reader: &mut BufReader<TcpStream>) -> String
             "if-none-match" => if_none_match = Some(value.trim().to_owned()),
             "x-amz-acl" => acl = Some(value.trim().to_owned()),
             "x-amz-copy-source" => copy_source = Some(value.trim().to_owned()),
+            "x-amz-copy-source-range" => copy_range = Some(value.trim().to_owned()),
             "range" => range = Some(value.trim().to_owned()),
             _ => {}
         }
@@ -308,6 +311,7 @@ fn read_request(request_line: &str, reader: &mut BufReader<TcpStream>) -> String
     parts.extend(if_none_match.map(|value| format!("if-none-match={value}")));
     parts.extend(acl.map(|value| format!("acl={value}")));
     parts.extend(copy_source.map(|value| format!("copy-source={value}")));
+    parts.extend(copy_range.map(|value| format!("copy-range={value}")));
     parts.extend(range.map(|value| format!("range={value}")));
     parts.extend(location.map(|region| format!("location={region}")));
     parts.join(" ")
@@ -2105,7 +2109,7 @@ async fn minio_append_stream_to_a_6_mib_object_copies_it_as_the_first_part() {
             "GET if-match=-",
             "HEAD if-match=-",
             "POST if-match=-",
-            "PUT if-match=- copy-source=archie/big.bin",
+            "PUT if-match=- copy-source=archie/big.bin copy-range=bytes=0-6291455",
             "PUT if-match=- len=1048576",
             "POST if-match=\"t\""
         ]
@@ -2118,6 +2122,91 @@ async fn minio_append_stream_to_a_6_mib_object_copies_it_as_the_first_part() {
             "{sent:?}"
         );
     }
+}
+
+#[test]
+fn copy_ranges_cover_every_byte_once_within_the_part_limits() {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    for length in [
+        COPY_MIN_BYTES,
+        COPY_MAX_BYTES,
+        COPY_MAX_BYTES + 1,
+        12 * GIB,
+        10_000 * COPY_MAX_BYTES,
+    ] {
+        let ranges = copy_ranges(length);
+        assert!(ranges.len() <= 10_000, "{length}");
+        let mut next = 0_u64;
+        for (first, last) in ranges {
+            assert_eq!(first, next, "{length}");
+            let size = last.saturating_sub(first).saturating_add(1);
+            assert!(
+                (COPY_MIN_BYTES..=COPY_MAX_BYTES).contains(&size),
+                "{length}"
+            );
+            next = last.saturating_add(1);
+        }
+        assert_eq!(next, length, "{length}");
+    }
+    assert_eq!(copy_ranges(COPY_MAX_BYTES), [(0, COPY_MAX_BYTES - 1)]);
+    assert_eq!(
+        copy_ranges(12 * GIB),
+        [
+            (0, 0xFFFF_FFFF),
+            (0x1_0000_0000, 0x1_FFFF_FFFF),
+            (0x2_0000_0000, 0x2_FFFF_FFFF)
+        ]
+    );
+}
+
+#[cfg(feature = "minio")]
+#[tokio::test(flavor = "current_thread")]
+async fn minio_append_stream_to_a_12_gib_object_copies_it_in_three_ranged_parts() {
+    let (endpoint, seen) = canned(vec![
+        empty_page(),
+        sized(12 * 1024 * 1024 * 1024),
+        upload_started(),
+        part_copied("c1"),
+        part_copied("c2"),
+        part_copied("c3"),
+        part_stored("p4"),
+        upload_completed(),
+    ]);
+    let bucket = MinioBucket::new(minio_config(endpoint));
+    let mut writer = bucket.append_stream(Path::new(BIG)).await.unwrap();
+    writer.write_all(&vec![1_u8; 1024 * 1024]).await.unwrap();
+    writer.close().await.unwrap();
+    assert_eq!(
+        requests(&seen),
+        [
+            "GET if-match=-",
+            "HEAD if-match=-",
+            "POST if-match=-",
+            "PUT if-match=- copy-source=archie/big.bin copy-range=bytes=0-4294967295",
+            "PUT if-match=- copy-source=archie/big.bin copy-range=bytes=4294967296-8589934591",
+            "PUT if-match=- copy-source=archie/big.bin copy-range=bytes=8589934592-12884901887",
+            "PUT if-match=- len=1048576",
+            "POST if-match=\"t\""
+        ]
+    );
+}
+
+#[cfg(feature = "minio")]
+#[tokio::test(flavor = "current_thread")]
+async fn minio_append_stream_with_the_second_range_refused_aborts_and_is_precondition_failed() {
+    let (endpoint, seen) = canned(vec![
+        empty_page(),
+        sized(12 * 1024 * 1024 * 1024),
+        upload_started(),
+        part_copied("c1"),
+        answer("412 Precondition Failed", "", ""),
+        answer("204 No Content", "", ""),
+    ]);
+    let bucket = MinioBucket::new(minio_config(endpoint));
+    let error = bucket.append_stream(Path::new(BIG)).await.err().unwrap();
+    assert_eq!(error.kind(), ErrorKind::PreconditionFailed);
+    assert_eq!(requests(&seen).last().unwrap(), "DELETE if-match=-");
+    assert_eq!(requests(&seen).len(), 6);
 }
 
 #[cfg(feature = "minio")]
