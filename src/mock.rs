@@ -7,10 +7,10 @@
 //!
 //! # What it holds
 //!
-//! One `MemorySystem` holds a [`Bucket`](crate::bucket::Bucket) with its files
+//! One `MemorySystem` holds a [`Bucket`] with its files
 //! and folders, environment variables, a current folder, a current executable
 //! path, a clock and (with the `process` feature) a set of live process ids.
-//! `MemorySystem::new()` holds a [`MemoryBucket`](crate::bucket::MemoryBucket)
+//! `MemorySystem::new()` holds a [`MemoryBucket`]
 //! that stamps files from the system's own clock;
 //! [`with_bucket`](MemorySystem::with_bucket) holds another bucket, which keeps
 //! its own clock. A new one starts with:

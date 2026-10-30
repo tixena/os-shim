@@ -163,7 +163,7 @@
 //!
 //! ## Locks that expire, tested without waiting
 //!
-//! A lock file is made with [`Condition::Absent`](bucket::Condition::Absent),
+//! A lock file is made with [`Condition::Absent`],
 //! which fails with `AlreadyExists` when someone else holds it, and the write
 //! gives back the file's [`RevisionToken`]. The lock is stale when its age
 //! passes a limit, and it is released with [`System::remove_file_if`], which
