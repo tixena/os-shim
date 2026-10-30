@@ -38,33 +38,17 @@ lint-features:
     cargo clippy --all-targets --features zip -- -D warnings
     cargo clippy --all-targets --features minio -- -D warnings
     cargo clippy --all-targets --features s3 -- -D warnings
-    cargo clippy --all-targets --features async -- -D warnings
     cargo clippy --all-targets --features process,zip -- -D warnings
     cargo clippy --all-targets --features process,minio -- -D warnings
     cargo clippy --all-targets --features process,s3 -- -D warnings
-    cargo clippy --all-targets --features process,async -- -D warnings
     cargo clippy --all-targets --features zip,minio -- -D warnings
     cargo clippy --all-targets --features zip,s3 -- -D warnings
-    cargo clippy --all-targets --features zip,async -- -D warnings
     cargo clippy --all-targets --features minio,s3 -- -D warnings
-    cargo clippy --all-targets --features minio,async -- -D warnings
-    cargo clippy --all-targets --features s3,async -- -D warnings
     cargo clippy --all-targets --features process,zip,minio -- -D warnings
     cargo clippy --all-targets --features process,zip,s3 -- -D warnings
-    cargo clippy --all-targets --features process,zip,async -- -D warnings
     cargo clippy --all-targets --features process,minio,s3 -- -D warnings
-    cargo clippy --all-targets --features process,minio,async -- -D warnings
-    cargo clippy --all-targets --features process,s3,async -- -D warnings
     cargo clippy --all-targets --features zip,minio,s3 -- -D warnings
-    cargo clippy --all-targets --features zip,minio,async -- -D warnings
-    cargo clippy --all-targets --features zip,s3,async -- -D warnings
-    cargo clippy --all-targets --features minio,s3,async -- -D warnings
     cargo clippy --all-targets --features process,zip,minio,s3 -- -D warnings
-    cargo clippy --all-targets --features process,zip,minio,async -- -D warnings
-    cargo clippy --all-targets --features process,zip,s3,async -- -D warnings
-    cargo clippy --all-targets --features process,minio,s3,async -- -D warnings
-    cargo clippy --all-targets --features zip,minio,s3,async -- -D warnings
-    cargo clippy --all-targets --features process,zip,minio,s3,async -- -D warnings
 
 # Run tests across every feature combination that ships
 test-features:
@@ -74,33 +58,17 @@ test-features:
     cargo test --features zip
     cargo test --features minio
     cargo test --features s3
-    cargo test --features async
     cargo test --features process,zip
     cargo test --features process,minio
     cargo test --features process,s3
-    cargo test --features process,async
     cargo test --features zip,minio
     cargo test --features zip,s3
-    cargo test --features zip,async
     cargo test --features minio,s3
-    cargo test --features minio,async
-    cargo test --features s3,async
     cargo test --features process,zip,minio
     cargo test --features process,zip,s3
-    cargo test --features process,zip,async
     cargo test --features process,minio,s3
-    cargo test --features process,minio,async
-    cargo test --features process,s3,async
     cargo test --features zip,minio,s3
-    cargo test --features zip,minio,async
-    cargo test --features zip,s3,async
-    cargo test --features minio,s3,async
     cargo test --features process,zip,minio,s3
-    cargo test --features process,zip,minio,async
-    cargo test --features process,zip,s3,async
-    cargo test --features process,minio,s3,async
-    cargo test --features zip,minio,s3,async
-    cargo test --features process,zip,minio,s3,async
 
 # The opt-in expensive tests compile only under `cfg(slow_tests)`, which no other
 # recipe sets.

@@ -7,7 +7,6 @@ A mockable layer between Rust code and the machine it runs on. Code written agai
 | Piece | Real implementation | In-memory twin | Feature |
 |---|---|---|---|
 | Environment, files, folders, temporary directories (`System`) | `RealSystem` | `MemorySystem` | always |
-| A wait that does not hold the thread (`System::sleep_async`) | `RealSystem`, on tokio's timer | `MemorySystem` | `async` |
 | Whether a process is alive (`System::is_pid_alive`) | `RealSystem` | `MemorySystem::with_pid` | `process` |
 | Zip archives of a tree, and trees loaded from archives | `archive`, `System::to_zip_*` | the same, over `MemorySystem` | `zip` |
 | Objects in a bucket of an S3-compatible store | `MinioBucket`, `S3Bucket` | `MemoryBucket` | `minio`, `s3` |
@@ -32,7 +31,7 @@ let system = MemorySystem::new()
 assert_eq!(config_path(&system).await?, "debug = true");
 ```
 
-In production the same function takes `&os_shim::real::RealSystem::new()`, which reads `std::env` and keeps its files on the local disk. Every file operation is async and is carried out by the bucket the system holds: `RealSystem::with_bucket` and `MemorySystem::with_bucket` hold any other. `System` covers environment variables, the current directory and executable, reading, writing, appending, copying, renaming and removing files, removing a file only while it still has the revision token the caller read, folders and their walks, metadata, temporary directories that are removed on drop, the current time, and a wait that `MemorySystem` answers by moving its clock. `MemorySystem`'s clock starts at the Unix epoch; `with_now` sets it, `advance` moves it forward, and each file `MemorySystem` writes takes its modification time from it.
+In production the same function takes `&os_shim::real::RealSystem::new()`, which reads `std::env` and keeps its files on the local disk. Every file operation is async and is carried out by the bucket the system holds: `RealSystem::with_bucket` and `MemorySystem::with_bucket` hold any other. `System` covers environment variables, the current directory and executable, reading, writing, appending, copying, renaming and removing files, removing a file only while it still has the revision token the caller read, folders and their walks, metadata, temporary directories that are removed on drop and live on local storage whatever the bucket is, the current time, and an async wait that `RealSystem` spends on a thread of its own, with no runtime, and `MemorySystem` answers by moving its clock. `MemorySystem`'s clock starts at the Unix epoch; `with_now` sets it, `advance` moves it forward, and each file `MemorySystem` writes takes its modification time from it.
 
 ## Zip archives (`zip`)
 
@@ -51,7 +50,7 @@ assert_eq!(loaded.read_to_string(Path::new("/src/main.rs")).await?, "fn main() {
 
 `System::to_zip_stream`, `to_zip_vec` and `to_zip_writer` archive a tree. `archive::load_zip` loads an archive from a stream, `archive::load_zip_seekable` from a seekable reader, including archives whose entries carry data descriptors. `archive::ZipStreamWriter` writes an archive one entry at a time into a sink that cannot seek.
 
-## Buckets (`minio`, `s3`, `async`)
+## Buckets (`minio`, `s3`)
 
 Files and folders in one bucket, each put and delete under an optional condition:
 
@@ -103,7 +102,7 @@ let bucket = BlockingBucket::new(MinioBucket::new(config))?;
 
 `S3Config::new(region, bucket, access_key, secret_key)` builds an `S3Bucket` the same way. `with_prefix` on either configuration puts every key under a prefix. Both configurations print the secret key as `<redacted>` in `Debug`.
 
-`BlockingBucket` runs each call on a tokio runtime of its own, so synchronous code needs no runtime; calling it from inside a tokio runtime panics. With the `async` feature, the `Bucket` trait itself is public and asynchronous code awaits the clients directly; it also turns on `System::sleep_async`, which `RealSystem` awaits on tokio's timer, inside a tokio runtime with its timer on. A bucket example:
+`BlockingBucket` runs each call on a tokio runtime of its own, so synchronous code needs no runtime; calling it from inside a tokio runtime panics. The `Bucket` trait itself is public and asynchronous code awaits the clients directly. A bucket example:
 
 ```rust
 use os_shim::bucket::{Bucket as _, Condition, MemoryBucket};

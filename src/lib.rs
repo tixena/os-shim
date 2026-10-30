@@ -30,10 +30,9 @@
 //!
 //! | Piece | Real version | In-memory version | Feature |
 //! | --- | --- | --- | --- |
-//! | Environment, files, folders, metadata, temporary directories, clock, sleep | [`RealSystem`](real::RealSystem) | [`MemorySystem`](mock::MemorySystem) | none |
+//! | Environment, files, folders, metadata, temporary directories, clock, async sleep | [`RealSystem`](real::RealSystem), which sleeps on a thread of its own | [`MemorySystem`](mock::MemorySystem), which moves its clock | none |
 //! | Compare-and-delete and create-new writes (lock files) | [`System::write`], [`System::remove_file_if`] | same methods | none |
 //! | Files in another bucket | [`RealSystem::with_bucket`](real::RealSystem::with_bucket) | [`MemorySystem::with_bucket`](mock::MemorySystem::with_bucket) | none |
-//! | Async sleep | [`RealSystem`](real::RealSystem) uses tokio's timer | `MemorySystem` moves its clock | `async` |
 //! | Is a process alive | `kill(pid, 0)` on Unix | `MemorySystem::with_pid` | `process` |
 //! | Zip a tree, unzip into a system | async `to_zip_*` methods, the `archive` module | `MemorySystem::from_zip_reader`, `MemorySystem::from_zip_stream` | `zip` |
 //! | Files and folders in a bucket with conditional writes | `MinioBucket` (`MinIO`, `RustFS`), `S3Bucket` (AWS) in the `bucket` module | `MemoryBucket`, plus `BlockingBucket` for sync code | `minio` or `s3` for the clients |
@@ -55,8 +54,7 @@
 //!   [`is_file`](System::is_file), [`metadata`](System::metadata),
 //!   [`canonicalize`](System::canonicalize).
 //! - Temporary directories: [`create_temp_dir`](System::create_temp_dir).
-//! - Clock and sleep: [`now`](System::now), [`sleep`](System::sleep), and
-//!   `sleep_async` with the `async` feature.
+//! - Clock and sleep: [`now`](System::now) and the async [`sleep`](System::sleep).
 //! - Processes: `is_pid_alive`, with the `process` feature.
 //! - Archives: `to_zip_vec`, `to_zip_stream` and `to_zip_writer`, with the
 //!   `zip` feature.
@@ -71,7 +69,7 @@
 //! os-shim = "0.1"
 //!
 //! # With the optional parts:
-//! # os-shim = { version = "0.1", features = ["zip", "minio", "async"] }
+//! # os-shim = { version = "0.1", features = ["zip", "minio"] }
 //! ```
 //!
 //! Write the code against [`System`]. Pass [`RealSystem`](real::RealSystem) in
@@ -154,8 +152,7 @@
 //! | `std::fs::canonicalize(path)` | [`system.canonicalize(path)`](System::canonicalize) |
 //! | `tempfile::tempdir()` | [`system.create_temp_dir()`](System::create_temp_dir) |
 //! | `SystemTime::now()` | [`system.now()`](System::now) |
-//! | `std::thread::sleep(duration)` | [`system.sleep(duration)`](System::sleep) |
-//! | `tokio::time::sleep(duration)` | `system.sleep_async(duration).await` (`async` feature) |
+//! | `std::thread::sleep(duration)`, `tokio::time::sleep(duration)` | [`system.sleep(duration).await`](System::sleep) |
 //!
 //! Two things differ from the standard library. `Path::exists` hides errors
 //! and returns `false`; `system.exists` returns a `Result<bool>`, so add
@@ -219,8 +216,8 @@
 //!
 //! ## Retry and backoff with no real waiting
 //!
-//! [`System::sleep`] waits on a real machine. On a `MemorySystem` it moves the
-//! clock and returns at once, so a test can assert on how long the code would
+//! Awaiting [`System::sleep`] waits on a real machine. On a `MemorySystem` it
+//! moves the clock and returns at once, so a test can assert on how long the code would
 //! have waited.
 //!
 //! ```
@@ -228,7 +225,7 @@
 //! use std::io;
 //! use std::time::Duration;
 //!
-//! fn retry<T>(
+//! async fn retry<T>(
 //!     system: &dyn System,
 //!     attempts: u32,
 //!     mut operation: impl FnMut() -> io::Result<T>,
@@ -243,24 +240,30 @@
 //!                 if tried >= attempts {
 //!                     return Err(error);
 //!                 }
-//!                 system.sleep(delay)?;
+//!                 system.sleep(delay).await?;
 //!                 delay *= 2;
 //!             }
 //!         }
 //!     }
 //! }
 //!
+//! # fn main() -> std::io::Result<()> {
+//! # tokio::runtime::Builder::new_current_thread().build()?.block_on(async {
 //! let system = MemorySystem::new();
 //! let start = system.now();
 //! let mut calls = 0;
 //! let result = retry(&system, 5, || {
 //!     calls += 1;
 //!     if calls < 4 { Err(io::Error::other("busy")) } else { Ok(calls) }
-//! });
+//! })
+//! .await;
 //!
 //! assert_eq!(result.unwrap(), 4);
 //! let waited = system.now().duration_since(start).unwrap();
 //! assert_eq!(waited, Duration::from_secs(1 + 2 + 4));
+//! # Ok(())
+//! # })
+//! # }
 //! ```
 //!
 //! ## Tests of tree-walking code, with no temporary directories
@@ -390,35 +393,9 @@
 //! # }
 //! ```
 //!
-//! ## Waiting in async code
-//!
-//! Available with the `async` feature. [`System::sleep`] blocks the thread, so
-//! async code calls `sleep_async` and awaits it. On a `MemorySystem` the await
-//! moves the clock and returns at once.
-//!
-//! ```
-//! # #[cfg(feature = "async")]
-//! # {
-//! use os_shim::{System, mock::MemorySystem};
-//! use std::io;
-//! use std::time::Duration;
-//!
-//! async fn pause<S: System>(system: &S, delay: Duration) -> io::Result<()> {
-//!     Ok(system.sleep_async(delay).await?)
-//! }
-//!
-//! let system = MemorySystem::new();
-//! let start = system.now();
-//! let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
-//! runtime.block_on(pause(&system, Duration::from_secs(30))).unwrap();
-//!
-//! assert_eq!(system.now().duration_since(start).unwrap(), Duration::from_secs(30));
-//! # }
-//! ```
-//!
 //! ## Conditional writes against object storage
 //!
-//! Available with the `async` and `minio` features (`s3` for AWS). Write the
+//! Available with the `minio` feature (`s3` for AWS). Write the
 //! code against a generic `B: Bucket`. A put with `Condition::Absent` succeeds
 //! for one caller only, which makes a claim on a key. Production builds a
 //! `MinioBucket` from a `MinioConfig`; a test uses `MemoryBucket`, with no
@@ -426,7 +403,7 @@
 //! guarded by an entity tag.
 //!
 //! ```
-//! # #[cfg(all(feature = "async", feature = "minio"))]
+//! # #[cfg(feature = "minio")]
 //! # {
 //! use os_shim::bucket::{Bucket, Condition, MemoryBucket, MinioBucket, MinioConfig};
 //! use os_shim::error::{ErrorKind, StorageError};
@@ -478,9 +455,9 @@
 //!   the size and the modification time.
 //! - `set_env_var` changes only that system. `RealSystem` changes the whole
 //!   process.
-//! - `create_temp_dir` makes `/tmp/mock_<n>` inside the system's bucket, never a real folder.
+//! - `create_temp_dir` makes `/tmp/mock_<n>` in the system's local storage, never a real folder.
 //! - The clock starts at `SystemTime::UNIX_EPOCH` and moves only when the test
-//!   moves it. `sleep` returns at once.
+//!   moves it. Awaiting `sleep` returns at once.
 //! - A new system holds only the folder `/`, the current folder `/` and the
 //!   executable path `/mock/exe`.
 //!
@@ -490,8 +467,6 @@
 //!
 //! No feature is on by default. docs.rs builds with all of them.
 //!
-//! - `async`: adds `System::sleep_async`.
-//!   Needs tokio; `RealSystem` waits on tokio's timer.
 //! - `process`: adds `System::is_pid_alive` and `MemorySystem::with_pid`. Uses
 //!   `libc`, so it is for Unix.
 //! - `zip`: adds the `archive` module, the async `System::to_zip_stream`,
@@ -525,7 +500,6 @@ pub mod error;
 mod files;
 pub mod mock;
 pub mod real;
-#[cfg(any(test, feature = "zip"))]
 mod streams;
 
 #[cfg(test)]
@@ -640,8 +614,8 @@ impl FileMetadata {
 /// [`System::create_temp_dir`] returns one. Keep the handle alive for as long
 /// as the directory is needed.
 ///
-/// For `RealSystem`, this wraps `tempfile::TempDir` and uses real filesystem.
-/// For `MemorySystem`, this manages an in-memory temporary directory.
+/// The directory is on local storage: the machine's disk for `RealSystem`, the
+/// system's own memory for `MemorySystem`.
 pub trait TempDirHandle {
     fn path(&self) -> &Path;
 
@@ -689,7 +663,7 @@ pub trait TempDirHandle {
 /// - Folders: `create_dir_all`, `read_dir`, `walk_dir`, `remove_dir_all`.
 /// - Queries: `exists`, `is_dir`, `is_file`, `metadata`, `canonicalize`.
 /// - Temporary directories: `create_temp_dir`.
-/// - Time: `now`, `sleep`, and `sleep_async` with the `async` feature.
+/// - Time: `now` and the async `sleep`.
 /// - Processes: `is_pid_alive`, with the `process` feature.
 /// - Archives: `to_zip_stream`, `to_zip_vec`, `to_zip_writer`, with the `zip`
 ///   feature. They are provided methods, so an implementor gets them for free.
@@ -775,10 +749,16 @@ pub trait System: Send + Sync {
     /// the handle is dropped.
     ///
     /// # Note
-    /// For `RealSystem`, this uses `tempfile::TempDir` on the real filesystem,
-    /// under the machine's temporary location.
-    /// For `MemorySystem`, this creates a temporary directory in its bucket at
-    /// a path like `/tmp/mock_7`; the number is unique within the process.
+    /// The directory is on local storage whatever bucket the system holds, so
+    /// the path can go to a library or a child process. While the handle lives,
+    /// every path under the directory goes to local storage; every other path
+    /// goes to the bucket. `copy` and `rename` between the two move the bytes
+    /// through streams, and `rename` removes the source.
+    /// For `RealSystem`, this is a directory under the machine's temporary
+    /// location, removed from disk on drop.
+    /// For `MemorySystem`, this is a directory at a path like `/tmp/mock_7`,
+    /// the number unique within the process, in the same tree as its other
+    /// files when it was built by `new`.
     ///
     /// # Example
     ///
@@ -1061,8 +1041,9 @@ pub trait System: Send + Sync {
     /// ```
     fn set_env_var(&self, key: &str, value: &str);
 
-    /// Waits `duration`: on the machine in `RealSystem`; in `MemorySystem`,
-    /// it moves the clock `now` gives forward by `duration` and returns at once.
+    /// Waits `duration`: on a thread of its own in `RealSystem`, which needs no
+    /// runtime; in `MemorySystem`, it moves the clock forward by `duration`
+    /// when awaited.
     ///
     /// # Example
     ///
@@ -1070,36 +1051,24 @@ pub trait System: Send + Sync {
     /// use os_shim::{System, mock::MemorySystem};
     /// use std::time::Duration;
     ///
+    /// # fn main() -> std::io::Result<()> {
+    /// # tokio::runtime::Builder::new_current_thread().build()?.block_on(async {
     /// let system = MemorySystem::new();
     /// let before = system.now();
-    /// system.sleep(Duration::from_secs(30)).unwrap();
+    /// system.sleep(Duration::from_secs(30)).await.unwrap();
     /// let waited = system.now().duration_since(before).unwrap();
     /// assert_eq!(waited, Duration::from_secs(30));
+    /// # Ok(())
+    /// # })
+    /// # }
     /// ```
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - `MemorySystem`'s clock would overflow, or its state lock is poisoned.
-    fn sleep(&self, duration: Duration) -> Result<()>;
-
-    /// Waits `duration` without holding the thread: on tokio's timer in
-    /// `RealSystem`; in `MemorySystem`, it moves the clock forward by
-    /// `duration` when awaited.
-    ///
-    /// Available with the `async` feature.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - `MemorySystem`'s clock would overflow, or its state lock is poisoned.
-    ///
-    /// # Panics
-    ///
-    /// In `RealSystem`, when awaited outside a tokio runtime with its timer on
-    /// (`Builder::enable_time` or `Builder::enable_all`).
-    #[cfg(feature = "async")]
-    fn sleep_async(&self, duration: Duration) -> BoxFuture<'_, Result<()>>;
+    /// - `RealSystem` cannot start the thread.
+    fn sleep(&self, duration: Duration) -> BoxFuture<'_, Result<()>>;
 
     /// A pull-based zip stream of `source`, held in memory.
     ///

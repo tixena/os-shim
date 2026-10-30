@@ -58,7 +58,7 @@
 //! # Time
 //!
 //! The clock only moves when you move it. [`advance`](MemorySystem::advance)
-//! and [`System::sleep`] both add to it and return at once. Every file takes
+//! and awaiting [`System::sleep`] both add to it and return at once. Every file takes
 //! its modified time from the clock when it is written. A test for a lock that
 //! expires after 60 seconds therefore runs in microseconds:
 //!
@@ -72,7 +72,7 @@
 //! let system = MemorySystem::new().with_file("/app.lock", b"owner-1")?;
 //! let taken_at = system.metadata(Path::new("/app.lock")).await?.modified.unwrap_or(SystemTime::UNIX_EPOCH);
 //!
-//! system.sleep(Duration::from_secs(61))?;
+//! system.sleep(Duration::from_secs(61)).await?;
 //!
 //! let age = system.now().duration_since(taken_at)?;
 //! assert!(age > Duration::from_secs(60));
@@ -97,20 +97,21 @@
 //! - [`System::canonicalize`] only joins a relative path onto the current
 //!   folder. It does not check that the path exists.
 //! - [`System::read_dir`] gives no order. [`System::walk_dir`] sorts by path.
-//! - [`System::create_temp_dir`] gives `/tmp/mock_<n>` inside the system's
-//!   bucket, never a real folder.
+//! - [`System::create_temp_dir`] gives `/tmp/mock_<n>` in the system's local
+//!   storage, never a real folder. [`MemorySystem::new`] keeps that storage in
+//!   the same tree as its other files; over another bucket it is a tree of its
+//!   own, and the paths under it never reach the bucket.
 //!
 //! # Features
 //!
 //! - `process`: adds `MemorySystem::with_pid` and answers `System::is_pid_alive`.
-//! - `async`: adds `System::sleep_async`, which advances the clock when awaited.
 //! - `zip`: adds `MemorySystem::from_zip_reader` and `MemorySystem::from_zip_stream`.
 
 #[cfg(feature = "zip")]
 use crate::archive::{load_zip, load_zip_seekable};
 use crate::bucket::{Bucket, Condition, Guarantees, MemoryBucket, RevisionToken};
 use crate::error::Result;
-use crate::files::{self, Machine};
+use crate::files::{self, LiveTemps, LocalTempDir, Machine};
 use crate::{BoxFuture, FileMetadata, System, TempDirHandle, WalkEntry};
 use alloc::collections::BTreeMap;
 #[cfg(feature = "process")]
@@ -130,7 +131,6 @@ use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::{PoisonError, RwLock};
 use std::time::SystemTime;
-use tracing::error;
 
 /// Global counter for generating unique temp directory IDs.
 static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -140,8 +140,8 @@ static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// `MemorySystem` provides an in-memory filesystem, environment, clock and
 /// process table, for fast, isolated unit tests without side effects. Build one
 /// with [`new`](Self::new) and the `with_*` builders, then pass it where your
-/// code takes `&dyn System`. Use [`advance`](Self::advance) or [`System::sleep`]
-/// to move its clock.
+/// code takes `&dyn System`. Use [`advance`](Self::advance) or await
+/// [`System::sleep`] to move its clock.
 ///
 /// Its files live in the bucket `B`, a [`MemoryBucket`] by default.
 /// Clones share state: `system.clone()` is a second handle to the same files,
@@ -216,8 +216,12 @@ static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub struct MemorySystem<B = MemoryBucket> {
     /// The bucket that holds the files.
     bucket: B,
+    /// The storage for the paths under a live temporary directory.
+    local: MemoryBucket,
     /// Shared mutable state protected by a read-write lock.
     state: Arc<RwLock<MemorySystemState>>,
+    /// The roots of the temporary directories whose handles are alive.
+    temps: LiveTemps,
 }
 
 /// In-memory state backing the mock environment and clock.
@@ -238,7 +242,7 @@ struct MemorySystemState {
 impl<B: Bucket> MemorySystem<B> {
     /// Moves the time `now()` gives forward by `by`.
     ///
-    /// This is the clock that [`System::sleep`] moves too. Files written after
+    /// This is the clock that awaiting [`System::sleep`] moves too. Files written after
     /// the call take the new time as their modified time when the bucket is the
     /// system's own `MemoryBucket`. Files already written keep the time they had.
     ///
@@ -292,9 +296,13 @@ impl<B: Bucket> MemorySystem<B> {
     #[must_use]
     #[inline]
     pub fn with_bucket(bucket: B) -> Self {
+        let state = fresh_state();
+        let local = clocked_bucket(&state);
         Self {
             bucket,
-            state: fresh_state(),
+            local,
+            state,
+            temps: LiveTemps::default(),
         }
     }
 
@@ -549,14 +557,13 @@ impl MemorySystem<MemoryBucket> {
     #[inline]
     pub fn new() -> Self {
         let state = fresh_state();
-        let clock_state = Arc::clone(&state);
-        let bucket = MemoryBucket::new(Arc::new(move || {
-            clock_state
-                .read()
-                .unwrap_or_else(PoisonError::into_inner)
-                .now
-        }));
-        Self { bucket, state }
+        let bucket = clocked_bucket(&state);
+        Self {
+            local: bucket.clone(),
+            bucket,
+            state,
+            temps: LiveTemps::default(),
+        }
     }
 
     /// Add a directory and every folder above it (builder pattern).
@@ -650,11 +657,22 @@ impl Default for MemorySystem<MemoryBucket> {
 }
 
 impl<B: Bucket> Machine for MemorySystem<B> {
+    type Local = MemoryBucket;
     type Store = B;
+
+    #[inline]
+    fn local(&self) -> &MemoryBucket {
+        &self.local
+    }
 
     #[inline]
     fn store(&self) -> &B {
         &self.bucket
+    }
+
+    #[inline]
+    fn temps(&self) -> &LiveTemps {
+        &self.temps
     }
 
     #[inline]
@@ -704,9 +722,8 @@ impl<B: Bucket> System for MemorySystem<B> {
         Box::pin(async move {
             let id = TEMP_DIR_COUNTER.fetch_add(1, Ordering::SeqCst);
             let path = PathBuf::from(format!("/tmp/mock_{id}"));
-            self.bucket.create_folder(&path).await?;
-            let handle: Box<dyn TempDirHandle + 'system> =
-                Box::new(MemoryTempDir { path, system: self });
+            self.local.create_folder(&path).await?;
+            let handle: Box<dyn TempDirHandle + 'system> = Box::new(LocalTempDir::new(self, path));
             Ok(handle)
         })
     }
@@ -871,13 +888,7 @@ impl<B: Bucket> System for MemorySystem<B> {
     }
 
     #[inline]
-    fn sleep(&self, duration: Duration) -> Result<()> {
-        Ok(self.advance(duration)?)
-    }
-
-    #[cfg(feature = "async")]
-    #[inline]
-    fn sleep_async(&self, duration: Duration) -> BoxFuture<'_, Result<()>> {
+    fn sleep(&self, duration: Duration) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move { Ok(self.advance(duration)?) })
     }
 
@@ -902,66 +913,6 @@ impl<B: Bucket> System for MemorySystem<B> {
     }
 }
 
-/// In-memory temporary directory handle that cleans up on drop.
-///
-/// It cannot be built directly. [`System::create_temp_dir`] on a
-/// [`MemorySystem`] returns it as a `Box<dyn TempDirHandle>`. The folder is
-/// `/tmp/mock_<n>` inside the system's bucket, where `<n>` comes from a
-/// counter shared by every `MemorySystem` in the process. Dropping the handle
-/// removes the folder and everything in it.
-///
-/// ```
-/// use os_shim::{System, TempDirHandle, mock::MemorySystem};
-///
-/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// # tokio::runtime::Builder::new_current_thread().build()?.block_on(async {
-/// let system = MemorySystem::new();
-/// let dir = system.create_temp_dir().await?;
-/// let path = dir.path().to_path_buf();
-///
-/// assert!(path.starts_with("/tmp"));
-/// assert!(system.is_dir(&path).await?);
-///
-/// drop(dir);
-/// assert!(!system.exists(&path).await?);
-/// # Ok(())
-/// # })
-/// # }
-/// ```
-#[non_exhaustive]
-pub struct MemoryTempDir<'system, B: Bucket = MemoryBucket> {
-    /// Path to the temporary directory in the system's bucket.
-    path: PathBuf,
-    /// The system whose bucket holds the directory, for cleanup.
-    system: &'system MemorySystem<B>,
-}
-
-impl<B: Bucket> TempDirHandle for MemoryTempDir<'_, B> {
-    #[inline]
-    fn path(&self) -> &Path {
-        &self.path
-    }
-
-    #[cfg(feature = "zip")]
-    #[inline]
-    fn to_zip_stream(&self) -> BoxFuture<'_, Result<Box<dyn Read + Send>>> {
-        self.system.to_zip_stream(&self.path)
-    }
-}
-
-impl<B: Bucket> Drop for MemoryTempDir<'_, B> {
-    #[inline]
-    fn drop(&mut self) {
-        match ready_now(
-            "remove_folder",
-            self.system.bucket.remove_folder(&self.path),
-        ) {
-            Ok(()) => (),
-            Err(err) => error!("Failed to remove temporary directory: {err}"),
-        }
-    }
-}
-
 /// Runs `future`, which a memory bucket makes ready at once, in a single poll.
 fn ready_now<T, F>(operation: &str, future: F) -> io::Result<T>
 where
@@ -977,6 +928,17 @@ where
             "{operation} did not finish at once"
         ))),
     }
+}
+
+/// A memory bucket that stamps files from the clock in `state`.
+fn clocked_bucket(state: &Arc<RwLock<MemorySystemState>>) -> MemoryBucket {
+    let clock_state = Arc::clone(state);
+    MemoryBucket::new(Arc::new(move || {
+        clock_state
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .now
+    }))
 }
 
 /// The state of a new system.

@@ -51,7 +51,6 @@ tokio = { version = "1.51.6", features = ["rt", "macros", "test-util"] }
 
 [features]
 default = []
-async = ["dep:tokio", "tokio/time"]
 minio = ["dep:tokio", "dep:aws-sdk-s3"]
 process = ["libc"]
 s3 = ["dep:tokio", "dep:aws-sdk-s3"]
