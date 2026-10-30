@@ -4,9 +4,11 @@
 //! `System` covers environment variables, the current directory and
 //! executable, files, folders, metadata, temporary directories, the clock,
 //! sleeping and (with features) process checks, zip archives and object
-//! storage. [`RealSystem`](real::RealSystem) runs on `std::env` and `std::fs`;
-//! [`MemorySystem`](mock::MemorySystem) runs with no disk and a clock the test
-//! moves by hand.
+//! storage. Its file operations are async: each returns a boxed future, and
+//! the [`Bucket`](bucket::Bucket) the system holds carries them out.
+//! [`RealSystem`](real::RealSystem) holds the local disk and reads
+//! `std::env`; [`MemorySystem`](mock::MemorySystem) holds a
+//! [`MemoryBucket`](bucket::MemoryBucket) and a clock the test moves by hand.
 //!
 //! # The problem and who it is for
 //!
@@ -30,9 +32,10 @@
 //! | --- | --- | --- | --- |
 //! | Environment, files, folders, metadata, temporary directories, clock, sleep | [`RealSystem`](real::RealSystem) | [`MemorySystem`](mock::MemorySystem) | none |
 //! | Compare-and-delete and create-new writes (lock files) | [`System::write`], [`System::remove_file_if`] | same methods | none |
+//! | Files in another bucket | [`RealSystem::with_bucket`](real::RealSystem::with_bucket) | [`MemorySystem::with_bucket`](mock::MemorySystem::with_bucket) | none |
 //! | Async sleep | [`RealSystem`](real::RealSystem) uses tokio's timer | `MemorySystem` moves its clock | `async` |
 //! | Is a process alive | `kill(pid, 0)` on Unix | `MemorySystem::with_pid` | `process` |
-//! | Zip a tree, unzip into a system | `to_zip_*` methods, the `archive` module | `MemorySystem::from_zip_reader`, `MemorySystem::from_zip_stream` | `zip` |
+//! | Zip a tree, unzip into a system | async `to_zip_*` methods, the `archive` module | `MemorySystem::from_zip_reader`, `MemorySystem::from_zip_stream` | `zip` |
 //! | Files and folders in a bucket with conditional writes | `MinioBucket` (`MinIO`, `RustFS`), `S3Bucket` (AWS) in the `bucket` module | `MemoryBucket`, plus `BlockingBucket` for sync code | `minio` or `s3` for the clients |
 //!
 //! # What `System` offers
@@ -40,7 +43,7 @@
 //! - Environment: [`env_var`](System::env_var), [`set_env_var`](System::set_env_var),
 //!   [`current_dir`](System::current_dir), [`current_exe`](System::current_exe).
 //! - Files: [`read_to_string`](System::read_to_string),
-//!   [`write`](System::write), [`open`](System::open),
+//!   [`read`](System::read), [`write`](System::write), [`open`](System::open),
 //!   [`create`](System::create), [`open_append`](System::open_append),
 //!   [`copy`](System::copy), [`rename`](System::rename),
 //!   [`remove_file`](System::remove_file),
@@ -74,54 +77,64 @@
 //! Write the code against [`System`]. Pass [`RealSystem`](real::RealSystem) in
 //! `main` and [`MemorySystem`](mock::MemorySystem) in tests. A function can take
 //! `&dyn System` or a generic `S: System`; both accept either implementation.
+//! Every file operation is awaited.
 //!
 //! ```
+//! use os_shim::error::{ErrorKind, Result};
 //! use os_shim::{System, mock::MemorySystem, real::RealSystem};
-//! use std::io;
 //! use std::path::Path;
 //!
-//! fn load_greeting(system: &dyn System) -> io::Result<String> {
-//!     let home = system.env_var("HOME").map_err(io::Error::other)?;
+//! async fn load_greeting(system: &dyn System) -> Result<String> {
+//!     let home = system.env_var("HOME").map_err(std::io::Error::other)?;
 //!     let path = Path::new(&home).join(".greeting");
-//!     if system.exists(&path)? {
-//!         system.read_to_string(&path)
+//!     if system.exists(&path).await? {
+//!         system.read_to_string(&path).await
 //!     } else {
 //!         Ok("hello".to_owned())
 //!     }
 //! }
 //!
 //! // The generic form takes the same systems as `&dyn System` does.
-//! fn greeting_length<S: System>(system: &S) -> io::Result<usize> {
-//!     Ok(load_greeting(system)?.len())
+//! async fn greeting_length<S: System>(system: &S) -> Result<usize> {
+//!     Ok(load_greeting(system).await?.len())
 //! }
 //!
 //! // Production: `main` builds the real system once and passes it down.
-//! fn run() -> io::Result<()> {
+//! async fn run() -> Result<()> {
 //!     let system = RealSystem::new();
-//!     println!("{}", load_greeting(&system)?);
-//!     println!("{}", greeting_length(&system)?);
+//!     println!("{}", load_greeting(&system).await?);
+//!     println!("{}", greeting_length(&system).await?);
 //!     Ok(())
 //! }
 //!
+//! # fn main() -> std::io::Result<()> {
+//! # tokio::runtime::Builder::new_current_thread().build()?.block_on(async {
 //! // Test: no disk, no process-wide environment.
 //! let with_file = MemorySystem::new()
 //!     .with_env("HOME", "/home/ana").unwrap()
 //!     .with_file("/home/ana/.greeting", b"hi there").unwrap();
-//! assert_eq!(load_greeting(&with_file).unwrap(), "hi there");
+//! assert_eq!(load_greeting(&with_file).await.unwrap(), "hi there");
 //!
 //! let without_file = MemorySystem::new()
 //!     .with_env("HOME", "/home/ana").unwrap()
 //!     .with_dir("/home/ana").unwrap();
-//! assert_eq!(load_greeting(&without_file).unwrap(), "hello");
-//! assert_eq!(greeting_length(&with_file).unwrap(), 8);
+//! assert_eq!(load_greeting(&without_file).await.unwrap(), "hello");
+//! assert_eq!(greeting_length(&with_file).await.unwrap(), 8);
+//!
+//! let missing = without_file.read_to_string(Path::new("/nope")).await;
+//! assert_eq!(missing.unwrap_err().kind(), ErrorKind::NotFound);
+//! # Ok(())
+//! # })
+//! # }
 //! ```
 //!
 //! # Converting existing code
 //!
 //! A coding agent or a person converts a function in four steps. Add a
 //! `system: &dyn System` parameter. Replace each call in the table below with
-//! the `System` method beside it. Pass `system` on to every function that
-//! calls them. Call `RealSystem::new()` once, in `main`.
+//! the `System` method beside it, and make the function `async` to await the
+//! file ones. Pass `system` on to every function that calls them. Call
+//! `RealSystem::new()` once, in `main`.
 //!
 //! | Existing call | Use instead |
 //! | --- | --- |
@@ -129,8 +142,8 @@
 //! | `std::env::set_var(key, value)` | [`system.set_env_var(key, value)`](System::set_env_var) |
 //! | `std::env::current_dir()`, `std::env::current_exe()` | [`system.current_dir()`](System::current_dir), [`system.current_exe()`](System::current_exe) |
 //! | `std::fs::read_to_string(path)` | [`system.read_to_string(path)`](System::read_to_string) |
-//! | `std::fs::write(path, bytes)` | [`system.write(path, bytes, WriteMode::Replace)`](System::write) |
-//! | `OpenOptions::new().create_new(true)` | [`system.write(path, bytes, WriteMode::CreateNew)`](System::write) |
+//! | `std::fs::write(path, bytes)` | [`system.write(path, bytes, Condition::None).await`](System::write) |
+//! | `OpenOptions::new().create_new(true)` | [`system.write(path, bytes, Condition::Absent).await`](System::write) |
 //! | `File::open(path)`, `File::create(path)` | [`system.open(path)`](System::open), [`system.create(path)`](System::create) |
 //! | `std::fs::copy`, `rename`, `remove_file` | [`copy`](System::copy), [`rename`](System::rename), [`remove_file`](System::remove_file) |
 //! | `std::fs::create_dir_all(path)` | [`system.create_dir_all(path)`](System::create_dir_all) |
@@ -145,7 +158,7 @@
 //! | `tokio::time::sleep(duration)` | `system.sleep_async(duration).await` (`async` feature) |
 //!
 //! Two things differ from the standard library. `Path::exists` hides errors
-//! and returns `false`; `system.exists` returns an `io::Result<bool>`, so add
+//! and returns `false`; `system.exists` returns a `Result<bool>`, so add
 //! `?`. `Instant::now` has no equivalent: `System` models the wall clock
 //! only, so time measured with `Instant` stays real.
 //!
@@ -153,47 +166,55 @@
 //!
 //! ## Locks that expire, tested without waiting
 //!
-//! A lock file is made with [`WriteMode::CreateNew`], which fails with
-//! `AlreadyExists` when someone else holds it. It is stale when its age passes
-//! a limit, and it is released with [`System::remove_file_if`], which removes
-//! the file only while it still holds the owner's name. The test moves the
-//! clock with `advance` instead of sleeping.
+//! A lock file is made with [`Condition::Absent`](bucket::Condition::Absent),
+//! which fails with `AlreadyExists` when someone else holds it, and the write
+//! gives back the file's [`RevisionToken`]. The lock is stale when its age
+//! passes a limit, and it is released with [`System::remove_file_if`], which
+//! removes the file only while it still has the token the owner holds. The test
+//! moves the clock with `advance` instead of sleeping.
 //!
 //! ```
-//! use os_shim::{System, WriteMode, mock::MemorySystem};
-//! use std::io;
+//! use os_shim::bucket::{Condition, RevisionToken};
+//! use os_shim::error::{ErrorKind, Result};
+//! use os_shim::{System, mock::MemorySystem};
 //! use std::path::Path;
 //! use std::time::Duration;
 //!
 //! const LIMIT: Duration = Duration::from_secs(60);
 //!
-//! fn try_lock(system: &dyn System, path: &Path, owner: &str) -> io::Result<bool> {
-//!     match system.write(path, owner.as_bytes(), WriteMode::CreateNew) {
-//!         Ok(()) => Ok(true),
-//!         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+//! async fn try_lock(system: &dyn System, path: &Path, owner: &str) -> Result<Option<RevisionToken>> {
+//!     match system.write(path, owner.as_bytes(), Condition::Absent).await {
+//!         Ok(token) => Ok(Some(token)),
+//!         Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(None),
 //!         Err(error) => Err(error),
 //!     }
 //! }
 //!
-//! fn is_stale(system: &dyn System, path: &Path) -> io::Result<bool> {
-//!     let modified = system.metadata(path)?.modified.unwrap_or(std::time::UNIX_EPOCH);
+//! async fn is_stale(system: &dyn System, path: &Path) -> Result<bool> {
+//!     let modified = system.metadata(path).await?.modified.unwrap_or(std::time::UNIX_EPOCH);
 //!     Ok(system.now().duration_since(modified).is_ok_and(|age| age > LIMIT))
 //! }
 //!
+//! # fn main() -> std::io::Result<()> {
+//! # tokio::runtime::Builder::new_current_thread().build()?.block_on(async {
 //! let system = MemorySystem::new().with_dir("/locks").unwrap();
 //! let path = Path::new("/locks/job");
 //!
-//! assert!(try_lock(&system, path, "worker-a").unwrap());
-//! assert!(!try_lock(&system, path, "worker-b").unwrap());
-//! assert!(!is_stale(&system, path).unwrap());
+//! let first = try_lock(&system, path, "worker-a").await.unwrap().unwrap();
+//! assert!(try_lock(&system, path, "worker-b").await.unwrap().is_none());
+//! assert!(!is_stale(&system, path).await.unwrap());
 //!
 //! system.advance(Duration::from_secs(61)).unwrap();
-//! assert!(is_stale(&system, path).unwrap());
+//! assert!(is_stale(&system, path).await.unwrap());
 //!
-//! // Only the owner named in the file can remove it.
-//! assert!(!system.remove_file_if(path, b"worker-b").unwrap());
-//! assert!(system.remove_file_if(path, b"worker-a").unwrap());
-//! assert!(try_lock(&system, path, "worker-b").unwrap());
+//! // Only the holder of the current token can remove it.
+//! let stale = RevisionToken::new("not-the-token");
+//! assert!(!system.remove_file_if(path, &stale).await.unwrap());
+//! assert!(system.remove_file_if(path, &first).await.unwrap());
+//! assert!(try_lock(&system, path, "worker-b").await.unwrap().is_some());
+//! # Ok(())
+//! # })
+//! # }
 //! ```
 //!
 //! ## Retry and backoff with no real waiting
@@ -248,13 +269,14 @@
 //! so tests run in parallel without clashing, and nothing is left to clean up.
 //!
 //! ```
+//! use os_shim::error::Result;
 //! use os_shim::{System, mock::MemorySystem};
-//! use std::io;
 //! use std::path::{Path, PathBuf};
 //!
-//! fn find_configs(system: &dyn System, root: &Path) -> io::Result<Vec<PathBuf>> {
+//! async fn find_configs(system: &dyn System, root: &Path) -> Result<Vec<PathBuf>> {
 //!     let mut found: Vec<PathBuf> = system
-//!         .walk_dir(root, false, false)?
+//!         .walk_dir(root, false, false)
+//!         .await?
 //!         .into_iter()
 //!         .filter(|entry| entry.is_file)
 //!         .filter(|entry| entry.path.file_name().is_some_and(|name| name == "app.toml"))
@@ -264,17 +286,22 @@
 //!     Ok(found)
 //! }
 //!
+//! # fn main() -> std::io::Result<()> {
+//! # tokio::runtime::Builder::new_current_thread().build()?.block_on(async {
 //! let system = MemorySystem::new()
 //!     .with_file("/proj/app.toml", b"").unwrap()
 //!     .with_file("/proj/api/app.toml", b"").unwrap()
 //!     .with_file("/proj/api/main.rs", b"").unwrap()
 //!     .with_file("/proj/.cache/app.toml", b"").unwrap();
 //!
-//! let found = find_configs(&system, Path::new("/proj")).unwrap();
+//! let found = find_configs(&system, Path::new("/proj")).await.unwrap();
 //! assert_eq!(
 //!     found,
 //!     vec![PathBuf::from("/proj/api/app.toml"), PathBuf::from("/proj/app.toml")],
 //! );
+//! # Ok(())
+//! # })
+//! # }
 //! ```
 //!
 //! ## Settings from the environment, with no pollution
@@ -301,9 +328,9 @@
 //! ## Zip a tree and load it back
 //!
 //! Available with the `zip` feature. [`System::to_zip_vec`] archives any
-//! folder a system can read. `MemorySystem::from_zip_reader` builds a system
-//! from archive bytes, which makes a ready-made fixture for code that reads
-//! archives.
+//! folder a system can read, and awaits. `MemorySystem::from_zip_reader` builds
+//! a system from archive bytes, which makes a ready-made fixture for code that
+//! reads archives.
 //!
 //! ```
 //! # #[cfg(feature = "zip")]
@@ -312,16 +339,21 @@
 //! use std::io::Cursor;
 //! use std::path::Path;
 //!
+//! # fn main() -> std::io::Result<()> {
+//! # tokio::runtime::Builder::new_current_thread().build()?.block_on(async {
 //! let site = MemorySystem::new()
 //!     .with_file("/site/index.html", b"<h1>hi</h1>").unwrap()
 //!     .with_file("/site/css/a.css", b"body {}").unwrap();
 //!
-//! let bytes = site.to_zip_vec(Path::new("/site")).unwrap();
+//! let bytes = site.to_zip_vec(Path::new("/site")).await.unwrap();
 //! let copy = MemorySystem::from_zip_reader(Cursor::new(bytes)).unwrap();
 //!
 //! // The folder's contents land at the root, not the folder itself.
-//! assert_eq!(copy.read_to_string(Path::new("/index.html")).unwrap(), "<h1>hi</h1>");
-//! assert_eq!(copy.read_to_string(Path::new("/css/a.css")).unwrap(), "body {}");
+//! assert_eq!(copy.read_to_string(Path::new("/index.html")).await.unwrap(), "<h1>hi</h1>");
+//! assert_eq!(copy.read_to_string(Path::new("/css/a.css")).await.unwrap(), "body {}");
+//! # Ok(())
+//! # })
+//! # }
 //! # }
 //! ```
 //!
@@ -338,18 +370,23 @@
 //! use std::io;
 //! use std::path::Path;
 //!
-//! fn lock_is_stale(system: &dyn System, lock: &Path) -> io::Result<bool> {
-//!     let pid: u32 = system.read_to_string(lock)?.trim().parse().map_err(io::Error::other)?;
+//! async fn lock_is_stale(system: &dyn System, lock: &Path) -> io::Result<bool> {
+//!     let pid: u32 = system.read_to_string(lock).await?.trim().parse().map_err(io::Error::other)?;
 //!     Ok(!system.is_pid_alive(pid))
 //! }
 //!
+//! # fn main() -> io::Result<()> {
+//! # tokio::runtime::Builder::new_current_thread().build()?.block_on(async {
 //! let system = MemorySystem::new()
 //!     .with_file("/running.pid", b"1234").unwrap()
 //!     .with_file("/dead.pid", b"999").unwrap()
 //!     .with_pid(1234).unwrap();
 //!
-//! assert!(!lock_is_stale(&system, Path::new("/running.pid")).unwrap());
-//! assert!(lock_is_stale(&system, Path::new("/dead.pid")).unwrap());
+//! assert!(!lock_is_stale(&system, Path::new("/running.pid")).await.unwrap());
+//! assert!(lock_is_stale(&system, Path::new("/dead.pid")).await.unwrap());
+//! # Ok(())
+//! # })
+//! # }
 //! # }
 //! ```
 //!
@@ -367,7 +404,7 @@
 //! use std::time::Duration;
 //!
 //! async fn pause<S: System>(system: &S, delay: Duration) -> io::Result<()> {
-//!     system.sleep_async(delay).await
+//!     Ok(system.sleep_async(delay).await?)
 //! }
 //!
 //! let system = MemorySystem::new();
@@ -441,7 +478,7 @@
 //!   the size and the modification time.
 //! - `set_env_var` changes only that system. `RealSystem` changes the whole
 //!   process.
-//! - `create_temp_dir` makes `/tmp/mock_<n>` inside memory, never a real folder.
+//! - `create_temp_dir` makes `/tmp/mock_<n>` inside the system's bucket, never a real folder.
 //! - The clock starts at `SystemTime::UNIX_EPOCH` and moves only when the test
 //!   moves it. `sleep` returns at once.
 //! - A new system holds only the folder `/`, the current folder `/` and the
@@ -457,7 +494,7 @@
 //!   Needs tokio; `RealSystem` waits on tokio's timer.
 //! - `process`: adds `System::is_pid_alive` and `MemorySystem::with_pid`. Uses
 //!   `libc`, so it is for Unix.
-//! - `zip`: adds the `archive` module, `System::to_zip_stream`,
+//! - `zip`: adds the `archive` module, the async `System::to_zip_stream`,
 //!   `System::to_zip_vec`, `System::to_zip_writer`,
 //!   `MemorySystem::from_zip_reader` and `MemorySystem::from_zip_stream`.
 //! - `minio`: adds the `bucket` module with `MinioBucket`, for `MinIO`, `RustFS` and
@@ -485,8 +522,11 @@ extern crate alloc;
 pub mod archive;
 pub mod bucket;
 pub mod error;
+mod files;
 pub mod mock;
 pub mod real;
+#[cfg(any(test, feature = "zip"))]
+mod streams;
 
 #[cfg(test)]
 #[expect(
@@ -495,15 +535,22 @@ pub mod real;
 )]
 mod parity_tests;
 
-#[cfg(feature = "async")]
+use core::future::Future;
 use core::pin::Pin;
+use core::result;
 use core::time::Duration;
+use futures_io::{AsyncRead, AsyncWrite};
 use std::env::VarError;
-use std::io::{self, Read, Write};
+#[cfg(feature = "zip")]
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use crate::bucket::RevisionToken;
+use crate::bucket::{Condition, Guarantees, RevisionToken};
+use crate::error::Result;
+
+/// A boxed future: what keeps [`System`] usable as `&dyn System`.
+pub type BoxFuture<'system, T> = Pin<Box<dyn Future<Output = T> + Send + 'system>>;
 
 /// One entry found by [`System::walk_dir`].
 ///
@@ -588,21 +635,6 @@ impl FileMetadata {
     }
 }
 
-/// How [`System::write`] treats a file already at the path.
-///
-/// `CreateNew` is the primitive for lock files: of several callers that write
-/// the same path, one succeeds and the others get `AlreadyExists`. The check and
-/// the creation are one step, but the contents follow it, so a reader can see the
-/// new file empty for a moment. A folder at the path counts as a file there.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum WriteMode {
-    /// Writes the file only when nothing is at the path; otherwise `AlreadyExists`.
-    CreateNew,
-    /// Writes the file, replacing one already at the path.
-    Replace,
-}
-
 /// A temporary directory that is removed when the handle is dropped.
 ///
 /// [`System::create_temp_dir`] returns one. Keep the handle alive for as long
@@ -628,22 +660,32 @@ pub trait TempDirHandle {
     /// - The directory cannot be read.
     #[cfg(feature = "zip")]
     #[inline]
-    fn to_zip_stream(&self) -> io::Result<Box<dyn Read>> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "this temporary directory handle cannot archive itself",
-        ))
+    fn to_zip_stream(&self) -> BoxFuture<'_, Result<Box<dyn Read + Send>>> {
+        Box::pin(async {
+            Err(error::StorageError::from_kind(
+                error::ErrorKind::Unsupported,
+            ))
+        })
     }
 }
 
 /// Everything your code asks of the machine it runs on.
 ///
 /// Take `&dyn System` (or `S: System`) wherever code would call `std::env` or
-/// `std::fs`. The methods fall in these groups:
+/// `std::fs`. The file operations are async: each returns a [`BoxFuture`] of an
+/// [`error::Result`], which is what keeps the trait usable as `&dyn System`.
+/// A system holds a [`Bucket`](bucket::Bucket) and has the bucket carry out
+/// every file operation, after it resolves a relative path against
+/// [`current_dir`](Self::current_dir); [`guarantees`](Self::guarantees) passes
+/// on what that bucket promises. The methods fall in these groups:
 ///
 /// - Environment: `env_var`, `set_env_var`, `current_dir`, `current_exe`.
-/// - Files: `create`, `open`, `open_append`, `read_to_string`, `write`, `copy`,
-///   `rename`, `remove_file`, `remove_file_if`.
+/// - Files: `create`, `open`, `open_append`, `read`, `read_to_string`, `write`,
+///   `copy`, `rename`, `remove_file`, `remove_file_if`. `write` takes a
+///   [`Condition`] and gives the new [`RevisionToken`], `read` gives the bytes
+///   with their token, and `remove_file_if` removes a file only while it still
+///   has a token. `open`, `create` and `open_append` return `futures-io`
+///   streams.
 /// - Folders: `create_dir_all`, `read_dir`, `walk_dir`, `remove_dir_all`.
 /// - Queries: `exists`, `is_dir`, `is_file`, `metadata`, `canonicalize`.
 /// - Temporary directories: `create_temp_dir`.
@@ -653,26 +695,31 @@ pub trait TempDirHandle {
 ///   feature. They are provided methods, so an implementor gets them for free.
 ///
 /// # Implementations
-/// - [`RealSystem`](real::RealSystem): Production implementation using `std::env` and `std::fs`.
-/// - [`MemorySystem`](mock::MemorySystem): Test implementation using in-memory
-///   storage and a clock the test controls.
+/// - [`RealSystem`](real::RealSystem): Production implementation: the local
+///   disk by default, and `std::env`.
+/// - [`MemorySystem`](mock::MemorySystem): Test implementation using an
+///   in-memory bucket and a clock the test controls.
 ///
-/// Both give the same answers, including the same `io::ErrorKind` for the same
-/// failure. The differences that remain are noted on the methods they affect.
+/// Both give the same answers, including the same [`error::ErrorKind`] for the
+/// same failure. The differences that remain are noted on the methods they
+/// affect.
 ///
 /// The trait needs `Send + Sync`, so one system can be shared between threads.
 pub trait System: Send + Sync {
     /// Canonicalize a path (resolve to absolute path).
     ///
-    /// `RealSystem` resolves symbolic links and fails when the path does not
-    /// exist. `MemorySystem` has no symbolic links: it joins a relative path
-    /// onto its current directory and checks nothing else.
+    /// `RealSystem` over the disk resolves symbolic links and fails when the
+    /// path does not exist. `MemorySystem` has no symbolic links: it joins a
+    /// relative path onto its current directory and checks nothing else.
     ///
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The path cannot be canonicalized (in `RealSystem`, it does not exist).
-    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf>;
+    /// - The path cannot be canonicalized (on disk, it does not exist).
+    fn canonicalize<'system>(
+        &'system self,
+        path: &'system Path,
+    ) -> BoxFuture<'system, Result<PathBuf>>;
 
     /// Copy a file from source to destination, and return the number of bytes
     /// copied.
@@ -684,19 +731,28 @@ pub trait System: Send + Sync {
     /// Returns an error if:
     /// - The source is missing (`NotFound`) or is a folder.
     /// - The file cannot be copied.
-    fn copy(&self, from: &Path, to: &Path) -> io::Result<u64>;
+    fn copy<'system>(
+        &'system self,
+        from: &'system Path,
+        to: &'system Path,
+    ) -> BoxFuture<'system, Result<u64>>;
 
     /// Create a file for writing (returns a writable stream).
     ///
-    /// A file already at the path is truncated. The parent folder must exist.
-    /// Flush or drop the writer before reading the file back.
+    /// A file already at the path is replaced. The parent folder must exist.
+    /// Close the writer before reading the file back: a bucket may store the
+    /// bytes only on close. A relative path is resolved first, and its writer
+    /// stores the bytes when closed.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The file cannot be created, for example because the parent folder is
     ///   missing (`NotFound`).
-    fn create(&self, path: &Path) -> io::Result<Box<dyn Write + '_>>;
+    fn create<'system>(
+        &'system self,
+        path: &'system Path,
+    ) -> BoxFuture<'system, Result<Box<dyn AsyncWrite + Send + Unpin + 'system>>>;
 
     /// Recursively create a directory and all parent directories.
     ///
@@ -707,7 +763,10 @@ pub trait System: Send + Sync {
     /// Returns an error if:
     /// - The directory cannot be created, for example because a file is at the
     ///   path or above it.
-    fn create_dir_all(&self, path: &Path) -> io::Result<()>;
+    fn create_dir_all<'system>(
+        &'system self,
+        path: &'system Path,
+    ) -> BoxFuture<'system, Result<()>>;
 
     /// Create a temporary directory that is automatically cleaned up on drop.
     ///
@@ -718,29 +777,36 @@ pub trait System: Send + Sync {
     /// # Note
     /// For `RealSystem`, this uses `tempfile::TempDir` on the real filesystem,
     /// under the machine's temporary location.
-    /// For `MemorySystem`, this creates an in-memory temporary directory at a
-    /// path like `/tmp/mock_7`; the number is unique within the process.
+    /// For `MemorySystem`, this creates a temporary directory in its bucket at
+    /// a path like `/tmp/mock_7`; the number is unique within the process.
     ///
     /// # Example
     ///
     /// ```
-    /// use os_shim::{System, WriteMode, mock::MemorySystem};
+    /// use os_shim::{System, bucket::Condition, mock::MemorySystem};
     ///
+    /// # fn main() -> std::io::Result<()> {
+    /// # tokio::runtime::Builder::new_current_thread().build()?.block_on(async {
     /// let system = MemorySystem::new();
-    /// let dir = system.create_temp_dir().unwrap();
+    /// let dir = system.create_temp_dir().await.unwrap();
     /// let file = dir.path().join("note.txt");
-    /// system.write(&file, b"scratch", WriteMode::CreateNew).unwrap();
-    /// assert!(system.exists(&file).unwrap());
+    /// system.write(&file, b"scratch", Condition::Absent).await.unwrap();
+    /// assert!(system.exists(&file).await.unwrap());
     ///
     /// drop(dir);
-    /// assert!(!system.exists(&file).unwrap());
+    /// assert!(!system.exists(&file).await.unwrap());
+    /// # Ok(())
+    /// # })
+    /// # }
     /// ```
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The temporary directory cannot be created.
-    fn create_temp_dir(&self) -> io::Result<Box<dyn TempDirHandle>>;
+    fn create_temp_dir<'system>(
+        &'system self,
+    ) -> BoxFuture<'system, Result<Box<dyn TempDirHandle + 'system>>>;
 
     /// Get the current working directory.
     ///
@@ -748,7 +814,7 @@ pub trait System: Send + Sync {
     ///
     /// Returns an error if:
     /// - The current working directory cannot be retrieved.
-    fn current_dir(&self) -> io::Result<PathBuf>;
+    fn current_dir(&self) -> Result<PathBuf>;
 
     /// Get the path to the current executable.
     ///
@@ -756,7 +822,7 @@ pub trait System: Send + Sync {
     ///
     /// Returns an error if:
     /// - The executable path cannot be determined.
-    fn current_exe(&self) -> io::Result<PathBuf>;
+    fn current_exe(&self) -> Result<PathBuf>;
 
     /// Get an environment variable.
     ///
@@ -765,18 +831,20 @@ pub trait System: Send + Sync {
     /// Returns an error if:
     /// - The variable is not set (`VarError::NotPresent`).
     /// - The value is not valid Unicode (`VarError::NotUnicode`).
-    fn env_var(&self, key: &str) -> Result<String, VarError>;
+    fn env_var(&self, key: &str) -> result::Result<String, VarError>;
 
     /// Check if a path exists.
     ///
-    /// `RealSystem` always returns `Ok`: a path it cannot check counts as not
-    /// existing.
+    /// A path under a file counts as missing.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The path cannot be checked.
-    fn exists(&self, path: &Path) -> io::Result<bool>;
+    fn exists<'system>(&'system self, path: &'system Path) -> BoxFuture<'system, Result<bool>>;
+
+    /// What the bucket this system holds promises.
+    fn guarantees(&self) -> Guarantees;
 
     /// Check if a path points to a directory.
     ///
@@ -784,7 +852,7 @@ pub trait System: Send + Sync {
     ///
     /// Returns an error if:
     /// - The path cannot be checked.
-    fn is_dir(&self, path: &Path) -> io::Result<bool>;
+    fn is_dir<'system>(&'system self, path: &'system Path) -> BoxFuture<'system, Result<bool>>;
 
     /// Check if a path points to a file.
     ///
@@ -792,7 +860,7 @@ pub trait System: Send + Sync {
     ///
     /// Returns an error if:
     /// - The path cannot be checked.
-    fn is_file(&self, path: &Path) -> io::Result<bool>;
+    fn is_file<'system>(&'system self, path: &'system Path) -> BoxFuture<'system, Result<bool>>;
 
     /// Check if a process with the given PID is alive.
     ///
@@ -809,7 +877,10 @@ pub trait System: Send + Sync {
     ///
     /// Returns an error if:
     /// - Nothing is at the path (`NotFound`) or it cannot be read.
-    fn metadata(&self, path: &Path) -> io::Result<FileMetadata>;
+    fn metadata<'system>(
+        &'system self,
+        path: &'system Path,
+    ) -> BoxFuture<'system, Result<FileMetadata>>;
 
     /// The current time: the machine's in `RealSystem`, the one a test set in
     /// `MemorySystem`.
@@ -822,22 +893,44 @@ pub trait System: Send + Sync {
 
     /// Open a file for reading (returns a readable stream).
     ///
+    /// A relative path is resolved first, and its reader holds the whole file.
+    ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The file does not exist (`NotFound`) or cannot be opened.
-    fn open(&self, path: &Path) -> io::Result<Box<dyn Read + '_>>;
+    fn open<'system>(
+        &'system self,
+        path: &'system Path,
+    ) -> BoxFuture<'system, Result<Box<dyn AsyncRead + Send + Unpin + 'system>>>;
 
     /// Open a file for appending (create if it does not exist).
     ///
-    /// The parent folder must exist. `MemorySystem` holds appended bytes until
-    /// the writer is flushed or dropped.
+    /// The parent folder must exist. A bucket may hold the appended bytes until
+    /// the writer is closed. A relative path is resolved first, and its writer
+    /// appends the bytes when closed.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The file cannot be opened for appending.
-    fn open_append(&self, path: &Path) -> io::Result<Box<dyn Write + '_>>;
+    fn open_append<'system>(
+        &'system self,
+        path: &'system Path,
+    ) -> BoxFuture<'system, Result<Box<dyn AsyncWrite + Send + Unpin + 'system>>>;
+
+    /// The bytes of the file at `path` and the token of the version read,
+    /// together.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The file is missing (`NotFound`), is a folder (`IsADirectory`) or
+    ///   cannot be read.
+    fn read<'system>(
+        &'system self,
+        path: &'system Path,
+    ) -> BoxFuture<'system, Result<(Vec<u8>, RevisionToken)>>;
 
     /// Read directory entries, returning the full paths of its direct
     /// children, files and folders alike.
@@ -850,7 +943,10 @@ pub trait System: Send + Sync {
     /// Returns an error if:
     /// - The directory cannot be read: it is missing (`NotFound`) or is a file
     ///   (`NotADirectory`).
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>>;
+    fn read_dir<'system>(
+        &'system self,
+        path: &'system Path,
+    ) -> BoxFuture<'system, Result<Vec<PathBuf>>>;
 
     /// Read entire file contents as a string.
     ///
@@ -859,7 +955,10 @@ pub trait System: Send + Sync {
     /// Returns an error if:
     /// - The file is missing (`NotFound`) or cannot be read.
     /// - The contents are not valid UTF-8 (`InvalidData`).
-    fn read_to_string(&self, path: &Path) -> io::Result<String>;
+    fn read_to_string<'system>(
+        &'system self,
+        path: &'system Path,
+    ) -> BoxFuture<'system, Result<String>>;
 
     /// Remove a directory and all its contents.
     ///
@@ -868,7 +967,10 @@ pub trait System: Send + Sync {
     /// Returns an error if:
     /// - The directory is missing (`NotFound`), is a file (`NotADirectory`) or
     ///   cannot be removed.
-    fn remove_dir_all(&self, path: &Path) -> io::Result<()>;
+    fn remove_dir_all<'system>(
+        &'system self,
+        path: &'system Path,
+    ) -> BoxFuture<'system, Result<()>>;
 
     /// Remove a file.
     ///
@@ -876,37 +978,43 @@ pub trait System: Send + Sync {
     ///
     /// Returns an error if:
     /// - The file is missing (`NotFound`), is a folder or cannot be removed.
-    fn remove_file(&self, path: &Path) -> io::Result<()>;
+    fn remove_file<'system>(&'system self, path: &'system Path) -> BoxFuture<'system, Result<()>>;
 
-    /// Removes the file at `path` only when its contents are `contents`:
-    /// `Ok(true)` when it removed it, `Ok(false)` when the file holds other
-    /// contents or another file took its place, and it stays.
+    /// Removes the file only while it still has `token`: `Ok(true)` when it
+    /// removed it, `Ok(false)` when the file has another token or another file
+    /// took the path, and it stays.
     ///
     /// Two callers that remove the same file through this method never both
     /// remove it, and neither removes a file that another made at the path in
     /// the meantime, as long as files are made there only with
-    /// `WriteMode::CreateNew`.
+    /// `Condition::Absent`.
     ///
-    /// This is how a lock file is released: the owner passes its own name, so
-    /// it cannot remove a lock that someone else took after its own expired.
-    /// `RealSystem` holds an advisory lock on the file while it compares, which
-    /// binds only callers that cooperate through this method. `MemorySystem`
-    /// does the comparison and the removal under one lock.
+    /// This is how a lock file is released: the owner passes the token its own
+    /// write returned, so it cannot remove a lock that someone else took after
+    /// its own expired. On disk the check holds an advisory lock on the file,
+    /// which binds only callers that cooperate through this method.
     ///
     /// # Example
     ///
     /// ```
-    /// use os_shim::{System, WriteMode, mock::MemorySystem};
+    /// use os_shim::{System, bucket::Condition, mock::MemorySystem};
     /// use std::path::Path;
     ///
+    /// # fn main() -> std::io::Result<()> {
+    /// # tokio::runtime::Builder::new_current_thread().build()?.block_on(async {
     /// let system = MemorySystem::new();
     /// let lock = Path::new("/job.lock");
-    /// system.write(lock, b"worker-a", WriteMode::CreateNew).unwrap();
+    /// let ours = system.write(lock, b"worker-a", Condition::Absent).await.unwrap();
+    /// system.write(lock, b"worker-b", Condition::None).await.unwrap();
     ///
-    /// assert!(!system.remove_file_if(lock, b"worker-b").unwrap());
-    /// assert!(system.exists(lock).unwrap());
-    /// assert!(system.remove_file_if(lock, b"worker-a").unwrap());
-    /// assert!(!system.exists(lock).unwrap());
+    /// assert!(!system.remove_file_if(lock, &ours).await.unwrap());
+    /// assert!(system.exists(lock).await.unwrap());
+    /// let (_bytes, current) = system.read(lock).await.unwrap();
+    /// assert!(system.remove_file_if(lock, &current).await.unwrap());
+    /// assert!(!system.exists(lock).await.unwrap());
+    /// # Ok(())
+    /// # })
+    /// # }
     /// ```
     ///
     /// # Errors
@@ -915,7 +1023,11 @@ pub trait System: Send + Sync {
     /// - Nothing is at the path (`NotFound`), it is a folder (`IsADirectory`),
     ///   or a file is above it (`NotADirectory`).
     /// - The file cannot be read or removed.
-    fn remove_file_if(&self, path: &Path, contents: &[u8]) -> io::Result<bool>;
+    fn remove_file_if<'system>(
+        &'system self,
+        path: &'system Path,
+        token: &'system RevisionToken,
+    ) -> BoxFuture<'system, Result<bool>>;
 
     /// Rename or move a file or directory.
     ///
@@ -926,7 +1038,11 @@ pub trait System: Send + Sync {
     /// Returns an error if:
     /// - The source path does not exist.
     /// - The rename operation fails.
-    fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
+    fn rename<'system>(
+        &'system self,
+        from: &'system Path,
+        to: &'system Path,
+    ) -> BoxFuture<'system, Result<()>>;
 
     /// Set an environment variable.
     ///
@@ -965,7 +1081,7 @@ pub trait System: Send + Sync {
     ///
     /// Returns an error if:
     /// - `MemorySystem`'s clock would overflow, or its state lock is poisoned.
-    fn sleep(&self, duration: Duration) -> io::Result<()>;
+    fn sleep(&self, duration: Duration) -> Result<()>;
 
     /// Waits `duration` without holding the thread: on tokio's timer in
     /// `RealSystem`; in `MemorySystem`, it moves the clock forward by
@@ -983,10 +1099,7 @@ pub trait System: Send + Sync {
     /// In `RealSystem`, when awaited outside a tokio runtime with its timer on
     /// (`Builder::enable_time` or `Builder::enable_all`).
     #[cfg(feature = "async")]
-    fn sleep_async(
-        &self,
-        duration: Duration,
-    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>>;
+    fn sleep_async(&self, duration: Duration) -> BoxFuture<'_, Result<()>>;
 
     /// A pull-based zip stream of `source`, held in memory.
     ///
@@ -1010,8 +1123,15 @@ pub trait System: Send + Sync {
     /// - The source cannot be read.
     #[cfg(feature = "zip")]
     #[inline]
-    fn to_zip_stream(&self, source: &Path) -> io::Result<Box<dyn Read>> {
-        Ok(Box::new(io::Cursor::new(self.to_zip_vec(source)?)))
+    fn to_zip_stream<'system>(
+        &'system self,
+        source: &'system Path,
+    ) -> BoxFuture<'system, Result<Box<dyn Read + Send>>> {
+        Box::pin(async move {
+            let bytes = self.to_zip_vec(source).await?;
+            let reader: Box<dyn Read + Send> = Box::new(Cursor::new(bytes));
+            Ok(reader)
+        })
     }
 
     /// The zip archive of `source` as bytes.
@@ -1033,10 +1153,15 @@ pub trait System: Send + Sync {
     /// - The source cannot be read.
     #[cfg(feature = "zip")]
     #[inline]
-    fn to_zip_vec(&self, source: &Path) -> io::Result<Vec<u8>> {
-        let mut bytes = Vec::new();
-        self.to_zip_writer(source, &mut bytes)?;
-        Ok(bytes)
+    fn to_zip_vec<'system>(
+        &'system self,
+        source: &'system Path,
+    ) -> BoxFuture<'system, Result<Vec<u8>>> {
+        Box::pin(async move {
+            let mut bytes = Vec::new();
+            self.to_zip_writer(source, &mut bytes).await?;
+            Ok(bytes)
+        })
     }
 
     /// Write `source` into `sink` as a zip archive.
@@ -1071,8 +1196,17 @@ pub trait System: Send + Sync {
     /// - The source is neither a file nor a folder (`NotFound`).
     #[cfg(feature = "zip")]
     #[inline]
-    fn to_zip_writer(&self, source: &Path, sink: &mut dyn Write) -> io::Result<()> {
-        archive::to_zip_writer(self, source, sink, archive::ZipOptions::default())
+    fn to_zip_writer<'system>(
+        &'system self,
+        source: &'system Path,
+        sink: &'system mut (dyn Write + Send),
+    ) -> BoxFuture<'system, Result<()>> {
+        Box::pin(archive::to_zip_writer(
+            self,
+            source,
+            sink,
+            archive::ZipOptions::default(),
+        ))
     }
 
     /// Recursively walk a directory, returning all entries.
@@ -1090,47 +1224,64 @@ pub trait System: Send + Sync {
     /// Vector of all entries found (files and directories), excluding the root itself.
     ///
     /// # Note
-    /// For `RealSystem`, this respects `.gitignore` files using the `ignore` crate.
-    /// For `MemorySystem`, this walks the in-memory filesystem; it has no
-    /// symbolic links and no ignore files, so `follow_links` does nothing and
-    /// nothing is skipped except by `hidden`. Walking a path that does not
-    /// exist gives an empty list.
+    /// Over the disk, this respects `.gitignore` files using the `ignore` crate.
+    /// Over the memory bucket, `follow_links` does nothing and nothing is
+    /// skipped except by `hidden`; there are no symbolic links and no ignore
+    /// files.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The directory cannot be walked.
-    fn walk_dir(&self, path: &Path, follow_links: bool, hidden: bool)
-    -> io::Result<Vec<WalkEntry>>;
+    fn walk_dir<'system>(
+        &'system self,
+        path: &'system Path,
+        follow_links: bool,
+        hidden: bool,
+    ) -> BoxFuture<'system, Result<Vec<WalkEntry>>>;
 
-    /// Write bytes to a file, as `mode` says for a file already at the path.
+    /// Write bytes to a file under `condition` and give the new token.
     ///
-    /// The parent folder must exist. With [`WriteMode::CreateNew`] this
-    /// takes a lock file: one caller gets `Ok`, the others `AlreadyExists`.
+    /// The parent folder must exist. With [`Condition::Absent`] this takes a
+    /// lock file: one caller gets `Ok`, the others `AlreadyExists`.
     ///
     /// # Example
     ///
     /// ```
-    /// use os_shim::{System, WriteMode, mock::MemorySystem};
-    /// use std::io::ErrorKind;
+    /// use os_shim::bucket::Condition;
+    /// use os_shim::error::ErrorKind;
+    /// use os_shim::{System, mock::MemorySystem};
     /// use std::path::Path;
     ///
+    /// # fn main() -> std::io::Result<()> {
+    /// # tokio::runtime::Builder::new_current_thread().build()?.block_on(async {
     /// let system = MemorySystem::new();
     /// let path = Path::new("/state.txt");
     ///
-    /// system.write(path, b"one", WriteMode::CreateNew).unwrap();
-    /// let second = system.write(path, b"two", WriteMode::CreateNew);
+    /// let first = system.write(path, b"one", Condition::Absent).await.unwrap();
+    /// let second = system.write(path, b"two", Condition::Absent).await;
     /// assert_eq!(second.unwrap_err().kind(), ErrorKind::AlreadyExists);
     ///
-    /// system.write(path, b"three", WriteMode::Replace).unwrap();
-    /// assert_eq!(system.read_to_string(path).unwrap(), "three");
+    /// let third = system.write(path, b"three", Condition::Matches(first)).await.unwrap();
+    /// let (bytes, token) = system.read(path).await.unwrap();
+    /// assert_eq!((bytes.as_slice(), token), (&b"three"[..], third));
+    /// # Ok(())
+    /// # })
+    /// # }
     /// ```
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The file cannot be written.
-    /// - `mode` is `WriteMode::CreateNew` and something is at the path
-    ///   (`io::ErrorKind::AlreadyExists`).
-    fn write(&self, path: &Path, contents: &[u8], mode: WriteMode) -> io::Result<()>;
+    /// - `condition` is `Condition::Absent` and something is at the path
+    ///   (`ErrorKind::AlreadyExists`).
+    /// - `condition` is `Condition::Matches` and the file has another token
+    ///   (`ErrorKind::PreconditionFailed`).
+    fn write<'system>(
+        &'system self,
+        path: &'system Path,
+        contents: &'system [u8],
+        condition: Condition,
+    ) -> BoxFuture<'system, Result<RevisionToken>>;
 }

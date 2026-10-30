@@ -21,18 +21,18 @@ use os_shim::System;
 use os_shim::mock::MemorySystem;
 use std::path::Path;
 
-fn config_path(system: &dyn System) -> std::io::Result<String> {
+async fn config_path(system: &dyn System) -> os_shim::error::Result<String> {
     let home = system.env_var("HOME").map_err(std::io::Error::other)?;
-    system.read_to_string(&Path::new(&home).join(".app.toml"))
+    system.read_to_string(&Path::new(&home).join(".app.toml")).await
 }
 
 let system = MemorySystem::new()
     .with_env("HOME", "/home/user")?
     .with_file("/home/user/.app.toml", b"debug = true")?;
-assert_eq!(config_path(&system)?, "debug = true");
+assert_eq!(config_path(&system).await?, "debug = true");
 ```
 
-In production the same function takes `&os_shim::real::RealSystem::new()`, which delegates to `std::env` and `std::fs`. `System` covers environment variables, the current directory and executable, reading, writing, appending, copying, renaming and removing files, removing a file only while it holds what the caller read, folders and their walks, metadata, temporary directories that are removed on drop, the current time, and a wait that `MemorySystem` answers by moving its clock. `MemorySystem`'s clock starts at the Unix epoch; `with_now` sets it, `advance` moves it forward, and each file `MemorySystem` writes takes its modification time from it.
+In production the same function takes `&os_shim::real::RealSystem::new()`, which reads `std::env` and keeps its files on the local disk. Every file operation is async and is carried out by the bucket the system holds: `RealSystem::with_bucket` and `MemorySystem::with_bucket` hold any other. `System` covers environment variables, the current directory and executable, reading, writing, appending, copying, renaming and removing files, removing a file only while it still has the revision token the caller read, folders and their walks, metadata, temporary directories that are removed on drop, the current time, and a wait that `MemorySystem` answers by moving its clock. `MemorySystem`'s clock starts at the Unix epoch; `with_now` sets it, `advance` moves it forward, and each file `MemorySystem` writes takes its modification time from it.
 
 ## Zip archives (`zip`)
 
@@ -43,10 +43,10 @@ use std::io::Cursor;
 use std::path::Path;
 
 let system = MemorySystem::new().with_file("/project/src/main.rs", b"fn main() {}")?;
-let archive = system.to_zip_vec(Path::new("/project"))?;
+let archive = system.to_zip_vec(Path::new("/project")).await?;
 
 let loaded = MemorySystem::from_zip_reader(Cursor::new(archive))?;
-assert_eq!(loaded.read_to_string(Path::new("/src/main.rs"))?, "fn main() {}");
+assert_eq!(loaded.read_to_string(Path::new("/src/main.rs")).await?, "fn main() {}");
 ```
 
 `System::to_zip_stream`, `to_zip_vec` and `to_zip_writer` archive a tree. `archive::load_zip` loads an archive from a stream, `archive::load_zip_seekable` from a seekable reader, including archives whose entries carry data descriptors. `archive::ZipStreamWriter` writes an archive one entry at a time into a sink that cannot seek.
