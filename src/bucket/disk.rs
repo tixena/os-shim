@@ -284,28 +284,39 @@ const fn stale() -> StorageError {
     StorageError::from_kind(ErrorKind::PreconditionFailed)
 }
 
-/// Open `path` with `options`, take the advisory lock, and give the file when its bytes have `wanted`.
+/// Open `path` with `options`.
 ///
 /// A missing file is stale when its parent folder exists, and `NotFound` otherwise.
-fn open_matching(options: &OpenOptions, path: &Path, wanted: &RevisionToken) -> Result<File> {
-    let file = match options.open(path) {
-        Ok(opened) => opened,
+fn open_existing(options: &OpenOptions, path: &Path) -> Result<File> {
+    match options.open(path) {
+        Ok(opened) => Ok(opened),
         Err(error)
             if error.kind() == io::ErrorKind::NotFound
                 && path.parent().is_some_and(Path::is_dir) =>
         {
-            return Err(stale());
+            Err(stale())
         }
-        Err(error) => return Err(error.into()),
-    };
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Take the advisory lock on `file` and check that its bytes have `wanted`.
+fn lock_and_compare(file: &File, wanted: &RevisionToken) -> Result<()> {
     file.lock()?;
     let mut held = Vec::new();
-    (&file).read_to_end(&mut held)?;
+    io::Read::read_to_end(&mut &*file, &mut held)?;
     if token_of(&held) == *wanted {
-        Ok(file)
+        Ok(())
     } else {
         Err(stale())
     }
+}
+
+/// Open `path` with `options`, take the advisory lock, and give the file when its bytes have `wanted`.
+fn open_matching(options: &OpenOptions, path: &Path, wanted: &RevisionToken) -> Result<File> {
+    let file = open_existing(options, path)?;
+    lock_and_compare(&file, wanted)?;
+    Ok(file)
 }
 
 /// The file at `path`, locked, checked against `wanted`, emptied and ready to be written whole.
@@ -318,7 +329,14 @@ fn open_for_replace(path: &Path, wanted: &RevisionToken) -> Result<File> {
 
 /// Remove the file at `path` when its bytes have `wanted` and `path` still names the file that was read.
 fn delete_matching(path: &Path, wanted: &RevisionToken) -> Result<()> {
-    let file = open_matching(OpenOptions::new().read(true), path, wanted)?;
+    let file = open_existing(OpenOptions::new().read(true), path)?;
+    delete_opened(file, path, wanted)
+}
+
+/// The steps of `delete_matching` after it opened `path` as `file`: lock, compare, check the path
+/// still names `file`, remove.
+fn delete_opened(file: File, path: &Path, wanted: &RevisionToken) -> Result<()> {
+    lock_and_compare(&file, wanted)?;
     let opened = Handle::from_file(file)?;
     let still_named = match Handle::from_path(path) {
         Ok(named) => named == opened,
