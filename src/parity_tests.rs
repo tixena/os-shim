@@ -485,8 +485,10 @@ async fn parity_write_absent_over_a_dir_fails_and_keeps_the_dir() {
         .await
         .err()
         .map(|err| err.kind());
-    assert_eq!(real_kind, Some(ErrorKind::AlreadyExists));
-    assert_eq!(mock_kind, Some(ErrorKind::IsADirectory));
+    assert_eq!(
+        (real_kind, mock_kind),
+        (Some(ErrorKind::IsADirectory), Some(ErrorKind::IsADirectory))
+    );
     assert!(real.is_dir(&real_dir).await.unwrap());
     assert!(mock.is_dir(mock_dir).await.unwrap());
 }
@@ -1249,8 +1251,13 @@ async fn parity_rename_dir_onto_non_empty_dir_fails_and_keeps_both() {
         .await
         .err()
         .map(|err| err.kind());
-    assert_eq!(real_kind, Some(ErrorKind::Other));
-    assert_eq!(mock_kind, Some(ErrorKind::AlreadyExists));
+    assert_eq!(
+        (real_kind, mock_kind),
+        (
+            Some(ErrorKind::AlreadyExists),
+            Some(ErrorKind::AlreadyExists)
+        )
+    );
     assert!(real.is_file(&root.join("d2").join("a.md")).await.unwrap());
     assert!(mock.is_file(Path::new("/work/d2/a.md")).await.unwrap());
     assert!(real.is_file(&root.join("e2").join("x.md")).await.unwrap());

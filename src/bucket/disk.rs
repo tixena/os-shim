@@ -188,15 +188,18 @@ impl Bucket for DiskBucket {
         bytes: &[u8],
         condition: &Condition,
     ) -> impl Future<Output = Result<RevisionToken>> + Send {
-        on_first_poll(move || match condition.clone() {
-            Condition::Absent => create_new_with(path, bytes),
-            Condition::Matches(wanted) => {
-                open_for_replace(path, &wanted)?.write_all(bytes)?;
-                Ok(token_of(bytes))
-            }
-            Condition::None => {
-                fs::write(path, bytes)?;
-                Ok(token_of(bytes))
+        on_first_poll(move || {
+            refuse_folder(path)?;
+            match condition.clone() {
+                Condition::Absent => create_new_with(path, bytes),
+                Condition::Matches(wanted) => {
+                    open_for_replace(path, &wanted)?.write_all(bytes)?;
+                    Ok(token_of(bytes))
+                }
+                Condition::None => {
+                    fs::write(path, bytes)?;
+                    Ok(token_of(bytes))
+                }
             }
         })
     }
@@ -220,7 +223,12 @@ impl Bucket for DiskBucket {
 
     #[inline]
     fn rename(&self, from: &Path, to: &Path) -> impl Future<Output = Result<()>> + Send {
-        on_first_poll(move || Ok(fs::rename(from, to)?))
+        on_first_poll(move || match fs::rename(from, to) {
+            Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => {
+                Err(StorageError::new(ErrorKind::AlreadyExists, error))
+            }
+            other => Ok(other?),
+        })
     }
 
     #[inline]
@@ -240,6 +248,7 @@ impl Bucket for DiskBucket {
         condition: Condition,
     ) -> impl Future<Output = Result<Box<dyn AsyncWrite + Send + Unpin + 'bucket>>> + Send {
         on_first_poll(move || {
+            refuse_folder(path)?;
             let file = match condition.clone() {
                 Condition::Absent => OpenOptions::new().write(true).create_new(true).open(path)?,
                 Condition::Matches(wanted) => open_for_replace(path, &wanted)?,
@@ -270,7 +279,7 @@ fn token_of(bytes: &[u8]) -> RevisionToken {
     RevisionToken::new(hex)
 }
 
-/// `IsADirectory` when `path` names a folder, whatever the condition of the delete.
+/// `IsADirectory` when `path` names a folder, whatever the condition of the call.
 fn refuse_folder(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(found) if found.is_dir() => Err(StorageError::from_kind(ErrorKind::IsADirectory)),
