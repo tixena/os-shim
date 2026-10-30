@@ -722,5 +722,39 @@ async fn the_memory_bucket_promises_what_it_does() {
     let promised = MemoryBucket::default().guarantees();
     assert!(promised.contains(Guarantee::FuturesNeverWait));
     assert!(promised.contains(Guarantee::DroppedWriterKeepsBytes));
+    assert!(promised.contains(Guarantee::RenameKeepsModificationTime));
     assert!(!promised.contains(Guarantee::WalkHonorsGitignore));
+}
+
+#[test]
+fn a_set_holds_each_of_the_sixteen_guarantees_and_only_those_it_was_given() {
+    let every = [
+        Guarantee::AppendIsAtomic,
+        Guarantee::AppendWritesOnlyNewBytes,
+        Guarantee::ConditionalDeleteInOneStep,
+        Guarantee::ConditionalWriteInOneStep,
+        Guarantee::CreateOnlyWriteInOneStep,
+        Guarantee::DroppedWriterKeepsBytes,
+        Guarantee::EmptyFoldersExist,
+        Guarantee::FailedRenameKeepsDestination,
+        Guarantee::FileAndFolderNeverShareAPath,
+        Guarantee::FileRenameIsAtomic,
+        Guarantee::FolderRenameIsAtomic,
+        Guarantee::FuturesNeverWait,
+        Guarantee::ParentCheckInOneStep,
+        Guarantee::ReadersNeverSeePartialWrites,
+        Guarantee::RenameKeepsModificationTime,
+        Guarantee::WalkHonorsGitignore,
+    ];
+    let all = every
+        .iter()
+        .fold(Guarantees::none(), |set, guarantee| set.with(*guarantee));
+    assert_eq!(every.map(|guarantee| all.contains(guarantee)), [true; 16]);
+    for alone in every {
+        let set = Guarantees::none().with(alone);
+        assert_eq!(
+            every.map(|guarantee| set.contains(guarantee)),
+            every.map(|guarantee| guarantee == alone)
+        );
+    }
 }

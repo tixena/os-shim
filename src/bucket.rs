@@ -246,6 +246,8 @@ pub enum Guarantee {
     ParentCheckInOneStep,
     /// A reader never sees a file half written.
     ReadersNeverSeePartialWrites,
+    /// A renamed file or folder keeps its files' modification times.
+    RenameKeepsModificationTime,
     /// `walk` leaves out what a `.gitignore` file names.
     WalkHonorsGitignore,
 }
@@ -268,7 +270,8 @@ impl Guarantee {
             Self::FuturesNeverWait => 0x0800,
             Self::ParentCheckInOneStep => 0x1000,
             Self::ReadersNeverSeePartialWrites => 0x2000,
-            Self::WalkHonorsGitignore => 0x4000,
+            Self::RenameKeepsModificationTime => 0x4000,
+            Self::WalkHonorsGitignore => 0x8000,
         }
     }
 }

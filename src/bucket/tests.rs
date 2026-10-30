@@ -55,7 +55,7 @@ const SDK_GUARANTEES: [Guarantee; 3] = [
 
 /// Every guarantee there is.
 #[cfg(any(feature = "minio", feature = "s3"))]
-const EVERY_GUARANTEE: [Guarantee; 15] = [
+const EVERY_GUARANTEE: [Guarantee; 16] = [
     Guarantee::AppendIsAtomic,
     Guarantee::AppendWritesOnlyNewBytes,
     Guarantee::ConditionalDeleteInOneStep,
@@ -70,6 +70,7 @@ const EVERY_GUARANTEE: [Guarantee; 15] = [
     Guarantee::FuturesNeverWait,
     Guarantee::ParentCheckInOneStep,
     Guarantee::ReadersNeverSeePartialWrites,
+    Guarantee::RenameKeepsModificationTime,
     Guarantee::WalkHonorsGitignore,
 ];
 

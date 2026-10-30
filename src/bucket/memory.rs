@@ -414,7 +414,8 @@ impl Bucket for MemoryBucket {
             .with(Guarantee::FolderRenameIsAtomic)
             .with(Guarantee::FuturesNeverWait)
             .with(Guarantee::ParentCheckInOneStep)
-            .with(Guarantee::ReadersNeverSeePartialWrites);
+            .with(Guarantee::ReadersNeverSeePartialWrites)
+            .with(Guarantee::RenameKeepsModificationTime);
         PROMISED
     }
 

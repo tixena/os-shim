@@ -154,6 +154,7 @@ impl Bucket for DiskBucket {
             .with(Guarantee::FolderRenameIsAtomic)
             .with(Guarantee::FuturesNeverWait)
             .with(Guarantee::ParentCheckInOneStep)
+            .with(Guarantee::RenameKeepsModificationTime)
             .with(Guarantee::WalkHonorsGitignore);
         DISK
     }
