@@ -18,7 +18,7 @@ ignore = "0.4.17"
 same-file = "1.0.6"
 
 # Mock implementation logging
-tracing = "0.1.40"
+tracing = "0.1.44"
 
 # Zip archive streaming (optional)
 zip = { version = "9.0.0", default-features = false, features = [
@@ -28,10 +28,10 @@ zip = { version = "9.0.0", default-features = false, features = [
 time = { version = "0.3.47", optional = true }
 
 # Process operations (optional)
-libc = { version = "0.2", optional = true }
+libc = { version = "0.2.183", optional = true }
 
 # Bucket clients (optional): BlockingBucket's runtime
-tokio = { version = "1.44.2", features = ["rt"], optional = true }
+tokio = { version = "1.51.6", features = ["rt"], optional = true }
 
 # Bucket clients (optional): AWS's S3 SDK, for MinIO-compatible servers and for AWS S3
 aws-sdk-s3 = { version = "1.144.0", default-features = false, features = [
@@ -40,7 +40,7 @@ aws-sdk-s3 = { version = "1.144.0", default-features = false, features = [
 ], optional = true }
 
 [dev-dependencies]
-tokio = { version = "1.44.2", features = ["rt", "macros", "test-util"] }
+tokio = { version = "1.51.6", features = ["rt", "macros", "test-util"] }
 
 [features]
 default = []
