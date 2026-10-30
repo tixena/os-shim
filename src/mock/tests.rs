@@ -2,7 +2,66 @@ use super::*;
 use crate::bucket::{Condition, Depth, MemoryBucket};
 use crate::error::ErrorKind;
 use crate::streams::{close, read_to_end, write_all};
+use core::sync::atomic::AtomicUsize;
 use std::path::Path;
+
+/// A bucket over memory that counts the whole-file reads and the streamed reads it serves.
+struct CountingBucket {
+    /// How many times `get` ran.
+    gets: Arc<AtomicUsize>,
+    /// The bucket that holds the files.
+    inner: MemoryBucket,
+    /// How many times `read_stream` ran.
+    streams: Arc<AtomicUsize>,
+}
+
+impl Bucket for CountingBucket {
+    fn delete(
+        &self,
+        path: &Path,
+        condition: &Condition,
+    ) -> impl Future<Output = Result<()>> + Send {
+        self.inner.delete(path, condition)
+    }
+
+    fn get(&self, path: &Path) -> impl Future<Output = Result<(Vec<u8>, RevisionToken)>> + Send {
+        self.gets.fetch_add(1, Ordering::SeqCst);
+        self.inner.get(path)
+    }
+
+    fn guarantees(&self) -> Guarantees {
+        self.inner.guarantees()
+    }
+
+    fn head(&self, path: &Path) -> impl Future<Output = Result<FileMetadata>> + Send {
+        self.inner.head(path)
+    }
+
+    fn list(
+        &self,
+        folder: &Path,
+        depth: Depth,
+    ) -> impl Future<Output = Result<Vec<WalkEntry>>> + Send {
+        self.inner.list(folder, depth)
+    }
+
+    fn put(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        condition: &Condition,
+    ) -> impl Future<Output = Result<RevisionToken>> + Send {
+        self.inner.put(path, bytes, condition)
+    }
+
+    fn read_stream<'bucket>(
+        &'bucket self,
+        path: &Path,
+    ) -> impl Future<Output = Result<Box<dyn AsyncRead + Send + Unpin + 'bucket>>> + Send {
+        self.streams.fetch_add(1, Ordering::SeqCst);
+        self.inner.read_stream(path)
+    }
+}
 
 #[tokio::test(flavor = "current_thread")]
 async fn metadata_returns_correct_len_for_file() {
@@ -526,6 +585,32 @@ async fn streams_on_a_relative_path_land_at_the_resolved_path() {
             .unwrap(),
         "created+more"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn opening_a_relative_path_streams_the_file_without_reading_it_whole() {
+    let gets = Arc::new(AtomicUsize::new(0));
+    let streams = Arc::new(AtomicUsize::new(0));
+    let inner = MemoryBucket::default();
+    inner.create_folder(Path::new("/work")).await.unwrap();
+    inner
+        .put(Path::new("/work/big.bin"), b"bytes", &Condition::None)
+        .await
+        .unwrap();
+    let system = MemorySystem::with_bucket(CountingBucket {
+        inner,
+        gets: Arc::clone(&gets),
+        streams: Arc::clone(&streams),
+    })
+    .with_current_dir("/work")
+    .unwrap();
+
+    let mut reader = system.open(Path::new("big.bin")).await.unwrap();
+    let bytes = read_to_end(&mut *reader).await.unwrap();
+
+    assert_eq!(bytes, b"bytes");
+    assert_eq!(streams.load(Ordering::SeqCst), 1);
+    assert_eq!(gets.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test(flavor = "current_thread")]

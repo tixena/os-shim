@@ -67,7 +67,7 @@ where
     /// Whether `close` has finished.
     done: bool,
     /// The file they go to.
-    path: &'bucket Path,
+    path: PathBuf,
     /// The store in progress, once `close` has started it.
     store: Option<Store<'bucket>>,
     /// How they are stored.
@@ -79,12 +79,12 @@ where
     B: ?Sized,
 {
     /// A writer over `path` that stores as `target` says.
-    pub const fn new(bucket: &'bucket B, path: &'bucket Path, target: Target) -> Self {
+    pub fn new(bucket: &'bucket B, path: &Path, target: Target) -> Self {
         Self {
             buffer: Vec::new(),
             bucket,
             done: false,
-            path,
+            path: path.to_path_buf(),
             store: None,
             target,
         }
@@ -102,13 +102,13 @@ where
         }
         if this.store.is_none() {
             let bucket = this.bucket;
-            let path = this.path;
+            let path = mem::take(&mut this.path);
             let bytes = mem::take(&mut this.buffer);
             let target = this.target.clone();
             this.store = Some(Box::pin(async move {
                 match target {
-                    Target::Append => bucket.append(path, &bytes).await.map(drop),
-                    Target::Put(condition) => bucket.put(path, &bytes, &condition).await.map(drop),
+                    Target::Append => bucket.append(&path, &bytes).await.map(drop),
+                    Target::Put(condition) => bucket.put(&path, &bytes, &condition).await.map(drop),
                 }
             }));
         }

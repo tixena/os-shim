@@ -1,15 +1,16 @@
 //! The file operations of `System`, run on the bucket a system holds, or on local storage while a temporary directory lives.
 
+#[cfg(feature = "zip")]
+use crate::BoxFuture;
 use crate::bucket::{Bucket, Condition, Depth, RevisionToken};
 use crate::error::{ErrorKind, Result, StorageError};
 use crate::streams::{close, read_chunk, write_all};
-use crate::{BoxFuture, FileMetadata, System, TempDirHandle, WalkEntry};
+use crate::{FileMetadata, System, TempDirHandle, WalkEntry};
 use alloc::borrow::Cow;
 use alloc::collections::BTreeSet;
 use alloc::sync::Arc;
 use core::future::Future;
-use core::mem;
-use core::pin::{Pin, pin};
+use core::pin::pin;
 use core::task::{Context, Poll, Waker};
 use futures_io::{AsyncRead, AsyncWrite};
 use std::io;
@@ -79,13 +80,8 @@ impl<S, L> Clone for Pick<'_, S, L> {
 impl<S, L> Copy for Pick<'_, S, L> {}
 
 impl<'storage, S: Bucket, L: Bucket> Pick<'storage, S, L> {
-    /// Add `more` at the end of the file at `path`.
-    async fn append(self, path: &Path, more: &[u8]) -> Result<RevisionToken> {
-        on!(self, bucket => bucket.append(path, more).await)
-    }
-
     /// A writer that appends to the file at `path` when closed.
-    async fn append_stream(self, path: &'storage Path) -> Result<Writer<'storage>> {
+    async fn append_stream(self, path: &Path) -> Result<Writer<'storage>> {
         on!(self, bucket => bucket.append_stream(path).await)
     }
 
@@ -130,7 +126,7 @@ impl<'storage, S: Bucket, L: Bucket> Pick<'storage, S, L> {
     }
 
     /// A reader over the file at `path`.
-    async fn read_stream(self, path: &'storage Path) -> Result<Reader<'storage>> {
+    async fn read_stream(self, path: &Path) -> Result<Reader<'storage>> {
         on!(self, bucket => bucket.read_stream(path).await)
     }
 
@@ -150,131 +146,16 @@ impl<'storage, S: Bucket, L: Bucket> Pick<'storage, S, L> {
     }
 
     /// A writer that stores its bytes at `path` under `condition` when closed.
-    async fn write_stream(
-        self,
-        path: &'storage Path,
-        condition: Condition,
-    ) -> Result<Writer<'storage>> {
+    async fn write_stream(self, path: &Path, condition: Condition) -> Result<Writer<'storage>> {
         on!(self, bucket => bucket.write_stream(path, condition).await)
     }
 }
 
-/// What a closed [`OwnedWriter`] does with its bytes.
-enum Target {
-    /// Append them to the file.
-    Append,
-    /// Store them as the whole file, replacing what is there.
-    Replace,
-}
-
 /// A path resolved, and the storage that holds it.
-type Located<'system, M> = (
-    Cow<'system, Path>,
+type Located<'system, 'path, M> = (
+    Cow<'path, Path>,
     Pick<'system, <M as Machine>::Store, <M as Machine>::Local>,
 );
-
-/// A reader over bytes in memory.
-struct OwnedReader {
-    /// The bytes.
-    bytes: Vec<u8>,
-    /// How many were read already.
-    position: usize,
-}
-
-impl AsyncRead for OwnedReader {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<io::Result<usize>> {
-        let remaining = self.bytes.get(self.position..).unwrap_or_default();
-        let count = remaining.len().min(buf.len());
-        if let (Some(target), Some(source)) = (buf.get_mut(..count), remaining.get(..count)) {
-            target.copy_from_slice(source);
-        }
-        self.position = self.position.saturating_add(count);
-        Poll::Ready(Ok(count))
-    }
-}
-
-/// The store in progress of an [`OwnedWriter`].
-type Store<'system> = BoxFuture<'system, Result<()>>;
-
-/// A writer that owns its path, keeps its bytes and hands them to the bucket when closed.
-struct OwnedWriter<'system, S, L> {
-    /// The bytes written so far.
-    buffer: Vec<u8>,
-    /// Whether `poll_close` has finished.
-    done: bool,
-    /// The file the bytes go to.
-    path: PathBuf,
-    /// The storage that stores the bytes.
-    storage: Pick<'system, S, L>,
-    /// The store, once `poll_close` has started it.
-    store: Option<Store<'system>>,
-    /// How the bytes are stored.
-    target: Target,
-}
-
-impl<'system, S: Bucket, L: Bucket> OwnedWriter<'system, S, L> {
-    /// A writer over `path` that stores as `target` says.
-    const fn new(storage: Pick<'system, S, L>, path: PathBuf, target: Target) -> Self {
-        Self {
-            storage,
-            buffer: Vec::new(),
-            done: false,
-            path,
-            store: None,
-            target,
-        }
-    }
-}
-
-impl<S: Bucket, L: Bucket> AsyncWrite for OwnedWriter<'_, S, L> {
-    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let this = &mut *self;
-        if this.done {
-            return Poll::Ready(Ok(()));
-        }
-        if this.store.is_none() {
-            let storage = this.storage;
-            let path = mem::take(&mut this.path);
-            let bytes = mem::take(&mut this.buffer);
-            let append = matches!(this.target, Target::Append);
-            this.store = Some(Box::pin(async move {
-                if append {
-                    storage.append(&path, &bytes).await.map(drop)
-                } else {
-                    storage.put(&path, &bytes, &Condition::None).await.map(drop)
-                }
-            }));
-        }
-        let Some(store) = this.store.as_mut() else {
-            return Poll::Ready(Ok(()));
-        };
-        match store.as_mut().poll(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(outcome) => {
-                this.done = true;
-                this.store = None;
-                Poll::Ready(outcome.map_err(io::Error::from))
-            }
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        self.buffer.extend_from_slice(buf);
-        Poll::Ready(Ok(buf.len()))
-    }
-}
 
 /// A temporary directory on local storage, removed when the handle drops.
 pub struct LocalTempDir<'system, M: Machine> {
@@ -361,7 +242,10 @@ where
 }
 
 /// `path` resolved, and the storage that holds it.
-fn locate<'system, M>(machine: &'system M, path: &'system Path) -> Result<Located<'system, M>>
+fn locate<'system, 'path, M>(
+    machine: &'system M,
+    path: &'path Path,
+) -> Result<Located<'system, 'path, M>>
 where
     M: Machine,
 {
@@ -482,19 +366,12 @@ where
 }
 
 /// A writer that replaces the file at `path`.
-pub async fn create<'system, M>(machine: &'system M, path: &'system Path) -> Result<Writer<'system>>
+pub async fn create<'system, M>(machine: &'system M, path: &Path) -> Result<Writer<'system>>
 where
     M: Machine,
 {
     let (resolved, storage) = locate(machine, path)?;
-    match resolved {
-        Cow::Borrowed(absolute) => storage.write_stream(absolute, Condition::None).await,
-        Cow::Owned(absolute) => Ok(Box::new(OwnedWriter::new(
-            storage,
-            absolute,
-            Target::Replace,
-        ))),
-    }
+    storage.write_stream(&resolved, Condition::None).await
 }
 
 /// Create `path` and the folders above it.
@@ -542,37 +419,21 @@ where
 }
 
 /// A reader over the file at `path`.
-pub async fn open<'system, M>(machine: &'system M, path: &'system Path) -> Result<Reader<'system>>
+pub async fn open<'system, M>(machine: &'system M, path: &Path) -> Result<Reader<'system>>
 where
     M: Machine,
 {
     let (resolved, storage) = locate(machine, path)?;
-    match resolved {
-        Cow::Borrowed(absolute) => storage.read_stream(absolute).await,
-        Cow::Owned(absolute) => {
-            let (bytes, _token) = storage.get(&absolute).await?;
-            Ok(Box::new(OwnedReader { bytes, position: 0 }))
-        }
-    }
+    storage.read_stream(&resolved).await
 }
 
 /// A writer that appends to the file at `path`, creating it when missing.
-pub async fn open_append<'system, M>(
-    machine: &'system M,
-    path: &'system Path,
-) -> Result<Writer<'system>>
+pub async fn open_append<'system, M>(machine: &'system M, path: &Path) -> Result<Writer<'system>>
 where
     M: Machine,
 {
     let (resolved, storage) = locate(machine, path)?;
-    match resolved {
-        Cow::Borrowed(absolute) => storage.append_stream(absolute).await,
-        Cow::Owned(absolute) => Ok(Box::new(OwnedWriter::new(
-            storage,
-            absolute,
-            Target::Append,
-        ))),
-    }
+    storage.append_stream(&resolved).await
 }
 
 /// The bytes at `path` and the token of that version.

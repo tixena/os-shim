@@ -44,7 +44,7 @@ macro_rules! declare_bucket {
             #[inline]
             fn append_stream<'bucket>(
                 &'bucket self,
-                path: &'bucket Path,
+                path: &Path,
             ) -> impl Future<Output = Result<Box<dyn AsyncWrite + Send + Unpin + 'bucket>>> + Send
             {
                 let writer: Box<dyn AsyncWrite + Send + Unpin + 'bucket> =
@@ -159,7 +159,7 @@ macro_rules! declare_bucket {
             #[inline]
             fn read_stream<'bucket>(
                 &'bucket self,
-                path: &'bucket Path,
+                path: &Path,
             ) -> impl Future<Output = Result<Box<dyn AsyncRead + Send + Unpin + 'bucket>>> + Send
             {
                 async move {
@@ -224,7 +224,7 @@ macro_rules! declare_bucket {
             #[inline]
             fn write_stream<'bucket>(
                 &'bucket self,
-                path: &'bucket Path,
+                path: &Path,
                 condition: Condition,
             ) -> impl Future<Output = Result<Box<dyn AsyncWrite + Send + Unpin + 'bucket>>> + Send
             {
