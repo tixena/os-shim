@@ -9,15 +9,12 @@ use super::{
 use super::{MinioBucket, MinioConfig};
 #[cfg(s3_tests)]
 use super::{S3Bucket, S3Config};
-#[cfg(minio_tests)]
-use aws_sdk_s3::operation::create_bucket::CreateBucketError;
 use aws_sdk_s3::{
     Client, Config,
     config::{BehaviorVersion, Credentials, Region, retry::RetryConfig},
     error::SdkError,
 };
 use std::env;
-#[cfg(s3_tests)]
 use std::process;
 #[cfg(minio_tests)]
 use std::sync::OnceLock;
@@ -62,25 +59,14 @@ fn runtime() -> Runtime {
 }
 
 #[cfg(minio_tests)]
-/// The configuration of a server whose bucket exists, created once per test binary.
+/// The configuration of a server whose bucket exists, made by `ensure` once per test binary.
 fn ready_config() -> MinioConfig {
     static CREATED: OnceLock<()> = OnceLock::new();
     let config = config();
     CREATED.get_or_init(|| {
-        let answer = runtime().block_on(
-            client(&config)
-                .create_bucket()
-                .bucket(&config.bucket)
-                .send(),
-        );
-        if let Err(error) = answer {
-            assert!(
-                error
-                    .as_service_error()
-                    .is_some_and(CreateBucketError::is_bucket_already_owned_by_you),
-                "the bucket cannot be created: {error:?}"
-            );
-        }
+        runtime()
+            .block_on(MinioBucket::new(config.clone()).ensure())
+            .unwrap();
     });
     config
 }
@@ -441,6 +427,51 @@ fn a_delete_on_a_missing_bucket_is_other_on_the_server() {
     }
 }
 
+/// Not a parity sequence, since `MemoryBucket` has no bucket to create: `ensure` creates a
+/// missing bucket, then leaves it as it is, and the bucket takes objects.
+#[cfg(minio_tests)]
+#[test]
+fn ensure_creates_a_missing_bucket_on_the_server() {
+    let mut config = config();
+    config.bucket = format!("os-shim-ensure-{}", process::id());
+    let sdk = client(&config);
+    let bucket = BlockingBucket::new(MinioBucket::new(config.clone())).unwrap();
+    let key = "ensure/note.md";
+    let before = bucket.get(key);
+    let created = bucket.runtime.block_on(bucket.bucket.ensure());
+    let again = bucket.runtime.block_on(bucket.bucket.ensure());
+    let put = bucket.put(key, b"# Note\n", &Condition::None);
+    let got = bucket.get(key);
+    let removed = bucket
+        .runtime
+        .block_on(sdk.delete_object().bucket(&config.bucket).key(key).send());
+    let deleted = bucket
+        .runtime
+        .block_on(sdk.delete_bucket().bucket(&config.bucket).send());
+    let transcript = vec![
+        get_line(&before),
+        shape(&created, |&()| "ensured".to_owned()),
+        shape(&again, |&()| "ensured".to_owned()),
+        put_line(&put),
+        get_line(&got),
+        status(&removed),
+        status(&deleted),
+    ];
+    eprintln!("ensure on the server:\n{}", transcript.join("\n"));
+    assert_eq!(
+        transcript,
+        [
+            "Other",
+            "ensured",
+            "ensured",
+            "tag",
+            "bytes [35, 32, 78, 111, 116, 101, 10]",
+            "accepted",
+            "accepted"
+        ]
+    );
+}
+
 /// The value of an environment variable the S3 tests need.
 #[cfg(s3_tests)]
 fn aws_variable(name: &str) -> String {
@@ -583,6 +614,14 @@ fn empty_listing_agrees_with_aws() {
         &empty_listing(&memory(), "a/"),
         &aws_transcript("empty-listing", empty_listing),
     );
+}
+
+/// `ensure` on the bucket the environment names, which exists, succeeds and creates nothing.
+#[cfg(s3_tests)]
+#[test]
+fn ensure_leaves_an_existing_bucket_on_aws() {
+    let bucket = aws();
+    bucket.runtime.block_on(bucket.bucket.ensure(None)).unwrap();
 }
 
 #[cfg(s3_tests)]

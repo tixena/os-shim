@@ -29,7 +29,10 @@
 //!   take a generic `B: Bucket`.
 //! - `MinioBucket` and `MinioConfig` (feature `minio`): a client for `MinIO`,
 //!   `RustFS` and other servers that speak its API. Path-style addressing.
+//!   `MinioBucket::ensure` creates the bucket when it is missing.
 //! - `S3Bucket` and `S3Config` (feature `s3`): a client for AWS S3.
+//!   `S3Bucket::ensure` creates the bucket when it is missing: private, in the
+//!   client's region, encrypted with a KMS key when one is given.
 //! - [`MemoryBucket`]: the same interface over a map in memory. No server, no
 //!   network. Clones share the same objects.
 //! - [`BlockingBucket`]: wraps any `Bucket` for code that is not async. It owns
@@ -99,6 +102,11 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 #[cfg(feature = "s3")]
 use aws_sdk_s3::config::Builder as ConfigBuilder;
+#[cfg(feature = "s3")]
+use aws_sdk_s3::types::{
+    BucketCannedAcl, BucketLocationConstraint, CreateBucketConfiguration, ServerSideEncryption,
+    ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
+};
 #[cfg(any(feature = "minio", feature = "s3"))]
 use aws_sdk_s3::{
     Client, Config,
@@ -529,6 +537,22 @@ struct SdkBucket {
 
 #[cfg(any(feature = "minio", feature = "s3"))]
 impl SdkBucket {
+    /// Whether the bucket exists: `HEAD` on it answers 200, or 404 when it is missing.
+    async fn bucket_exists(&self) -> Result<bool, ObjectError> {
+        match self.client.head_bucket().bucket(&self.bucket).send().await {
+            Ok(_) => Ok(true),
+            Err(error)
+                if error
+                    .raw_response()
+                    .map(|response| response.status().as_u16())
+                    == Some(404) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(classify(error)),
+        }
+    }
+
     /// The entity tag of the object at `key`, or `None` when no object is there.
     async fn current_tag(&self, key: &str) -> Result<Option<String>, ObjectError> {
         match self
@@ -654,21 +678,13 @@ impl SdkBucket {
     /// `Ok(None)` when the bucket exists, since a `HEAD` 404 carries no S3 code to say which of
     /// the object and the bucket is missing.
     async fn object_is_missing(&self) -> Result<Option<String>, ObjectError> {
-        match self.client.head_bucket().bucket(&self.bucket).send().await {
-            Ok(_) => Ok(None),
-            Err(error)
-                if error
-                    .raw_response()
-                    .map(|response| response.status().as_u16())
-                    == Some(404) =>
-            {
-                Err(ObjectError::from(io::Error::other(format!(
-                    "404: the bucket {} does not exist",
-                    self.bucket
-                ))))
-            }
-            Err(error) => Err(classify(error)),
+        if self.bucket_exists().await? {
+            return Ok(None);
         }
+        Err(ObjectError::from(io::Error::other(format!(
+            "404: the bucket {} does not exist",
+            self.bucket
+        ))))
     }
 
     /// Write `bytes` whole at `key` when `condition` holds, and give the new entity tag.
@@ -773,6 +789,27 @@ pub struct MinioBucket(
 
 #[cfg(feature = "minio")]
 impl MinioBucket {
+    /// Create the bucket when it does not exist.
+    ///
+    /// # Errors
+    ///
+    /// `Other` when the store cannot be reached, or refuses to say whether the
+    /// bucket exists or to create it.
+    #[inline]
+    pub async fn ensure(&self) -> Result<(), ObjectError> {
+        if self.0.bucket_exists().await? {
+            return Ok(());
+        }
+        self.0
+            .client
+            .create_bucket()
+            .bucket(&self.0.bucket)
+            .send()
+            .await
+            .map(drop)
+            .map_err(classify)
+    }
+
     /// A client for `config.bucket` on `config.endpoint`, with path-style addressing and no retries.
     #[inline]
     #[must_use]
@@ -896,6 +933,63 @@ pub struct S3Bucket(
 
 #[cfg(feature = "s3")]
 impl S3Bucket {
+    /// Create the bucket when it does not exist: private, in the client's
+    /// region, and encrypted by default with `kms_key_arn` when one is given.
+    ///
+    /// # Errors
+    ///
+    /// `Other` when AWS cannot be reached, or refuses to say whether the bucket
+    /// exists, to create it or to set its encryption.
+    #[inline]
+    pub async fn ensure(&self, kms_key_arn: Option<&str>) -> Result<(), ObjectError> {
+        if self.0.bucket_exists().await? {
+            return Ok(());
+        }
+        let mut create = self
+            .0
+            .client
+            .create_bucket()
+            .bucket(&self.0.bucket)
+            .acl(BucketCannedAcl::Private);
+        // A bucket outside us-east-1 names its region, or AWS refuses it.
+        if let Some(region) = self.0.client.config().region().map(Region::as_ref)
+            && region != "us-east-1"
+        {
+            create = create.create_bucket_configuration(
+                CreateBucketConfiguration::builder()
+                    .location_constraint(BucketLocationConstraint::from(region))
+                    .build(),
+            );
+        }
+        create.send().await.map_err(classify)?;
+        let Some(key_arn) = kms_key_arn else {
+            return Ok(());
+        };
+        let by_default = ServerSideEncryptionByDefault::builder()
+            .sse_algorithm(ServerSideEncryption::AwsKms)
+            .kms_master_key_id(key_arn)
+            .build()
+            .map_err(|error| ObjectError::from(io::Error::other(error)))?;
+        let encryption = ServerSideEncryptionConfiguration::builder()
+            .rules(
+                ServerSideEncryptionRule::builder()
+                    .apply_server_side_encryption_by_default(by_default)
+                    .bucket_key_enabled(true)
+                    .build(),
+            )
+            .build()
+            .map_err(|error| ObjectError::from(io::Error::other(error)))?;
+        self.0
+            .client
+            .put_bucket_encryption()
+            .bucket(&self.0.bucket)
+            .server_side_encryption_configuration(encryption)
+            .send()
+            .await
+            .map(drop)
+            .map_err(classify)
+    }
+
     /// A client for `config.bucket` in `config.region`, with no retries.
     #[inline]
     #[must_use]

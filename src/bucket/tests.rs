@@ -337,12 +337,14 @@ fn serve(listener: &TcpListener, answers: Vec<String>, log: &Mutex<Vec<String>>)
     }
 }
 
-/// The rest of the request that starts with `request_line`, read off `reader`, as its method and conditional headers.
+/// The rest of the request that starts with `request_line`, read off `reader`, as its method, its
+/// conditional headers, and its canned ACL and location constraint when it carries them.
 #[cfg(any(feature = "minio", feature = "s3"))]
 fn read_request(request_line: &str, reader: &mut BufReader<TcpStream>) -> String {
     let mut length = 0_u64;
     let mut if_match = String::from("-");
     let mut if_none_match = None;
+    let mut acl = None;
     loop {
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
@@ -353,15 +355,22 @@ fn read_request(request_line: &str, reader: &mut BufReader<TcpStream>) -> String
             "content-length" => length = value.trim().parse().unwrap(),
             "if-match" => value.trim().clone_into(&mut if_match),
             "if-none-match" => if_none_match = Some(value.trim().to_owned()),
+            "x-amz-acl" => acl = Some(value.trim().to_owned()),
             _ => {}
         }
     }
-    io::copy(&mut reader.take(length), &mut io::sink()).unwrap();
+    let mut body = Vec::new();
+    reader.take(length).read_to_end(&mut body).unwrap();
+    let location = String::from_utf8_lossy(&body)
+        .split_once("<LocationConstraint>")
+        .and_then(|(_, rest)| rest.split_once("</LocationConstraint>"))
+        .map(|(region, _)| region.to_owned());
     let method = request_line.split(' ').next().unwrap();
-    if_none_match.map_or_else(
-        || format!("{method} if-match={if_match}"),
-        |value| format!("{method} if-match={if_match} if-none-match={value}"),
-    )
+    let mut parts = vec![method.to_owned(), format!("if-match={if_match}")];
+    parts.extend(if_none_match.map(|value| format!("if-none-match={value}")));
+    parts.extend(acl.map(|value| format!("acl={value}")));
+    parts.extend(location.map(|region| format!("location={region}")));
+    parts.join(" ")
 }
 
 /// An HTTP answer with `status`, the header lines in `headers` and `body`.
@@ -733,6 +742,58 @@ fn minio_head_without_a_content_length_is_other() {
     );
 }
 
+/// A 403 answer whose S3 error body carries `AccessDenied`.
+#[cfg(any(feature = "minio", feature = "s3"))]
+fn access_denied() -> String {
+    answer(
+        "403 Forbidden",
+        "Content-Type: application/xml\r\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>AccessDenied</Code><Message>Access Denied.</Message></Error>",
+    )
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_ensure_on_an_existing_bucket_sends_one_head() {
+    let (endpoint, seen) = canned(vec![answer("200 OK", "", "")]);
+    let bucket = minio(endpoint);
+    bucket.runtime.block_on(bucket.bucket.ensure()).unwrap();
+    assert_eq!(requests(&seen), ["HEAD if-match=-"]);
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_ensure_creates_a_missing_bucket_with_no_acl_and_no_location() {
+    let (endpoint, seen) = canned(vec![
+        answer("404 Not Found", "", ""),
+        answer("200 OK", "", ""),
+    ]);
+    let bucket = minio(endpoint);
+    bucket.runtime.block_on(bucket.bucket.ensure()).unwrap();
+    assert_eq!(requests(&seen), ["HEAD if-match=-", "PUT if-match=-"]);
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_ensure_with_the_head_refused_is_other_and_creates_nothing() {
+    let (endpoint, seen) = canned(vec![access_denied()]);
+    let bucket = minio(endpoint);
+    let error = bucket.runtime.block_on(bucket.bucket.ensure()).unwrap_err();
+    assert_eq!(error.kind(), ObjectErrorKind::Other);
+    assert_eq!(requests(&seen), ["HEAD if-match=-"]);
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_ensure_with_the_create_refused_is_other_naming_the_answer() {
+    let (endpoint, seen) = canned(vec![answer("404 Not Found", "", ""), access_denied()]);
+    let bucket = minio(endpoint);
+    let error = bucket.runtime.block_on(bucket.bucket.ensure()).unwrap_err();
+    assert_eq!(error.kind(), ObjectErrorKind::Other);
+    assert_eq!(error.to_string(), "403 AccessDenied: Access Denied.");
+    assert_eq!(requests(&seen), ["HEAD if-match=-", "PUT if-match=-"]);
+}
+
 /// The configuration every AWS S3 scenario uses.
 #[cfg(feature = "s3")]
 fn s3_config() -> S3Config {
@@ -747,7 +808,15 @@ fn s3_config() -> S3Config {
 /// A blocking AWS S3 client that reaches the canned server at `endpoint`.
 #[cfg(feature = "s3")]
 fn s3(endpoint: &str) -> BlockingBucket<S3Bucket> {
-    let sdk = S3Bucket::sdk_config(s3_config())
+    s3_in(endpoint, "us-east-1")
+}
+
+/// A blocking AWS S3 client in `region` that reaches the canned server at `endpoint`.
+#[cfg(feature = "s3")]
+fn s3_in(endpoint: &str, region: &str) -> BlockingBucket<S3Bucket> {
+    let mut config = s3_config();
+    region.clone_into(&mut config.region);
+    let sdk = S3Bucket::sdk_config(config)
         .endpoint_url(endpoint)
         .force_path_style(true)
         .build();
@@ -857,6 +926,89 @@ fn s3_head_of_a_missing_object_in_an_existing_bucket_is_not_found() {
     let error = s3(&endpoint).head("task.md").unwrap_err();
     assert_eq!(error.kind(), ObjectErrorKind::NotFound);
     assert_eq!(requests(&seen), ["HEAD if-match=-", "HEAD if-match=-"]);
+}
+
+#[cfg(feature = "s3")]
+#[test]
+fn s3_ensure_on_an_existing_bucket_sends_one_head() {
+    let (endpoint, seen) = canned(vec![answer("200 OK", "", "")]);
+    let bucket = s3(&endpoint);
+    bucket
+        .runtime
+        .block_on(
+            bucket
+                .bucket
+                .ensure(Some("arn:aws:kms:us-east-1:111122223333:key/a")),
+        )
+        .unwrap();
+    assert_eq!(requests(&seen), ["HEAD if-match=-"]);
+}
+
+#[cfg(feature = "s3")]
+#[test]
+fn s3_ensure_with_a_key_creates_a_private_bucket_then_sets_its_encryption() {
+    let (endpoint, seen) = canned(vec![
+        answer("404 Not Found", "", ""),
+        answer("200 OK", "", ""),
+        answer("200 OK", "", ""),
+    ]);
+    let bucket = s3(&endpoint);
+    bucket
+        .runtime
+        .block_on(
+            bucket
+                .bucket
+                .ensure(Some("arn:aws:kms:us-east-1:111122223333:key/a")),
+        )
+        .unwrap();
+    assert_eq!(
+        requests(&seen),
+        [
+            "HEAD if-match=-",
+            "PUT if-match=- acl=private",
+            "PUT if-match=-"
+        ]
+    );
+}
+
+#[cfg(feature = "s3")]
+#[test]
+fn s3_ensure_without_a_key_outside_us_east_1_names_the_region_and_sets_no_encryption() {
+    let (endpoint, seen) = canned(vec![
+        answer("404 Not Found", "", ""),
+        answer("200 OK", "", ""),
+    ]);
+    let bucket = s3_in(&endpoint, "eu-west-1");
+    bucket.runtime.block_on(bucket.bucket.ensure(None)).unwrap();
+    assert_eq!(
+        requests(&seen),
+        [
+            "HEAD if-match=-",
+            "PUT if-match=- acl=private location=eu-west-1"
+        ]
+    );
+}
+
+#[cfg(feature = "s3")]
+#[test]
+fn s3_ensure_with_the_encryption_refused_is_other_naming_the_answer() {
+    let (endpoint, seen) = canned(vec![
+        answer("404 Not Found", "", ""),
+        answer("200 OK", "", ""),
+        access_denied(),
+    ]);
+    let bucket = s3(&endpoint);
+    let error = bucket
+        .runtime
+        .block_on(
+            bucket
+                .bucket
+                .ensure(Some("arn:aws:kms:us-east-1:111122223333:key/a")),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), ObjectErrorKind::Other);
+    assert_eq!(error.to_string(), "403 AccessDenied: Access Denied.");
+    assert_eq!(requests(&seen).len(), 3);
 }
 
 #[cfg(feature = "s3")]
