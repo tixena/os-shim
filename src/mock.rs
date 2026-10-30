@@ -59,10 +59,10 @@
 //! ```
 //! use os_shim::{System, mock::MemorySystem};
 //! use std::path::Path;
-//! use std::time::Duration;
+//! use std::time::{Duration, SystemTime};
 //!
 //! let system = MemorySystem::new().with_file("/app.lock", b"owner-1")?;
-//! let taken_at = system.metadata(Path::new("/app.lock"))?.modified;
+//! let taken_at = system.metadata(Path::new("/app.lock"))?.modified.unwrap_or(SystemTime::UNIX_EPOCH);
 //!
 //! system.sleep(Duration::from_secs(61))?;
 //!
@@ -232,9 +232,9 @@ impl MemorySystem {
     ///
     /// let old = system.metadata(Path::new("/old.txt"))?.modified;
     /// let new = system.metadata(Path::new("/new.txt"))?.modified;
-    /// assert_eq!(old, SystemTime::UNIX_EPOCH);
-    /// assert_eq!(new, SystemTime::UNIX_EPOCH + Duration::from_secs(30));
-    /// assert_eq!(system.now(), new);
+    /// assert_eq!(old, Some(SystemTime::UNIX_EPOCH));
+    /// assert_eq!(new, Some(SystemTime::UNIX_EPOCH + Duration::from_secs(30)));
+    /// assert_eq!(Some(system.now()), new);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     ///
@@ -615,7 +615,7 @@ impl MemorySystem {
     ///
     /// let meta = system.metadata(Path::new("/data/in.csv"))?;
     /// assert_eq!(meta.len, 8);
-    /// assert_eq!(meta.modified, at);
+    /// assert_eq!(meta.modified, Some(at));
     /// assert!(system.is_dir(Path::new("/data"))?);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
@@ -933,7 +933,8 @@ impl System for MemorySystem {
             is_dir,
             is_file,
             len,
-            modified,
+            modified: Some(modified),
+            revision: None,
         })
     }
 

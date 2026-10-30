@@ -2,13 +2,13 @@
 //! and the two transcripts must be equal. `minio_tests` runs them against a
 //! MinIO-compatible server, `s3_tests` against an AWS bucket.
 
-use super::{
-    BlockingBucket, Bucket, Condition, Head, MemoryBucket, Object, ObjectError, ObjectErrorKind,
-};
+use super::{BlockingBucket, Bucket, Condition, Depth, MemoryBucket, RevisionToken};
 #[cfg(minio_tests)]
 use super::{MinioBucket, MinioConfig};
 #[cfg(s3_tests)]
 use super::{S3Bucket, S3Config};
+use crate::error::{ErrorKind, Result};
+use crate::{FileMetadata, WalkEntry};
 #[cfg(s3_tests)]
 use aws_sdk_s3::types::BucketLocationConstraint;
 use aws_sdk_s3::{
@@ -16,7 +16,9 @@ use aws_sdk_s3::{
     config::{BehaviorVersion, Credentials, Region, retry::RetryConfig},
     error::SdkError,
 };
+use core::result;
 use std::env;
+use std::path::{Path, PathBuf};
 use std::process;
 #[cfg(minio_tests)]
 use std::sync::OnceLock;
@@ -84,36 +86,60 @@ fn server() -> BlockingBucket<MinioBucket> {
     BlockingBucket::new(MinioBucket::new(ready_config())).unwrap()
 }
 
-/// What an answer looks like with its tag hidden: `tag`, the shown value, `NotFound`, `PreconditionFailed` or `Other`.
-fn shape<T>(answer: &Result<T, ObjectError>, show: impl Fn(&T) -> String) -> String {
+/// What an answer looks like with its token hidden: `tag`, the shown value, or the kind of its error.
+fn shape<T>(answer: &Result<T>, show: impl Fn(&T) -> String) -> String {
     match answer.as_ref() {
         Ok(value) => show(value),
-        Err(error) => match error.kind() {
-            ObjectErrorKind::NotFound => "NotFound".to_owned(),
-            ObjectErrorKind::PreconditionFailed => "PreconditionFailed".to_owned(),
-            ObjectErrorKind::Other => "Other".to_owned(),
-        },
+        Err(error) => format!("{:?}", error.kind()),
     }
 }
 
 /// The line for a put's answer.
-fn put_line(answer: &Result<String, ObjectError>) -> String {
+fn put_line(answer: &Result<RevisionToken>) -> String {
     shape(answer, |_| "tag".to_owned())
 }
 
 /// The line for a get's answer.
-fn get_line(answer: &Result<Object, ObjectError>) -> String {
-    shape(answer, |object| format!("bytes {:?}", object.bytes))
+fn get_line(answer: &Result<(Vec<u8>, RevisionToken)>) -> String {
+    shape(answer, |found| format!("bytes {:?}", found.0))
 }
 
 /// The line for a head's answer.
-fn head_line(answer: &Result<Head, ObjectError>) -> String {
-    shape(answer, |head| format!("size {}", head.size))
+fn head_line(answer: &Result<FileMetadata>) -> String {
+    shape(answer, |head| {
+        format!(
+            "file {} dir {} size {} modified {} token {}",
+            head.is_file,
+            head.is_dir,
+            head.len,
+            head.modified.is_some(),
+            head.revision.is_some()
+        )
+    })
 }
 
 /// The line for a delete's answer.
-fn delete_line(answer: &Result<(), ObjectError>) -> String {
+fn delete_line(answer: &Result<()>) -> String {
     shape(answer, |&()| "deleted".to_owned())
+}
+
+/// The line for a listing's answer: the paths below `base`, sorted, folders ending in `/`.
+fn list_line(answer: &Result<Vec<WalkEntry>>, base: &str) -> String {
+    shape(answer, |entries| {
+        let mut shown: Vec<String> = entries
+            .iter()
+            .map(|entry| {
+                let relative = entry.path.strip_prefix(base).unwrap_or(&entry.path);
+                format!(
+                    "{}{}",
+                    relative.display(),
+                    if entry.is_dir { "/" } else { "" }
+                )
+            })
+            .collect();
+        shown.sort();
+        format!("paths {shown:?}")
+    })
 }
 
 /// Print the server's transcript and assert it equals the memory one.
@@ -122,146 +148,244 @@ fn assert_agree(name: &str, memory_transcript: &[String], server_transcript: &[S
     assert_eq!(memory_transcript, server_transcript);
 }
 
-/// A put, a get and the tag the put returned.
-fn put_and_get<B>(bucket: &BlockingBucket<B>, prefix: &str) -> Vec<String>
+/// Create the folder where the backend has folders, and do nothing where it has none.
+fn ensure_folder<B>(bucket: &BlockingBucket<B>, folder: &str)
 where
     B: Bucket,
 {
-    let key = format!("{prefix}note.md");
+    let created = bucket.create_folder(Path::new(folder));
+    if created
+        .as_ref()
+        .is_err_and(|error| error.kind() == ErrorKind::Unsupported)
+    {
+        return;
+    }
+    created.unwrap();
+}
+
+/// A put, a get and the token the put returned.
+fn put_and_get<B>(bucket: &BlockingBucket<B>, base: &str) -> Vec<String>
+where
+    B: Bucket,
+{
+    ensure_folder(bucket, base);
+    let path = PathBuf::from(format!("{base}/note.md"));
     let mut transcript = Vec::new();
-    let put = bucket.put(&key, b"# Note\n", &Condition::None);
+    let put = bucket.put(&path, b"# Note\n", &Condition::None);
     transcript.push(put_line(&put));
-    let got = bucket.get(&key);
+    let got = bucket.get(&path);
     transcript.push(get_line(&got));
     transcript.push(format!(
-        "get tag equals put tag: {}",
-        got.unwrap().etag == put.unwrap()
+        "get token equals put token: {}",
+        got.unwrap().1 == put.unwrap()
     ));
     transcript
 }
 
-/// A head of a key that holds nothing, then of the same key after a put, against the put's tag.
-fn head_after_put<B>(bucket: &BlockingBucket<B>, prefix: &str) -> Vec<String>
+/// A head of a path that holds nothing, then of the same path after a put, against the put's token.
+fn head_after_put<B>(bucket: &BlockingBucket<B>, base: &str) -> Vec<String>
 where
     B: Bucket,
 {
-    let key = format!("{prefix}note.md");
-    let missing = bucket.head(&key);
-    let put = bucket.put(&key, b"12345", &Condition::None);
-    let found = bucket.head(&key);
+    ensure_folder(bucket, base);
+    let path = PathBuf::from(format!("{base}/note.md"));
+    let missing = bucket.head(&path);
+    let put = bucket.put(&path, b"12345", &Condition::None);
+    let found = bucket.head(&path);
     vec![
         head_line(&missing),
         put_line(&put),
         head_line(&found),
         format!(
-            "head tag equals put tag: {}",
-            found.unwrap().etag == put.unwrap()
+            "head token equals put token: {}",
+            found.unwrap().revision == Some(put.unwrap())
         ),
     ]
 }
 
-/// Puts and deletes under `Absent` and under current and stale tags.
-fn conditional_writes<B>(bucket: &BlockingBucket<B>, prefix: &str) -> Vec<String>
+/// Puts and deletes under `Absent` and under current and stale tokens.
+fn conditional_writes<B>(bucket: &BlockingBucket<B>, base: &str) -> Vec<String>
 where
     B: Bucket,
 {
-    let key = format!("{prefix}task.md");
+    ensure_folder(bucket, base);
+    let path = PathBuf::from(format!("{base}/task.md"));
     let mut transcript = Vec::new();
-    let created = bucket.put(&key, b"# Task\n", &Condition::Absent);
+    let created = bucket.put(&path, b"# Task\n", &Condition::Absent);
     transcript.push(put_line(&created));
     transcript.push(put_line(&bucket.put(
-        &key,
+        &path,
         b"# Other\n",
         &Condition::Absent,
     )));
     let first = created.unwrap();
-    let replaced = bucket.put(&key, b"# Done\n", &Condition::ETag(first.clone()));
+    let replaced = bucket.put(&path, b"# Done\n", &Condition::Matches(first.clone()));
     transcript.push(put_line(&replaced));
     transcript.push(put_line(&bucket.put(
-        &key,
+        &path,
         b"# Late\n",
-        &Condition::ETag(first.clone()),
+        &Condition::Matches(first.clone()),
     )));
-    transcript.push(get_line(&bucket.get(&key)));
-    transcript.push(delete_line(&bucket.delete(&key, &Condition::ETag(first))));
+    transcript.push(get_line(&bucket.get(&path)));
     transcript.push(delete_line(
-        &bucket.delete(&key, &Condition::ETag(replaced.unwrap())),
+        &bucket.delete(&path, &Condition::Matches(first)),
     ));
-    transcript.push(get_line(&bucket.get(&key)));
+    transcript.push(delete_line(
+        &bucket.delete(&path, &Condition::Matches(replaced.unwrap())),
+    ));
+    transcript.push(get_line(&bucket.get(&path)));
     transcript
 }
 
-/// Deletes of a key that holds nothing, under each condition.
-fn missing_key_deletes<B>(bucket: &BlockingBucket<B>, prefix: &str) -> Vec<String>
+/// Deletes of a path that holds nothing, under each condition.
+fn missing_path_deletes<B>(bucket: &BlockingBucket<B>, base: &str) -> Vec<String>
 where
     B: Bucket,
 {
-    let key = format!("{prefix}none.md");
+    ensure_folder(bucket, base);
+    let path = PathBuf::from(format!("{base}/none.md"));
     vec![
-        delete_line(&bucket.delete(&key, &Condition::None)),
-        delete_line(&bucket.delete(&key, &Condition::ETag("\"0123456789abcdef\"".to_owned()))),
-        delete_line(&bucket.delete(&key, &Condition::Absent)),
+        delete_line(&bucket.delete(&path, &Condition::None)),
+        delete_line(&bucket.delete(
+            &path,
+            &Condition::Matches(RevisionToken::new("\"0123456789abcdef\"")),
+        )),
+        delete_line(&bucket.delete(&path, &Condition::Absent)),
     ]
 }
 
-/// A put under a stale tag at a key that holds nothing, and a get of that key.
-fn missing_key_tagged_put<B>(bucket: &BlockingBucket<B>, prefix: &str) -> Vec<String>
+/// A delete of a path that holds a file, under `Absent`, and what is left.
+fn absent_delete_over_a_file<B>(bucket: &BlockingBucket<B>, base: &str) -> Vec<String>
 where
     B: Bucket,
 {
-    let key = format!("{prefix}none.md");
+    ensure_folder(bucket, base);
+    let path = PathBuf::from(format!("{base}/kept.md"));
+    let put = bucket.put(&path, b"kept", &Condition::None);
     vec![
-        put_line(&bucket.put(&key, b"# Task\n", &Condition::ETag("\"stale\"".to_owned()))),
-        get_line(&bucket.get(&key)),
+        put_line(&put),
+        delete_line(&bucket.delete(&path, &Condition::Absent)),
+        get_line(&bucket.get(&path)),
     ]
 }
 
-/// Tags of the same bytes at two keys, and of different bytes.
-fn same_bytes_tags<B>(bucket: &BlockingBucket<B>, prefix: &str) -> Vec<String>
+/// A put under a stale token at a path that holds nothing, and a get of that path.
+fn missing_path_tokened_put<B>(bucket: &BlockingBucket<B>, base: &str) -> Vec<String>
 where
     B: Bucket,
 {
-    let one = bucket.put(&format!("{prefix}one.md"), b"same", &Condition::None);
-    let two = bucket.put(&format!("{prefix}two.md"), b"same", &Condition::None);
-    let other = bucket.put(&format!("{prefix}other.md"), b"different", &Condition::None);
-    let one_tag = one.unwrap();
+    ensure_folder(bucket, base);
+    let path = PathBuf::from(format!("{base}/none.md"));
     vec![
-        format!("same bytes, same tag: {}", one_tag == two.unwrap()),
-        format!("other bytes, same tag: {}", one_tag == other.unwrap()),
+        put_line(&bucket.put(
+            &path,
+            b"# Task\n",
+            &Condition::Matches(RevisionToken::new("\"stale\"")),
+        )),
+        get_line(&bucket.get(&path)),
     ]
 }
 
-/// A listing of 1,001 keys, more than one page holds.
-fn long_listing<B>(bucket: &BlockingBucket<B>, prefix: &str) -> Vec<String>
+/// Tokens of different bytes at one path, and of the same bytes at two paths.
+fn rewritten_tokens<B>(bucket: &BlockingBucket<B>, base: &str) -> Vec<String>
 where
     B: Bucket,
 {
+    ensure_folder(bucket, base);
+    let one = bucket.put(
+        &PathBuf::from(format!("{base}/one.md")),
+        b"first",
+        &Condition::None,
+    );
+    let again = bucket.put(
+        &PathBuf::from(format!("{base}/one.md")),
+        b"second",
+        &Condition::None,
+    );
+    let one_token = one.unwrap();
+    vec![format!(
+        "rewrite changes the token: {}",
+        one_token != again.unwrap()
+    )]
+}
+
+/// A listing of 1,001 files, more than one page holds.
+fn long_listing<B>(bucket: &BlockingBucket<B>, base: &str) -> Vec<String>
+where
+    B: Bucket,
+{
+    ensure_folder(bucket, base);
     let expected: Vec<String> = (0_u32..=1000_u32)
-        .map(|index| format!("{prefix}{index:04}"))
+        .map(|index| format!("{base}/{index:04}"))
         .collect();
-    for key in &expected {
-        bucket.put(key, b"x", &Condition::None).unwrap();
+    for path in &expected {
+        bucket.put(Path::new(path), b"x", &Condition::None).unwrap();
     }
-    let mut listed = bucket.list(prefix).unwrap();
+    let listed = bucket.list(Path::new(base), Depth::All).unwrap();
     let count = listed.len();
-    listed.sort();
+    let mut paths: Vec<String> = listed
+        .iter()
+        .map(|entry| entry.path.display().to_string())
+        .collect();
+    paths.sort();
     vec![
-        format!("keys {count}"),
-        format!("every key once: {}", listed == expected),
+        format!("entries {count}"),
+        format!("every path once: {}", paths == expected),
     ]
 }
 
-/// A listing under a prefix no key has.
-fn empty_listing<B>(bucket: &BlockingBucket<B>, prefix: &str) -> Vec<String>
+/// A listing below a folder nothing is in.
+fn empty_listing<B>(bucket: &BlockingBucket<B>, base: &str) -> Vec<String>
 where
     B: Bucket,
 {
-    let listed = bucket.list(&format!("{prefix}nothing-here/"));
-    vec![format!("keys {:?}", listed.unwrap())]
+    ensure_folder(bucket, base);
+    let folder = format!("{base}/nothing-here");
+    vec![list_line(
+        &bucket.list(Path::new(&folder), Depth::All),
+        &folder,
+    )]
+}
+
+/// Children of a folder with a file and a subfolder holding a file.
+fn children_listing<B>(bucket: &BlockingBucket<B>, base: &str) -> Vec<String>
+where
+    B: Bucket,
+{
+    ensure_folder(bucket, &format!("{base}/sub"));
+    bucket
+        .put(
+            &PathBuf::from(format!("{base}/top.md")),
+            b"t",
+            &Condition::None,
+        )
+        .unwrap();
+    bucket
+        .put(
+            &PathBuf::from(format!("{base}/sub/deep.md")),
+            b"d",
+            &Condition::None,
+        )
+        .unwrap();
+    vec![list_line(
+        &bucket.list(Path::new(base), Depth::Children),
+        base,
+    )]
+}
+
+/// Relative paths and `..` above the root are refused before any request.
+fn refused_paths<B>(bucket: &BlockingBucket<B>) -> Vec<String>
+where
+    B: Bucket,
+{
+    vec![
+        get_line(&bucket.get(Path::new("relative/note.md"))),
+        get_line(&bucket.get(Path::new("/../note.md"))),
+    ]
 }
 
 /// The status an SDK answer carried, or `accepted` when it succeeded.
-fn status<T, E>(answer: &Result<T, SdkError<E>>) -> String {
+fn status<T, E>(answer: &result::Result<T, SdkError<E>>) -> String {
     match answer.as_ref() {
         Ok(_) => "accepted".to_owned(),
         Err(error) => format!(
@@ -275,11 +399,11 @@ fn status<T, E>(answer: &Result<T, SdkError<E>>) -> String {
 
 #[cfg(minio_tests)]
 #[test]
-fn put_and_get_agree_with_the_server() {
+fn put_and_get_agrees_with_the_server() {
     assert_agree(
         "put and get",
-        &put_and_get(&memory(), "a/"),
-        &put_and_get(&server(), "put-and-get/"),
+        &put_and_get(&memory(), "/a"),
+        &put_and_get(&server(), "/put-and-get"),
     );
 }
 
@@ -288,48 +412,58 @@ fn put_and_get_agree_with_the_server() {
 fn head_after_put_agrees_with_the_server() {
     assert_agree(
         "head after put",
-        &head_after_put(&memory(), "a/"),
-        &head_after_put(&server(), "head-after-put/"),
+        &head_after_put(&memory(), "/a"),
+        &head_after_put(&server(), "/head-after-put"),
     );
 }
 
 #[cfg(minio_tests)]
 #[test]
-fn conditional_writes_agree_with_the_server() {
+fn conditional_writes_agrees_with_the_server() {
     assert_agree(
         "conditional writes",
-        &conditional_writes(&memory(), "a/"),
-        &conditional_writes(&server(), "conditional-writes/"),
+        &conditional_writes(&memory(), "/a"),
+        &conditional_writes(&server(), "/conditional-writes"),
     );
 }
 
 #[cfg(minio_tests)]
 #[test]
-fn missing_key_deletes_agree_with_the_server() {
+fn missing_path_deletes_agrees_with_the_server() {
     assert_agree(
-        "missing key deletes",
-        &missing_key_deletes(&memory(), "a/"),
-        &missing_key_deletes(&server(), "missing-key-deletes/"),
+        "missing path deletes",
+        &missing_path_deletes(&memory(), "/a"),
+        &missing_path_deletes(&server(), "/missing-path-deletes"),
     );
 }
 
 #[cfg(minio_tests)]
 #[test]
-fn missing_key_tagged_put_agrees_with_the_server() {
+fn absent_delete_over_a_file_agrees_with_the_server() {
     assert_agree(
-        "missing key tagged put",
-        &missing_key_tagged_put(&memory(), "a/"),
-        &missing_key_tagged_put(&server(), "missing-key-tagged-put/"),
+        "absent delete over a file",
+        &absent_delete_over_a_file(&memory(), "/a"),
+        &absent_delete_over_a_file(&server(), "/absent-delete-over-a-file"),
     );
 }
 
 #[cfg(minio_tests)]
 #[test]
-fn same_bytes_tags_agree_with_the_server() {
+fn missing_path_tokened_put_agrees_with_the_server() {
     assert_agree(
-        "same bytes tags",
-        &same_bytes_tags(&memory(), "a/"),
-        &same_bytes_tags(&server(), "same-bytes-tags/"),
+        "missing path tokened put",
+        &missing_path_tokened_put(&memory(), "/a"),
+        &missing_path_tokened_put(&server(), "/missing-path-tokened-put"),
+    );
+}
+
+#[cfg(minio_tests)]
+#[test]
+fn rewritten_tokens_agrees_with_the_server() {
+    assert_agree(
+        "rewritten tokens",
+        &rewritten_tokens(&memory(), "/a"),
+        &rewritten_tokens(&server(), "/rewritten-tokens"),
     );
 }
 
@@ -338,8 +472,8 @@ fn same_bytes_tags_agree_with_the_server() {
 fn long_listing_agrees_with_the_server() {
     assert_agree(
         "long listing",
-        &long_listing(&memory(), "a/"),
-        &long_listing(&server(), "long-listing/"),
+        &long_listing(&memory(), "/a"),
+        &long_listing(&server(), "/long-listing"),
     );
 }
 
@@ -348,8 +482,28 @@ fn long_listing_agrees_with_the_server() {
 fn empty_listing_agrees_with_the_server() {
     assert_agree(
         "empty listing",
-        &empty_listing(&memory(), "a/"),
-        &empty_listing(&server(), "empty-listing/"),
+        &empty_listing(&memory(), "/a"),
+        &empty_listing(&server(), "/empty-listing"),
+    );
+}
+
+#[cfg(minio_tests)]
+#[test]
+fn children_listing_agrees_with_the_server() {
+    assert_agree(
+        "children listing",
+        &children_listing(&memory(), "/a"),
+        &children_listing(&server(), "/children-listing"),
+    );
+}
+
+#[cfg(minio_tests)]
+#[test]
+fn refused_paths_agree_with_the_server() {
+    assert_agree(
+        "refused paths",
+        &refused_paths(&memory()),
+        &refused_paths(&server()),
     );
 }
 
@@ -359,7 +513,8 @@ fn observe_a_raw_delete_with_a_wrong_if_match() {
     let config = ready_config();
     let bucket = server();
     let key = "observe-raw-delete/note.md";
-    bucket.put(key, b"kept", &Condition::None).unwrap();
+    let path = Path::new("/observe-raw-delete/note.md");
+    bucket.put(path, b"kept", &Condition::None).unwrap();
     let answer = runtime().block_on(
         client(&config)
             .delete_object()
@@ -369,22 +524,22 @@ fn observe_a_raw_delete_with_a_wrong_if_match() {
             .send(),
     );
     eprintln!("raw delete with a wrong If-Match: {}", status(&answer));
-    eprintln!("object afterwards: {}", get_line(&bucket.get(key)));
+    eprintln!("object afterwards: {}", get_line(&bucket.get(path)));
 }
 
 #[cfg(minio_tests)]
 #[test]
 fn observe_a_put_with_the_tag_stripped_of_its_quotes() {
     let bucket = server();
-    let key = "observe-unquoted-tag/note.md";
-    let tag = bucket.put(key, b"first", &Condition::None).unwrap();
+    let path = Path::new("/observe-unquoted-tag/note.md");
+    let tag = bucket.put(path, b"first", &Condition::None).unwrap();
     let answer = bucket.put(
-        key,
+        path,
         b"second",
-        &Condition::ETag(tag.trim_matches('"').to_owned()),
+        &Condition::Matches(RevisionToken::new(tag.as_str().trim_matches('"'))),
     );
     eprintln!("put with an unquoted tag: {}", put_line(&answer));
-    eprintln!("object afterwards: {}", get_line(&bucket.get(key)));
+    eprintln!("object afterwards: {}", get_line(&bucket.get(path)));
 }
 
 /// Not a parity sequence, since `MemoryBucket` has no missing-bucket state: every call to
@@ -395,16 +550,21 @@ fn a_missing_bucket_is_other_on_the_server() {
     let mut config = config();
     "os-shim-no-such-bucket".clone_into(&mut config.bucket);
     let bucket = BlockingBucket::new(MinioBucket::new(config)).unwrap();
-    let key = "missing-bucket/note.md";
-    let got = bucket.get(key);
+    let path = Path::new("/missing-bucket/note.md");
+    let got = bucket.get(path);
     let transcript = vec![
         get_line(&got),
-        head_line(&bucket.head(key)),
-        put_line(&bucket.put(key, b"# Note\n", &Condition::None)),
-        put_line(&bucket.put(key, b"# Note\n", &Condition::ETag("\"stale\"".to_owned()))),
-        shape(&bucket.list("missing-bucket/"), |keys| {
-            format!("keys {keys:?}")
-        }),
+        head_line(&bucket.head(path)),
+        put_line(&bucket.put(path, b"# Note\n", &Condition::None)),
+        put_line(&bucket.put(
+            path,
+            b"# Note\n",
+            &Condition::Matches(RevisionToken::new("\"stale\"")),
+        )),
+        list_line(
+            &bucket.list(Path::new("/missing-bucket"), Depth::All),
+            "/missing-bucket",
+        ),
     ];
     eprintln!("missing bucket on the server:\n{}", transcript.join("\n"));
     assert_eq!(transcript, ["Other", "Other", "Other", "Other", "Other"]);
@@ -418,10 +578,13 @@ fn a_delete_on_a_missing_bucket_is_other_on_the_server() {
     let mut config = config();
     "os-shim-no-such-bucket".clone_into(&mut config.bucket);
     let bucket = BlockingBucket::new(MinioBucket::new(config)).unwrap();
-    let key = "missing-bucket/note.md";
-    for condition in [Condition::Absent, Condition::ETag("\"x\"".to_owned())] {
-        let error = bucket.delete(key, &condition).unwrap_err();
-        assert_eq!(error.kind(), ObjectErrorKind::Other, "{condition:?}");
+    let path = Path::new("/missing-bucket/note.md");
+    for condition in [
+        Condition::Absent,
+        Condition::Matches(RevisionToken::new("\"x\"")),
+    ] {
+        let error = bucket.delete(path, &condition).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Other, "{condition:?}");
         assert!(
             error.to_string().contains("os-shim-no-such-bucket"),
             "{error}"
@@ -439,11 +602,12 @@ fn ensure_creates_a_missing_bucket_on_the_server() {
     let sdk = client(&config);
     let bucket = BlockingBucket::new(MinioBucket::new(config.clone())).unwrap();
     let key = "ensure/note.md";
-    let before = bucket.get(key);
+    let path = Path::new("/ensure/note.md");
+    let before = bucket.get(path);
     let created = bucket.runtime.block_on(bucket.bucket.ensure());
     let again = bucket.runtime.block_on(bucket.bucket.ensure());
-    let put = bucket.put(key, b"# Note\n", &Condition::None);
-    let got = bucket.get(key);
+    let put = bucket.put(path, b"# Note\n", &Condition::None);
+    let got = bucket.get(path);
     let removed = bucket
         .runtime
         .block_on(sdk.delete_object().bucket(&config.bucket).key(key).send());
@@ -520,14 +684,14 @@ fn aws_client_in(region: &str) -> Client {
 /// A key prefix no other run or sequence shares.
 #[cfg(s3_tests)]
 fn run_prefix(name: &str) -> String {
-    format!("os-shim-tests/{}-{name}/", process::id())
+    format!("/os-shim-tests/{}-{name}", process::id())
 }
 
 /// Delete every key under `prefix`.
 #[cfg(s3_tests)]
 fn remove_prefix(bucket: &BlockingBucket<S3Bucket>, prefix: &str) {
-    for key in bucket.list(prefix).unwrap() {
-        bucket.delete(&key, &Condition::None).unwrap();
+    for entry in bucket.list(Path::new(prefix), Depth::All).unwrap() {
+        bucket.delete(&entry.path, &Condition::None).unwrap();
     }
 }
 
@@ -546,10 +710,10 @@ fn aws_transcript(
 
 #[cfg(s3_tests)]
 #[test]
-fn put_and_get_agree_with_aws() {
+fn put_and_get_agrees_with_aws() {
     assert_agree(
         "put and get",
-        &put_and_get(&memory(), "a/"),
+        &put_and_get(&memory(), "/a"),
         &aws_transcript("put-and-get", put_and_get),
     );
 }
@@ -559,48 +723,58 @@ fn put_and_get_agree_with_aws() {
 fn head_after_put_agrees_with_aws() {
     assert_agree(
         "head after put",
-        &head_after_put(&memory(), "a/"),
+        &head_after_put(&memory(), "/a"),
         &aws_transcript("head-after-put", head_after_put),
     );
 }
 
 #[cfg(s3_tests)]
 #[test]
-fn conditional_writes_agree_with_aws() {
+fn conditional_writes_agrees_with_aws() {
     assert_agree(
         "conditional writes",
-        &conditional_writes(&memory(), "a/"),
+        &conditional_writes(&memory(), "/a"),
         &aws_transcript("conditional-writes", conditional_writes),
     );
 }
 
 #[cfg(s3_tests)]
 #[test]
-fn missing_key_deletes_agree_with_aws() {
+fn missing_path_deletes_agrees_with_aws() {
     assert_agree(
-        "missing key deletes",
-        &missing_key_deletes(&memory(), "a/"),
-        &aws_transcript("missing-key-deletes", missing_key_deletes),
+        "missing path deletes",
+        &missing_path_deletes(&memory(), "/a"),
+        &aws_transcript("missing-path-deletes", missing_path_deletes),
     );
 }
 
 #[cfg(s3_tests)]
 #[test]
-fn missing_key_tagged_put_agrees_with_aws() {
+fn absent_delete_over_a_file_agrees_with_aws() {
     assert_agree(
-        "missing key tagged put",
-        &missing_key_tagged_put(&memory(), "a/"),
-        &aws_transcript("missing-key-tagged-put", missing_key_tagged_put),
+        "absent delete over a file",
+        &absent_delete_over_a_file(&memory(), "/a"),
+        &aws_transcript("absent-delete-over-a-file", absent_delete_over_a_file),
     );
 }
 
 #[cfg(s3_tests)]
 #[test]
-fn same_bytes_tags_agree_with_aws() {
+fn missing_path_tokened_put_agrees_with_aws() {
     assert_agree(
-        "same bytes tags",
-        &same_bytes_tags(&memory(), "a/"),
-        &aws_transcript("same-bytes-tags", same_bytes_tags),
+        "missing path tokened put",
+        &missing_path_tokened_put(&memory(), "/a"),
+        &aws_transcript("missing-path-tokened-put", missing_path_tokened_put),
+    );
+}
+
+#[cfg(s3_tests)]
+#[test]
+fn rewritten_tokens_agrees_with_aws() {
+    assert_agree(
+        "rewritten tokens",
+        &rewritten_tokens(&memory(), "/a"),
+        &aws_transcript("rewritten-tokens", rewritten_tokens),
     );
 }
 
@@ -609,7 +783,7 @@ fn same_bytes_tags_agree_with_aws() {
 fn long_listing_agrees_with_aws() {
     assert_agree(
         "long listing",
-        &long_listing(&memory(), "a/"),
+        &long_listing(&memory(), "/a"),
         &aws_transcript("long-listing", long_listing),
     );
 }
@@ -619,8 +793,28 @@ fn long_listing_agrees_with_aws() {
 fn empty_listing_agrees_with_aws() {
     assert_agree(
         "empty listing",
-        &empty_listing(&memory(), "a/"),
+        &empty_listing(&memory(), "/a"),
         &aws_transcript("empty-listing", empty_listing),
+    );
+}
+
+#[cfg(s3_tests)]
+#[test]
+fn children_listing_agrees_with_aws() {
+    assert_agree(
+        "children listing",
+        &children_listing(&memory(), "/a"),
+        &aws_transcript("children-listing", children_listing),
+    );
+}
+
+#[cfg(s3_tests)]
+#[test]
+fn refused_paths_agree_with_aws() {
+    assert_agree(
+        "refused paths",
+        &refused_paths(&memory()),
+        &refused_paths(&aws()),
     );
 }
 
@@ -688,8 +882,13 @@ fn ensure_creates_a_private_encrypted_bucket_on_aws() {
 fn observe_a_raw_delete_with_a_wrong_if_match_on_aws() {
     let bucket = aws();
     let prefix = run_prefix("observe-raw-delete");
-    let key = format!("{prefix}note.md");
-    bucket.put(&key, b"kept", &Condition::None).unwrap();
+    let path = PathBuf::from(format!("{prefix}/note.md"));
+    let key = path
+        .display()
+        .to_string()
+        .trim_start_matches('/')
+        .to_owned();
+    bucket.put(&path, b"kept", &Condition::None).unwrap();
     let answer = runtime().block_on(
         aws_client()
             .delete_object()
@@ -699,7 +898,7 @@ fn observe_a_raw_delete_with_a_wrong_if_match_on_aws() {
             .send(),
     );
     eprintln!("raw delete with a wrong If-Match: {}", status(&answer));
-    eprintln!("object afterwards: {}", get_line(&bucket.get(&key)));
+    eprintln!("object afterwards: {}", get_line(&bucket.get(&path)));
     remove_prefix(&bucket, &prefix);
 }
 
@@ -708,14 +907,14 @@ fn observe_a_raw_delete_with_a_wrong_if_match_on_aws() {
 fn observe_a_put_with_the_tag_stripped_of_its_quotes_on_aws() {
     let bucket = aws();
     let prefix = run_prefix("observe-unquoted-tag");
-    let key = format!("{prefix}note.md");
-    let tag = bucket.put(&key, b"first", &Condition::None).unwrap();
+    let path = PathBuf::from(format!("{prefix}/note.md"));
+    let tag = bucket.put(&path, b"first", &Condition::None).unwrap();
     let answer = bucket.put(
-        &key,
+        &path,
         b"second",
-        &Condition::ETag(tag.trim_matches('"').to_owned()),
+        &Condition::Matches(RevisionToken::new(tag.as_str().trim_matches('"'))),
     );
     eprintln!("put with an unquoted tag: {}", put_line(&answer));
-    eprintln!("object afterwards: {}", get_line(&bucket.get(&key)));
+    eprintln!("object afterwards: {}", get_line(&bucket.get(&path)));
     remove_prefix(&bucket, &prefix);
 }

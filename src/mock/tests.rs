@@ -59,8 +59,8 @@ fn metadata_modified_updates_on_write() {
         .unwrap()
         .modified;
 
-    assert_eq!(mtime1, start);
-    assert_eq!(mtime2, mtime1.checked_add(Duration::from_secs(1)).unwrap());
+    assert_eq!(mtime1, Some(start));
+    assert_eq!(mtime2, start.checked_add(Duration::from_secs(1)));
 }
 
 #[test]
@@ -142,7 +142,7 @@ fn rename_keeps_the_modification_time() {
 
     assert_eq!(
         system.metadata(Path::new("/test/n.md")).unwrap().modified,
-        start
+        Some(start)
     );
 }
 
@@ -167,7 +167,7 @@ fn rename_of_a_folder_keeps_its_files_modification_times() {
 
     assert_eq!(
         system.metadata(Path::new("/test/h/k.md")).unwrap().modified,
-        start
+        Some(start)
     );
 }
 
@@ -411,7 +411,7 @@ fn files_written_after_a_sleep_take_the_moved_clock_as_modified() {
         .unwrap();
 
     let meta = system.metadata(Path::new("/test/file.txt")).unwrap();
-    assert_eq!(meta.modified, epoch_plus(102));
+    assert_eq!(meta.modified, Some(epoch_plus(102)));
 }
 
 #[cfg(feature = "async")]

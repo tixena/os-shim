@@ -1,23 +1,25 @@
-//! Tests for the in-memory bucket, the blocking wrapper, the bucket error and the `MinIO` and AWS S3 clients.
+//! Tests for the blocking wrapper, the key rules and the `MinIO` and AWS S3 clients.
 
 #![cfg(any(feature = "minio", feature = "s3"))]
 
-use super::{
-    BlockingBucket, Bucket, Condition, Head, MemoryBucket, Object, ObjectError, ObjectErrorKind,
-};
+use super::paths::key_of;
+use super::{BlockingBucket, Condition, Depth, MemoryBucket, RevisionToken};
 #[cfg(feature = "minio")]
 use super::{MinioBucket, MinioConfig};
 #[cfg(feature = "s3")]
 use super::{S3Bucket, S3Config};
-#[cfg(any(feature = "minio", feature = "s3"))]
+use crate::WalkEntry;
+use crate::error::{ErrorKind, StorageError};
 use alloc::sync::Arc;
 #[cfg(feature = "minio")]
 use aws_sdk_s3::{error::SdkError, operation::get_object::GetObjectError};
-#[cfg(not(feature = "minio"))]
-use core::error::Error as _;
+#[cfg(feature = "minio")]
+use core::time::Duration;
 #[cfg(feature = "minio")]
 use core::{error::Error, iter};
-use std::io;
+use std::path::Path;
+#[cfg(feature = "minio")]
+use std::time::UNIX_EPOCH;
 #[cfg(any(feature = "minio", feature = "s3"))]
 use std::{
     io::{BufRead as _, BufReader, Read as _, Write as _},
@@ -26,34 +28,15 @@ use std::{
     thread,
 };
 
-/// A bucket that implements only the required methods, so its `head` is the trait's default body.
-struct RequiredOnly(MemoryBucket);
+/// A list of lines the canned server records, shared with the test.
+type Log = Arc<Mutex<Vec<String>>>;
 
-impl Bucket for RequiredOnly {
-    fn delete(
-        &self,
-        key: &str,
-        condition: &Condition,
-    ) -> impl Future<Output = Result<(), ObjectError>> + Send {
-        self.0.delete(key, condition)
-    }
-
-    fn get(&self, key: &str) -> impl Future<Output = Result<Object, ObjectError>> + Send {
-        self.0.get(key)
-    }
-
-    fn list(&self, prefix: &str) -> impl Future<Output = Result<Vec<String>, ObjectError>> + Send {
-        self.0.list(prefix)
-    }
-
-    fn put(
-        &self,
-        key: &str,
-        bytes: &[u8],
-        condition: &Condition,
-    ) -> impl Future<Output = Result<String, ObjectError>> + Send {
-        self.0.put(key, bytes, condition)
-    }
+/// The paths of `entries`.
+fn paths(entries: &[WalkEntry]) -> Vec<String> {
+    entries
+        .iter()
+        .map(|entry| entry.path.display().to_string())
+        .collect()
 }
 
 fn blocking() -> BlockingBucket<MemoryBucket> {
@@ -61,272 +44,133 @@ fn blocking() -> BlockingBucket<MemoryBucket> {
 }
 
 #[test]
-fn put_then_get_gives_the_bytes_and_the_put_tag() {
+fn blocking_put_then_get_gives_the_bytes_and_the_put_token() {
     let bucket = blocking();
-    let tag = bucket.put("vault/a.md", b"x", &Condition::None).unwrap();
-    let object = bucket.get("vault/a.md").unwrap();
-    assert_eq!(object.bytes, b"x");
-    assert_eq!(object.etag, tag);
+    let path = Path::new("/a.md");
+    let token = bucket.put(path, b"x", &Condition::None).unwrap();
+    assert_eq!(bucket.get(path).unwrap(), (b"x".to_vec(), token));
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn async_put_then_get_gives_the_bytes_and_the_put_tag() {
-    let bucket = MemoryBucket::default();
-    let tag = bucket
-        .put("vault/a.md", b"x", &Condition::None)
-        .await
+#[test]
+fn blocking_wraps_every_whole_file_operation() {
+    let bucket = blocking();
+    bucket.create_folder(Path::new("/d/e")).unwrap();
+    bucket
+        .put(Path::new("/d/a.md"), b"x", &Condition::None)
         .unwrap();
-    let object = bucket.get("vault/a.md").await.unwrap();
-    assert_eq!(object.bytes, b"x");
-    assert_eq!(object.etag, tag);
-}
-
-#[test]
-fn get_of_a_missing_key_is_not_found() {
-    let error = blocking().get("vault/none.md").unwrap_err();
-    assert_eq!(error.kind(), ObjectErrorKind::NotFound);
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn async_get_of_a_missing_key_is_not_found() {
-    let error = MemoryBucket::default()
-        .get("vault/none.md")
-        .await
-        .unwrap_err();
-    assert_eq!(error.kind(), ObjectErrorKind::NotFound);
-}
-
-#[test]
-fn head_gives_the_size_and_the_put_tag() {
-    let bucket = blocking();
-    let tag = bucket
-        .put("org/a.docx", b"PK\x03\x04", &Condition::None)
+    bucket.append(Path::new("/d/a.md"), b"y").unwrap();
+    assert_eq!(
+        bucket
+            .copy(Path::new("/d/a.md"), Path::new("/d/b.md"))
+            .unwrap(),
+        2
+    );
+    bucket
+        .rename(Path::new("/d/b.md"), Path::new("/d/e/c.md"))
         .unwrap();
     assert_eq!(
-        bucket.head("org/a.docx").unwrap(),
-        Head { etag: tag, size: 4 }
+        paths(&bucket.list(Path::new("/d"), Depth::Children).unwrap()),
+        ["/d/a.md", "/d/e"]
     );
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn async_head_gives_the_size_and_the_put_tag() {
-    let bucket = MemoryBucket::default();
-    let tag = bucket
-        .put("org/a.docx", b"PK\x03\x04", &Condition::None)
-        .await
-        .unwrap();
     assert_eq!(
-        bucket.head("org/a.docx").await.unwrap(),
-        Head { etag: tag, size: 4 }
+        paths(&bucket.walk(Path::new("/d"), false, true).unwrap()),
+        ["/d/a.md", "/d/e", "/d/e/c.md"]
     );
-}
-
-#[test]
-fn head_of_a_missing_key_is_not_found() {
-    let error = blocking().head("org/b.docx").unwrap_err();
-    assert_eq!(error.kind(), ObjectErrorKind::NotFound);
-}
-
-#[test]
-fn default_head_gives_the_size_and_the_tag_get_gives() {
-    let bucket = BlockingBucket::new(RequiredOnly(MemoryBucket::default())).unwrap();
-    bucket
-        .put("org/a.docx", b"12345", &Condition::None)
-        .unwrap();
-    let object = bucket.get("org/a.docx").unwrap();
+    assert!(bucket.head(Path::new("/d/e")).unwrap().is_dir);
     assert_eq!(
-        bucket.head("org/a.docx").unwrap(),
-        Head {
-            etag: object.etag,
-            size: 5
-        }
+        bucket.canonicalize(Path::new("/d/./e/../a.md")).unwrap(),
+        Path::new("/d/a.md")
     );
-    let error = bucket.head("org/b.docx").unwrap_err();
-    assert_eq!(error.kind(), ObjectErrorKind::NotFound);
-}
-
-#[test]
-fn absent_over_an_object_fails_and_keeps_it() {
-    let bucket = blocking();
-    bucket.put("vault/a.md", b"x", &Condition::None).unwrap();
-    let error = bucket
-        .put("vault/a.md", b"y", &Condition::Absent)
-        .unwrap_err();
-    assert_eq!(error.kind(), ObjectErrorKind::PreconditionFailed);
-    assert_eq!(bucket.get("vault/a.md").unwrap().bytes, b"x");
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn async_absent_over_an_object_fails_and_keeps_it() {
-    let bucket = MemoryBucket::default();
     bucket
-        .put("vault/a.md", b"x", &Condition::None)
-        .await
+        .delete(Path::new("/d/a.md"), &Condition::None)
         .unwrap();
-    let error = bucket
-        .put("vault/a.md", b"y", &Condition::Absent)
-        .await
-        .unwrap_err();
-    assert_eq!(error.kind(), ObjectErrorKind::PreconditionFailed);
-    assert_eq!(bucket.get("vault/a.md").await.unwrap().bytes, b"x");
-}
-
-#[test]
-fn matching_tag_replaces_the_object() {
-    let bucket = blocking();
-    let first = bucket.put("vault/a.md", b"x", &Condition::None).unwrap();
-    let second = bucket
-        .put("vault/a.md", b"y", &Condition::ETag(first.clone()))
-        .unwrap();
-    assert_ne!(second, first);
-    assert_eq!(bucket.get("vault/a.md").unwrap().bytes, b"y");
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn async_matching_tag_replaces_the_object() {
-    let bucket = MemoryBucket::default();
-    let first = bucket
-        .put("vault/a.md", b"x", &Condition::None)
-        .await
-        .unwrap();
-    let second = bucket
-        .put("vault/a.md", b"y", &Condition::ETag(first.clone()))
-        .await
-        .unwrap();
-    assert_ne!(second, first);
-    assert_eq!(bucket.get("vault/a.md").await.unwrap().bytes, b"y");
-}
-
-#[test]
-fn stale_tag_on_put_fails_and_keeps_the_object() {
-    let bucket = blocking();
-    let stale = bucket.put("vault/a.md", b"x", &Condition::None).unwrap();
-    bucket
-        .put("vault/a.md", b"y", &Condition::ETag(stale.clone()))
-        .unwrap();
-    let error = bucket
-        .put("vault/a.md", b"z", &Condition::ETag(stale))
-        .unwrap_err();
-    assert_eq!(error.kind(), ObjectErrorKind::PreconditionFailed);
-    assert_eq!(bucket.get("vault/a.md").unwrap().bytes, b"y");
-}
-
-#[test]
-fn same_bytes_give_the_same_quoted_hex_tag() {
-    let bucket = blocking();
-    let first = bucket.put("vault/a.md", b"x", &Condition::None).unwrap();
-    let second = bucket.put("vault/b.md", b"x", &Condition::None).unwrap();
-    assert_eq!(first, second);
-    let digits = first
-        .strip_prefix('"')
-        .and_then(|rest| rest.strip_suffix('"'))
-        .unwrap();
-    assert_eq!(digits.len(), 16);
-    assert!(
-        digits
-            .chars()
-            .all(|digit| digit.is_ascii_digit() || ('a'..='f').contains(&digit))
-    );
-}
-
-#[test]
-fn conditional_delete_needs_the_current_tag() {
-    let bucket = blocking();
-    let stale = bucket.put("vault/a.md", b"x", &Condition::None).unwrap();
-    let current = bucket
-        .put("vault/a.md", b"y", &Condition::ETag(stale.clone()))
-        .unwrap();
-    let error = bucket
-        .delete("vault/a.md", &Condition::ETag(stale))
-        .unwrap_err();
-    assert_eq!(error.kind(), ObjectErrorKind::PreconditionFailed);
-    bucket
-        .delete("vault/a.md", &Condition::ETag(current))
-        .unwrap();
-    let missing = bucket.get("vault/a.md").unwrap_err();
-    assert_eq!(missing.kind(), ObjectErrorKind::NotFound);
-}
-
-#[test]
-fn delete_of_a_missing_key_fails_only_under_a_tag() {
-    let bucket = blocking();
-    bucket.delete("vault/none.md", &Condition::None).unwrap();
-    let error = bucket
-        .delete("vault/none.md", &Condition::ETag("\"0\"".to_owned()))
-        .unwrap_err();
-    assert_eq!(error.kind(), ObjectErrorKind::PreconditionFailed);
-    bucket.delete("vault/none.md", &Condition::Absent).unwrap();
-}
-
-#[test]
-fn absent_delete_over_an_object_fails_and_keeps_it() {
-    let bucket = blocking();
-    bucket.put("vault/a.md", b"x", &Condition::None).unwrap();
-    let error = bucket.delete("vault/a.md", &Condition::Absent).unwrap_err();
-    assert_eq!(error.kind(), ObjectErrorKind::PreconditionFailed);
-    assert_eq!(bucket.get("vault/a.md").unwrap().bytes, b"x");
-}
-
-#[test]
-fn listing_gives_every_key_under_the_prefix() {
-    let bucket = blocking();
-    for key in ["vault/a.md", "vault/b/c.md", "other.md"] {
-        bucket.put(key, b"x", &Condition::None).unwrap();
-    }
+    bucket.remove_folder(Path::new("/d")).unwrap();
     assert_eq!(
-        bucket.list("vault/").unwrap(),
-        ["vault/a.md", "vault/b/c.md"]
+        bucket.head(Path::new("/d")).unwrap_err().kind(),
+        ErrorKind::NotFound
     );
-}
-
-#[test]
-fn listing_with_no_match_is_empty() {
-    let bucket = blocking();
-    bucket.put("vault/a.md", b"x", &Condition::None).unwrap();
-    assert_eq!(bucket.list("none/").unwrap(), Vec::<String>::new());
-}
-
-#[test]
-fn error_text_and_source() {
-    let not_found = ObjectError::not_found();
-    let failed = ObjectError::precondition_failed();
-    let other = ObjectError::from(io::Error::other("boom"));
-    assert_eq!(not_found.to_string(), "no object at the key");
-    assert_eq!(failed.to_string(), "the condition does not hold");
-    assert_eq!(other.to_string(), "boom");
-    assert_eq!(other.kind(), ObjectErrorKind::Other);
-    assert!(not_found.source().is_none());
-    assert!(failed.source().is_none());
-    assert_eq!(other.source().unwrap().to_string(), "boom");
 }
 
 #[tokio::test(flavor = "current_thread")]
 #[should_panic(expected = "Cannot start a runtime from within a runtime")]
 async fn blocking_inside_a_runtime_panics() {
     let bucket = blocking();
-    drop(bucket.get("vault/a.md"));
+    drop(bucket.get(Path::new("/a.md")));
+}
+
+#[test]
+fn the_key_rules_give_the_designs_table() {
+    let key = |prefix: &str, path: &str| key_of(prefix, Path::new(path)).unwrap();
+    assert_eq!(key("", "/notes/a.md"), "notes/a.md");
+    assert_eq!(key("tenant-7", "/notes/a.md"), "tenant-7/notes/a.md");
+    assert_eq!(key("", "/notes/./b/../a.md"), "notes/a.md");
+    for refused in ["/../a.md", "notes/a.md", "a.md", "/notes/../../a.md"] {
+        let error = key_of("", Path::new(refused)).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidInput, "{refused}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_path_that_is_not_utf8_has_no_key() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let path = Path::new(OsStr::from_bytes(b"/notes/\xff.md"));
+    let error: StorageError = key_of("", path).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+}
+
+#[cfg(windows)]
+#[test]
+fn a_windows_path_keeps_its_drive_in_the_key() {
+    assert_eq!(
+        key_of("", Path::new(r"C:\Users\a.md")).unwrap(),
+        "C:/Users/a.md"
+    );
 }
 
 /// Serve `answers` in order, one per request, and record each request's method and conditional headers.
 #[cfg(any(feature = "minio", feature = "s3"))]
 fn canned(answers: Vec<String>) -> (String, Arc<Mutex<Vec<String>>>) {
+    let (endpoint, seen, _targets) = canned_with_targets(answers);
+    (endpoint, seen)
+}
+
+/// Like `canned`, and also record the target of each request, as `METHOD /path`.
+#[cfg(any(feature = "minio", feature = "s3"))]
+fn canned_with_targets(answers: Vec<String>) -> (String, Log, Log) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let seen = Arc::new(Mutex::new(Vec::new()));
+    let targets = Arc::new(Mutex::new(Vec::new()));
     let log = Arc::clone(&seen);
-    thread::spawn(move || serve(&listener, answers, &log));
-    (endpoint, seen)
+    let target_log = Arc::clone(&targets);
+    thread::spawn(move || serve(&listener, answers, &log, &target_log));
+    (endpoint, seen, targets)
 }
 
 /// Answer each request on every connection with the next answer, until none is left.
 #[cfg(any(feature = "minio", feature = "s3"))]
-fn serve(listener: &TcpListener, answers: Vec<String>, log: &Mutex<Vec<String>>) {
+fn serve(
+    listener: &TcpListener,
+    answers: Vec<String>,
+    log: &Mutex<Vec<String>>,
+    targets: &Mutex<Vec<String>>,
+) {
     let mut pending = answers.into_iter();
     for incoming in listener.incoming() {
         let mut stream = incoming.unwrap();
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut request_line = String::new();
         while reader.read_line(&mut request_line).unwrap() > 0 {
+            targets.lock().unwrap().push(
+                request_line
+                    .split(' ')
+                    .take(2)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
             log.lock()
                 .unwrap()
                 .push(read_request(&request_line, &mut reader));
@@ -450,8 +294,8 @@ fn minio(endpoint: String) -> BlockingBucket<MinioBucket> {
 #[test]
 fn minio_get_answered_404_is_not_found() {
     let (endpoint, seen) = canned(vec![answer("404 Not Found", "", "")]);
-    let error = minio(endpoint).get("task.md").unwrap_err();
-    assert_eq!(error.kind(), ObjectErrorKind::NotFound);
+    let error = minio(endpoint).get(Path::new("/task.md")).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::NotFound);
     assert_eq!(requests(&seen), ["GET if-match=-"]);
 }
 
@@ -460,20 +304,24 @@ fn minio_get_answered_404_is_not_found() {
 fn minio_put_with_a_stale_tag_answered_412_is_precondition_failed() {
     let (endpoint, seen) = canned(vec![answer("412 Precondition Failed", "", "")]);
     let error = minio(endpoint)
-        .put("task.md", b"x", &Condition::ETag("\"a\"".to_owned()))
+        .put(
+            Path::new("/task.md"),
+            b"x",
+            &Condition::Matches(RevisionToken::new("\"a\"")),
+        )
         .unwrap_err();
-    assert_eq!(error.kind(), ObjectErrorKind::PreconditionFailed);
+    assert_eq!(error.kind(), ErrorKind::PreconditionFailed);
     assert_eq!(requests(&seen), ["PUT if-match=\"a\""]);
 }
 
 #[cfg(feature = "minio")]
 #[test]
-fn minio_put_with_absent_sends_if_none_match_star() {
+fn minio_put_with_absent_answered_412_is_already_exists_and_sends_if_none_match_star() {
     let (endpoint, seen) = canned(vec![answer("412 Precondition Failed", "", "")]);
     let error = minio(endpoint)
-        .put("task.md", b"x", &Condition::Absent)
+        .put(Path::new("/task.md"), b"x", &Condition::Absent)
         .unwrap_err();
-    assert_eq!(error.kind(), ObjectErrorKind::PreconditionFailed);
+    assert_eq!(error.kind(), ErrorKind::AlreadyExists);
     assert_eq!(requests(&seen), ["PUT if-match=- if-none-match=*"]);
 }
 
@@ -482,18 +330,18 @@ fn minio_put_with_absent_sends_if_none_match_star() {
 fn minio_put_gives_the_tag_the_server_answered() {
     let (endpoint, _seen) = canned(vec![answer("200 OK", "ETag: \"b\"\r\n", "")]);
     let tag = minio(endpoint)
-        .put("task.md", b"x", &Condition::None)
+        .put(Path::new("/task.md"), b"x", &Condition::None)
         .unwrap();
-    assert_eq!(tag, "\"b\"");
+    assert_eq!(tag, RevisionToken::new("\"b\""));
 }
 
 #[cfg(feature = "minio")]
 #[test]
 fn minio_get_gives_the_bytes_and_the_tag() {
     let (endpoint, _seen) = canned(vec![answer("200 OK", "ETag: \"b\"\r\n", "x")]);
-    let object = minio(endpoint).get("task.md").unwrap();
-    assert_eq!(object.bytes, b"x");
-    assert_eq!(object.etag, "\"b\"");
+    let (bytes, token) = minio(endpoint).get(Path::new("/task.md")).unwrap();
+    assert_eq!(bytes, b"x");
+    assert_eq!(token, RevisionToken::new("\"b\""));
 }
 
 #[cfg(feature = "minio")]
@@ -501,9 +349,12 @@ fn minio_get_gives_the_bytes_and_the_tag() {
 fn minio_delete_with_a_stale_tag_fails_without_deleting() {
     let (endpoint, seen) = canned(vec![answer("200 OK", "ETag: \"b\"\r\n", "")]);
     let error = minio(endpoint)
-        .delete("task.md", &Condition::ETag("\"a\"".to_owned()))
+        .delete(
+            Path::new("/task.md"),
+            &Condition::Matches(RevisionToken::new("\"a\"")),
+        )
         .unwrap_err();
-    assert_eq!(error.kind(), ObjectErrorKind::PreconditionFailed);
+    assert_eq!(error.kind(), ErrorKind::PreconditionFailed);
     assert_eq!(requests(&seen), ["HEAD if-match=-"]);
 }
 
@@ -515,7 +366,10 @@ fn minio_delete_with_the_current_tag_sends_if_match() {
         answer("204 No Content", "", ""),
     ]);
     minio(endpoint)
-        .delete("task.md", &Condition::ETag("\"a\"".to_owned()))
+        .delete(
+            Path::new("/task.md"),
+            &Condition::Matches(RevisionToken::new("\"a\"")),
+        )
         .unwrap();
     assert_eq!(
         requests(&seen),
@@ -531,9 +385,12 @@ fn minio_delete_with_a_tag_of_a_missing_object_fails_without_deleting() {
         answer("200 OK", "", ""),
     ]);
     let error = minio(endpoint)
-        .delete("task.md", &Condition::ETag("\"a\"".to_owned()))
+        .delete(
+            Path::new("/task.md"),
+            &Condition::Matches(RevisionToken::new("\"a\"")),
+        )
         .unwrap_err();
-    assert_eq!(error.kind(), ObjectErrorKind::PreconditionFailed);
+    assert_eq!(error.kind(), ErrorKind::PreconditionFailed);
     assert_eq!(requests(&seen), ["HEAD if-match=-", "HEAD if-match=-"]);
 }
 
@@ -541,7 +398,9 @@ fn minio_delete_with_a_tag_of_a_missing_object_fails_without_deleting() {
 #[test]
 fn minio_delete_with_no_condition_sends_one_delete() {
     let (endpoint, seen) = canned(vec![answer("204 No Content", "", "")]);
-    minio(endpoint).delete("task.md", &Condition::None).unwrap();
+    minio(endpoint)
+        .delete(Path::new("/task.md"), &Condition::None)
+        .unwrap();
     assert_eq!(requests(&seen), ["DELETE if-match=-"]);
 }
 
@@ -550,8 +409,8 @@ fn minio_delete_with_no_condition_sends_one_delete() {
 fn minio_get_answered_503_is_other_after_one_request() {
     let unavailable = answer("503 Service Unavailable", "", "");
     let (endpoint, seen) = canned(vec![unavailable.clone(), unavailable.clone(), unavailable]);
-    let error = minio(endpoint).get("task.md").unwrap_err();
-    assert_eq!(error.kind(), ObjectErrorKind::Other);
+    let error = minio(endpoint).get(Path::new("/task.md")).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Other);
     assert_eq!(requests(&seen), ["GET if-match=-"]);
 }
 
@@ -562,8 +421,10 @@ fn minio_list_reads_every_page() {
         page("vault/a.md", Some("next")),
         page("vault/b.md", None),
     ]);
-    let keys = minio(endpoint).list("vault/").unwrap();
-    assert_eq!(keys, ["vault/a.md", "vault/b.md"]);
+    let entries = minio(endpoint)
+        .list(Path::new("/vault"), Depth::All)
+        .unwrap();
+    assert_eq!(paths(&entries), ["/vault/a.md", "/vault/b.md"]);
     assert_eq!(requests(&seen), ["GET if-match=-", "GET if-match=-"]);
 }
 
@@ -580,9 +441,9 @@ fn minio_config_debug_keeps_the_secret_key_out() {
 #[test]
 fn minio_get_with_nothing_listening_is_other_naming_the_dispatch_failure_and_its_cause() {
     let error = minio("http://127.0.0.1:9".to_owned())
-        .get("task.md")
+        .get(Path::new("/task.md"))
         .unwrap_err();
-    assert_eq!(error.kind(), ObjectErrorKind::Other);
+    assert_eq!(error.kind(), ErrorKind::Other);
     let message = error.to_string();
     assert!(message.starts_with("dispatch failure: "));
     assert!(message.contains("Connection refused"));
@@ -597,8 +458,8 @@ fn minio_get_answered_403_names_the_status_the_code_and_the_message() {
         "Content-Type: application/xml\r\n",
         body,
     )]);
-    let error = minio(endpoint).get("task.md").unwrap_err();
-    assert_eq!(error.kind(), ObjectErrorKind::Other);
+    let error = minio(endpoint).get(Path::new("/task.md")).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Other);
     assert_eq!(
         error.to_string(),
         "403 SignatureDoesNotMatch: The request signature we calculated does not match the signature you provided."
@@ -613,8 +474,8 @@ fn minio_get_answered_403_names_the_status_the_code_and_the_message() {
 #[test]
 fn minio_get_answered_404_no_such_bucket_is_other_naming_the_answer() {
     let (endpoint, _seen) = canned(vec![no_such_bucket()]);
-    let error = minio(endpoint).get("task.md").unwrap_err();
-    assert_eq!(error.kind(), ObjectErrorKind::Other);
+    let error = minio(endpoint).get(Path::new("/task.md")).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Other);
     assert_eq!(
         error.to_string(),
         "404 NoSuchBucket: The specified bucket does not exist."
@@ -628,8 +489,8 @@ fn minio_get_answered_404_no_such_key_is_not_found() {
         "NoSuchKey",
         "The specified key does not exist.",
     )]);
-    let error = minio(endpoint).get("task.md").unwrap_err();
-    assert_eq!(error.kind(), ObjectErrorKind::NotFound);
+    let error = minio(endpoint).get(Path::new("/task.md")).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::NotFound);
 }
 
 #[cfg(feature = "minio")]
@@ -640,7 +501,7 @@ fn minio_delete_absent_of_a_missing_key_in_an_existing_bucket_succeeds() {
         answer("200 OK", "", ""),
     ]);
     minio(endpoint)
-        .delete("task.md", &Condition::Absent)
+        .delete(Path::new("/task.md"), &Condition::Absent)
         .unwrap();
     assert_eq!(requests(&seen), ["HEAD if-match=-", "HEAD if-match=-"]);
 }
@@ -653,9 +514,9 @@ fn minio_delete_absent_in_a_missing_bucket_is_other_naming_the_bucket() {
         answer("404 Not Found", "", ""),
     ]);
     let error = minio(endpoint)
-        .delete("task.md", &Condition::Absent)
+        .delete(Path::new("/task.md"), &Condition::Absent)
         .unwrap_err();
-    assert_eq!(error.kind(), ObjectErrorKind::Other);
+    assert_eq!(error.kind(), ErrorKind::Other);
     assert_eq!(error.to_string(), "404: the bucket archie does not exist");
     assert_eq!(requests(&seen), ["HEAD if-match=-", "HEAD if-match=-"]);
 }
@@ -668,9 +529,12 @@ fn minio_delete_with_a_tag_in_a_missing_bucket_is_other() {
         answer("404 Not Found", "", ""),
     ]);
     let error = minio(endpoint)
-        .delete("task.md", &Condition::ETag("\"a\"".to_owned()))
+        .delete(
+            Path::new("/task.md"),
+            &Condition::Matches(RevisionToken::new("\"a\"")),
+        )
         .unwrap_err();
-    assert_eq!(error.kind(), ObjectErrorKind::Other);
+    assert_eq!(error.kind(), ErrorKind::Other);
 }
 
 #[cfg(feature = "minio")]
@@ -678,9 +542,13 @@ fn minio_delete_with_a_tag_in_a_missing_bucket_is_other() {
 fn minio_put_with_a_tag_answered_404_no_such_bucket_is_other() {
     let (endpoint, seen) = canned(vec![no_such_bucket()]);
     let error = minio(endpoint)
-        .put("task.md", b"x", &Condition::ETag("\"a\"".to_owned()))
+        .put(
+            Path::new("/task.md"),
+            b"x",
+            &Condition::Matches(RevisionToken::new("\"a\"")),
+        )
         .unwrap_err();
-    assert_eq!(error.kind(), ObjectErrorKind::Other);
+    assert_eq!(error.kind(), ErrorKind::Other);
     assert_eq!(requests(&seen), ["PUT if-match=\"a\""]);
 }
 
@@ -688,13 +556,17 @@ fn minio_put_with_a_tag_answered_404_no_such_bucket_is_other() {
 #[test]
 fn minio_head_gives_the_size_and_the_tag_from_one_head() {
     let (endpoint, seen) = canned(vec![head_answer("ETag: \"a\"\r\nContent-Length: 5\r\n")]);
+    let metadata = minio(endpoint).head(Path::new("/task.md")).unwrap();
     assert_eq!(
-        minio(endpoint).head("task.md").unwrap(),
-        Head {
-            etag: "\"a\"".to_owned(),
-            size: 5
-        }
+        (
+            metadata.is_file,
+            metadata.is_dir,
+            metadata.len,
+            metadata.modified
+        ),
+        (true, false, 5, None)
     );
+    assert_eq!(metadata.revision, Some(RevisionToken::new("\"a\"")));
     assert_eq!(requests(&seen), ["HEAD if-match=-"]);
 }
 
@@ -705,8 +577,8 @@ fn minio_head_of_a_missing_object_in_an_existing_bucket_is_not_found() {
         answer("404 Not Found", "", ""),
         answer("200 OK", "", ""),
     ]);
-    let error = minio(endpoint).head("task.md").unwrap_err();
-    assert_eq!(error.kind(), ObjectErrorKind::NotFound);
+    let error = minio(endpoint).head(Path::new("/task.md")).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::NotFound);
     assert_eq!(requests(&seen), ["HEAD if-match=-", "HEAD if-match=-"]);
 }
 
@@ -717,8 +589,8 @@ fn minio_head_in_a_missing_bucket_is_other_naming_the_bucket() {
         answer("404 Not Found", "", ""),
         answer("404 Not Found", "", ""),
     ]);
-    let error = minio(endpoint).head("task.md").unwrap_err();
-    assert_eq!(error.kind(), ObjectErrorKind::Other);
+    let error = minio(endpoint).head(Path::new("/task.md")).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Other);
     assert_eq!(error.to_string(), "404: the bucket archie does not exist");
     assert_eq!(requests(&seen), ["HEAD if-match=-", "HEAD if-match=-"]);
 }
@@ -727,8 +599,8 @@ fn minio_head_in_a_missing_bucket_is_other_naming_the_bucket() {
 #[test]
 fn minio_head_without_an_etag_is_other() {
     let (endpoint, _seen) = canned(vec![head_answer("Content-Length: 5\r\n")]);
-    let error = minio(endpoint).head("task.md").unwrap_err();
-    assert_eq!(error.kind(), ObjectErrorKind::Other);
+    let error = minio(endpoint).head(Path::new("/task.md")).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Other);
     assert_eq!(error.to_string(), "the answer carries no ETag header");
 }
 
@@ -736,8 +608,8 @@ fn minio_head_without_an_etag_is_other() {
 #[test]
 fn minio_head_without_a_content_length_is_other() {
     let (endpoint, _seen) = canned(vec![head_answer("ETag: \"a\"\r\n")]);
-    let error = minio(endpoint).head("task.md").unwrap_err();
-    assert_eq!(error.kind(), ObjectErrorKind::Other);
+    let error = minio(endpoint).head(Path::new("/task.md")).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Other);
     assert_eq!(
         error.to_string(),
         "the answer carries no Content-Length header"
@@ -781,7 +653,7 @@ fn minio_ensure_with_the_head_refused_is_other_and_creates_nothing() {
     let (endpoint, seen) = canned(vec![access_denied()]);
     let bucket = minio(endpoint);
     let error = bucket.runtime.block_on(bucket.bucket.ensure()).unwrap_err();
-    assert_eq!(error.kind(), ObjectErrorKind::Other);
+    assert_eq!(error.kind(), ErrorKind::Other);
     assert_eq!(requests(&seen), ["HEAD if-match=-"]);
 }
 
@@ -791,7 +663,7 @@ fn minio_ensure_with_the_create_refused_is_other_naming_the_answer() {
     let (endpoint, seen) = canned(vec![answer("404 Not Found", "", ""), access_denied()]);
     let bucket = minio(endpoint);
     let error = bucket.runtime.block_on(bucket.bucket.ensure()).unwrap_err();
-    assert_eq!(error.kind(), ObjectErrorKind::Other);
+    assert_eq!(error.kind(), ErrorKind::Other);
     assert_eq!(error.to_string(), "403 AccessDenied: Access Denied.");
     assert_eq!(requests(&seen), ["HEAD if-match=-", "PUT if-match=-"]);
 }
@@ -822,7 +694,12 @@ fn s3_in(endpoint: &str, region: &str) -> BlockingBucket<S3Bucket> {
         .endpoint_url(endpoint)
         .force_path_style(true)
         .build();
-    BlockingBucket::new(S3Bucket::with_sdk_config("archie".to_owned(), sdk)).unwrap()
+    BlockingBucket::new(S3Bucket::with_sdk_config(
+        "archie".to_owned(),
+        String::new(),
+        sdk,
+    ))
+    .unwrap()
 }
 
 #[cfg(feature = "s3")]
@@ -830,7 +707,10 @@ fn s3_in(endpoint: &str, region: &str) -> BlockingBucket<S3Bucket> {
 fn s3_delete_with_the_current_tag_sends_one_delete_with_if_match() {
     let (endpoint, seen) = canned(vec![answer("204 No Content", "", "")]);
     s3(&endpoint)
-        .delete("task.md", &Condition::ETag("\"a\"".to_owned()))
+        .delete(
+            Path::new("/task.md"),
+            &Condition::Matches(RevisionToken::new("\"a\"")),
+        )
         .unwrap();
     assert_eq!(requests(&seen), ["DELETE if-match=\"a\""]);
 }
@@ -840,9 +720,12 @@ fn s3_delete_with_the_current_tag_sends_one_delete_with_if_match() {
 fn s3_delete_with_a_stale_tag_answered_412_is_precondition_failed() {
     let (endpoint, seen) = canned(vec![answer("412 Precondition Failed", "", "")]);
     let error = s3(&endpoint)
-        .delete("task.md", &Condition::ETag("\"a\"".to_owned()))
+        .delete(
+            Path::new("/task.md"),
+            &Condition::Matches(RevisionToken::new("\"a\"")),
+        )
         .unwrap_err();
-    assert_eq!(error.kind(), ObjectErrorKind::PreconditionFailed);
+    assert_eq!(error.kind(), ErrorKind::PreconditionFailed);
     assert_eq!(requests(&seen), ["DELETE if-match=\"a\""]);
 }
 
@@ -851,9 +734,12 @@ fn s3_delete_with_a_stale_tag_answered_412_is_precondition_failed() {
 fn s3_delete_with_a_tag_of_a_missing_object_is_precondition_failed() {
     let (endpoint, seen) = canned(vec![answer("404 Not Found", "", "")]);
     let error = s3(&endpoint)
-        .delete("task.md", &Condition::ETag("\"a\"".to_owned()))
+        .delete(
+            Path::new("/task.md"),
+            &Condition::Matches(RevisionToken::new("\"a\"")),
+        )
         .unwrap_err();
-    assert_eq!(error.kind(), ObjectErrorKind::PreconditionFailed);
+    assert_eq!(error.kind(), ErrorKind::PreconditionFailed);
     assert_eq!(requests(&seen), ["DELETE if-match=\"a\""]);
 }
 
@@ -862,9 +748,12 @@ fn s3_delete_with_a_tag_of_a_missing_object_is_precondition_failed() {
 fn s3_delete_with_a_tag_answered_404_no_such_bucket_is_other() {
     let (endpoint, seen) = canned(vec![no_such_bucket()]);
     let error = s3(&endpoint)
-        .delete("task.md", &Condition::ETag("\"a\"".to_owned()))
+        .delete(
+            Path::new("/task.md"),
+            &Condition::Matches(RevisionToken::new("\"a\"")),
+        )
         .unwrap_err();
-    assert_eq!(error.kind(), ObjectErrorKind::Other);
+    assert_eq!(error.kind(), ErrorKind::Other);
     assert_eq!(requests(&seen), ["DELETE if-match=\"a\""]);
 }
 
@@ -872,7 +761,9 @@ fn s3_delete_with_a_tag_answered_404_no_such_bucket_is_other() {
 #[test]
 fn s3_delete_with_no_condition_sends_one_delete() {
     let (endpoint, seen) = canned(vec![answer("204 No Content", "", "")]);
-    s3(&endpoint).delete("task.md", &Condition::None).unwrap();
+    s3(&endpoint)
+        .delete(Path::new("/task.md"), &Condition::None)
+        .unwrap();
     assert_eq!(requests(&seen), ["DELETE if-match=-"]);
 }
 
@@ -880,18 +771,18 @@ fn s3_delete_with_no_condition_sends_one_delete() {
 #[test]
 fn s3_get_answered_404_is_not_found() {
     let (endpoint, _seen) = canned(vec![answer("404 Not Found", "", "")]);
-    let error = s3(&endpoint).get("task.md").unwrap_err();
-    assert_eq!(error.kind(), ObjectErrorKind::NotFound);
+    let error = s3(&endpoint).get(Path::new("/task.md")).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::NotFound);
 }
 
 #[cfg(feature = "s3")]
 #[test]
-fn s3_put_with_absent_answered_412_is_precondition_failed() {
+fn s3_put_with_absent_answered_412_is_already_exists() {
     let (endpoint, _seen) = canned(vec![answer("412 Precondition Failed", "", "")]);
     let error = s3(&endpoint)
-        .put("task.md", b"x", &Condition::Absent)
+        .put(Path::new("/task.md"), b"x", &Condition::Absent)
         .unwrap_err();
-    assert_eq!(error.kind(), ObjectErrorKind::PreconditionFailed);
+    assert_eq!(error.kind(), ErrorKind::AlreadyExists);
 }
 
 #[cfg(feature = "s3")]
@@ -899,8 +790,8 @@ fn s3_put_with_absent_answered_412_is_precondition_failed() {
 fn s3_get_answered_503_is_other_after_one_request() {
     let unavailable = answer("503 Service Unavailable", "", "");
     let (endpoint, seen) = canned(vec![unavailable.clone(), unavailable.clone(), unavailable]);
-    let error = s3(&endpoint).get("task.md").unwrap_err();
-    assert_eq!(error.kind(), ObjectErrorKind::Other);
+    let error = s3(&endpoint).get(Path::new("/task.md")).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Other);
     assert_eq!(requests(&seen), ["GET if-match=-"]);
 }
 
@@ -908,13 +799,17 @@ fn s3_get_answered_503_is_other_after_one_request() {
 #[test]
 fn s3_head_gives_the_size_and_the_tag_from_one_head() {
     let (endpoint, seen) = canned(vec![head_answer("ETag: \"a\"\r\nContent-Length: 5\r\n")]);
+    let metadata = s3(&endpoint).head(Path::new("/task.md")).unwrap();
     assert_eq!(
-        s3(&endpoint).head("task.md").unwrap(),
-        Head {
-            etag: "\"a\"".to_owned(),
-            size: 5
-        }
+        (
+            metadata.is_file,
+            metadata.is_dir,
+            metadata.len,
+            metadata.modified
+        ),
+        (true, false, 5, None)
     );
+    assert_eq!(metadata.revision, Some(RevisionToken::new("\"a\"")));
     assert_eq!(requests(&seen), ["HEAD if-match=-"]);
 }
 
@@ -925,8 +820,8 @@ fn s3_head_of_a_missing_object_in_an_existing_bucket_is_not_found() {
         answer("404 Not Found", "", ""),
         answer("200 OK", "", ""),
     ]);
-    let error = s3(&endpoint).head("task.md").unwrap_err();
-    assert_eq!(error.kind(), ObjectErrorKind::NotFound);
+    let error = s3(&endpoint).head(Path::new("/task.md")).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::NotFound);
     assert_eq!(requests(&seen), ["HEAD if-match=-", "HEAD if-match=-"]);
 }
 
@@ -1008,7 +903,7 @@ fn s3_ensure_with_the_encryption_refused_is_other_naming_the_answer() {
                 .ensure(Some("arn:aws:kms:us-east-1:111122223333:key/a")),
         )
         .unwrap_err();
-    assert_eq!(error.kind(), ObjectErrorKind::Other);
+    assert_eq!(error.kind(), ErrorKind::Other);
     assert_eq!(error.to_string(), "403 AccessDenied: Access Denied.");
     assert_eq!(requests(&seen).len(), 3);
 }
@@ -1019,4 +914,88 @@ fn s3_config_debug_keeps_the_secret_key_out() {
     let shown = format!("{:?}", s3_config());
     assert!(shown.contains("<redacted>"));
     assert!(!shown.contains("os-shim-secret"));
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_put_under_a_prefix_puts_every_key_under_it() {
+    let (endpoint, _seen, targets) =
+        canned_with_targets(vec![answer("200 OK", "ETag: \"b\"\r\n", "")]);
+    let config = minio_config(endpoint).with_prefix("tenant-7/");
+    assert_eq!(config.prefix.as_deref(), Some("tenant-7"));
+    BlockingBucket::new(MinioBucket::new(config))
+        .unwrap()
+        .put(Path::new("/notes/a.md"), b"x", &Condition::None)
+        .unwrap();
+    assert_eq!(
+        *targets.lock().unwrap(),
+        ["PUT /archie/tenant-7/notes/a.md?x-id=PutObject"]
+    );
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_delete_absent_over_an_object_is_already_exists() {
+    let (endpoint, seen) = canned(vec![answer("200 OK", "ETag: \"a\"\r\n", "")]);
+    let error = minio(endpoint)
+        .delete(Path::new("/task.md"), &Condition::Absent)
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::AlreadyExists);
+    assert_eq!(requests(&seen), ["HEAD if-match=-"]);
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_head_reads_the_modification_time_from_last_modified() {
+    let (endpoint, _seen) = canned(vec![head_answer(
+        "ETag: \"a\"\r\nContent-Length: 5\r\nLast-Modified: Thu, 01 Jan 1970 00:16:40 GMT\r\n",
+    )]);
+    let modified = minio(endpoint)
+        .head(Path::new("/task.md"))
+        .unwrap()
+        .modified;
+    assert_eq!(modified, UNIX_EPOCH.checked_add(Duration::from_secs(1_000)));
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_list_of_children_groups_the_keys_by_the_next_component() {
+    let (endpoint, _seen, targets) = canned_with_targets(vec![page("vault/a.md", None)]);
+    let entries = minio(endpoint)
+        .list(Path::new("/vault"), Depth::Children)
+        .unwrap();
+    assert_eq!(paths(&entries), ["/vault/a.md"]);
+    assert!(entries.iter().all(|entry| entry.is_file && !entry.is_dir));
+    assert_eq!(targets.lock().unwrap().len(), 1);
+}
+
+#[cfg(feature = "s3")]
+#[test]
+fn s3_put_under_a_prefix_puts_every_key_under_it() {
+    let (endpoint, _seen, targets) =
+        canned_with_targets(vec![answer("200 OK", "ETag: \"b\"\r\n", "")]);
+    let config = s3_config().with_prefix("tenant-7/");
+    let prefix = config.prefix.clone().unwrap_or_default();
+    let sdk = S3Bucket::sdk_config(config)
+        .endpoint_url(endpoint)
+        .force_path_style(true)
+        .build();
+    BlockingBucket::new(S3Bucket::with_sdk_config("archie".to_owned(), prefix, sdk))
+        .unwrap()
+        .put(Path::new("/notes/a.md"), b"x", &Condition::None)
+        .unwrap();
+    assert_eq!(
+        *targets.lock().unwrap(),
+        ["PUT /archie/tenant-7/notes/a.md?x-id=PutObject"]
+    );
+}
+
+#[cfg(feature = "s3")]
+#[test]
+fn s3_delete_absent_over_an_object_is_already_exists() {
+    let (endpoint, _seen) = canned(vec![answer("200 OK", "ETag: \"a\"\r\n", "")]);
+    let error = s3(&endpoint)
+        .delete(Path::new("/task.md"), &Condition::Absent)
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::AlreadyExists);
 }

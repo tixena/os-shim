@@ -175,7 +175,8 @@ impl System for RealSystem {
             is_dir: meta.is_dir(),
             is_file: meta.is_file(),
             len: meta.len(),
-            modified: meta.modified()?,
+            modified: Some(meta.modified()?),
+            revision: None,
         })
     }
 
