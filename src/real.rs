@@ -9,38 +9,40 @@
 //! take `&dyn System` or a generic `S: System`; both accept `&RealSystem`.
 //!
 //! ```
+//! use os_shim::error::Result;
 //! use os_shim::{System, real::RealSystem};
-//! use std::io;
 //! use std::path::Path;
 //!
-//! fn file_size(system: &dyn System, path: &Path) -> io::Result<u64> {
-//!     Ok(system.metadata(path)?.len)
+//! async fn file_size(system: &dyn System, path: &Path) -> Result<u64> {
+//!     Ok(system.metadata(path).await?.len)
 //! }
 //!
-//! fn has_config<S: System>(system: &S) -> io::Result<bool> {
-//!     system.exists(Path::new("app.toml"))
+//! async fn has_config<S: System>(system: &S) -> Result<bool> {
+//!     system.exists(Path::new("app.toml")).await
 //! }
 //!
 //! // The body of `main` in a program that uses the real machine.
-//! fn run() -> io::Result<()> {
+//! async fn run() -> Result<()> {
 //!     let system = RealSystem::new();
-//!     if has_config(&system)? {
-//!         println!("{} bytes", file_size(&system, Path::new("app.toml"))?);
+//!     if has_config(&system).await? {
+//!         println!("{} bytes", file_size(&system, Path::new("app.toml")).await?);
 //!     }
 //!     Ok(())
 //! }
 //! ```
 
-use crate::{FileMetadata, System, TempDirHandle, WalkEntry, WriteMode};
-#[cfg(feature = "async")]
-use core::pin::Pin;
+use crate::bucket::disk::DiskBucket;
+use crate::bucket::{Bucket, Condition, Guarantees, RevisionToken};
+use crate::error::Result;
+use crate::files::{self, Machine};
+use crate::{BoxFuture, FileMetadata, System, TempDirHandle, WalkEntry};
+use core::result;
 use core::time::Duration;
-use ignore::WalkBuilder;
-use same_file::Handle;
+use futures_io::{AsyncRead, AsyncWrite};
 use std::env;
 use std::env::VarError;
-use std::fs;
-use std::io::{self, Read, Write};
+#[cfg(feature = "zip")]
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::SystemTime;
@@ -48,16 +50,16 @@ use tempfile::TempDir;
 #[cfg(feature = "async")]
 use tokio::time;
 
-/// Production implementation of [`System`].
+/// Production implementation of [`System`]: the machine's environment,
+/// processes and clock, with its files in a bucket, the local disk by default.
 ///
-/// This implementation directly delegates to the standard library's
-/// environment and filesystem functions. It's a zero-cost abstraction
-/// that provides no overhead in production.
-///
-/// It holds no state, so it is `Copy` and every value is the same machine.
+/// Environment, clock and process calls go straight to the standard library;
+/// every file operation is carried out by the bucket `B`. `RealSystem::new()`
+/// holds the disk through [`DiskBucket`], and
+/// [`with_bucket`](Self::with_bucket) holds any other bucket.
 /// What to know before using it:
 ///
-/// - [`walk_dir`](System::walk_dir) respects `.gitignore` files.
+/// - [`walk_dir`](System::walk_dir) respects `.gitignore` files over the disk.
 /// - [`set_env_var`](System::set_env_var) changes the environment of the whole
 ///   process.
 /// - [`sleep`](System::sleep) blocks the thread; `sleep_async` (feature
@@ -77,87 +79,129 @@ use tokio::time;
 /// }
 ///
 /// let system = RealSystem::new();
-/// let copy = system;
+/// let copy = system.clone();
 /// assert!(is_unconfigured(&system));
 /// assert!(is_unconfigured(&copy));
-/// assert!(is_unconfigured(&RealSystem::default()));
 /// ```
-#[derive(Debug, Clone, Copy)]
-#[non_exhaustive]
-pub struct RealSystem;
+#[derive(Debug, Clone, Default)]
+pub struct RealSystem<B = DiskBucket> {
+    /// The bucket that holds the files.
+    bucket: B,
+}
 
-impl RealSystem {
-    /// Create a new `RealSystem`. It is the same as [`RealSystem::default`].
+impl RealSystem<DiskBucket> {
+    /// The machine with its files on the local disk.
     #[must_use]
     #[inline]
     pub const fn new() -> Self {
-        Self
+        Self {
+            bucket: DiskBucket::new(),
+        }
     }
 }
 
-impl Default for RealSystem {
+impl<B: Bucket> RealSystem<B> {
+    /// The machine with its files in `bucket`.
+    #[must_use]
     #[inline]
-    fn default() -> Self {
-        Self::new()
+    pub const fn with_bucket(bucket: B) -> Self {
+        Self { bucket }
     }
 }
 
-impl System for RealSystem {
+impl<B: Bucket> Machine for RealSystem<B> {
+    type Store = B;
+
     #[inline]
-    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
-        fs::canonicalize(path)
+    fn store(&self) -> &B {
+        &self.bucket
     }
 
     #[inline]
-    fn copy(&self, from: &Path, to: &Path) -> io::Result<u64> {
-        fs::copy(from, to)
+    fn working_dir(&self) -> Result<PathBuf> {
+        Ok(env::current_dir()?)
+    }
+}
+
+impl<B: Bucket> System for RealSystem<B> {
+    #[inline]
+    fn canonicalize<'system>(
+        &'system self,
+        path: &'system Path,
+    ) -> BoxFuture<'system, Result<PathBuf>> {
+        Box::pin(files::canonicalize(self, path))
     }
 
     #[inline]
-    fn create(&self, path: &Path) -> io::Result<Box<dyn Write + '_>> {
-        let file = fs::File::create(path)?;
-        Ok(Box::new(file))
+    fn copy<'system>(
+        &'system self,
+        from: &'system Path,
+        to: &'system Path,
+    ) -> BoxFuture<'system, Result<u64>> {
+        Box::pin(files::copy(self, from, to))
     }
 
     #[inline]
-    fn create_dir_all(&self, path: &Path) -> io::Result<()> {
-        fs::create_dir_all(path)
+    fn create<'system>(
+        &'system self,
+        path: &'system Path,
+    ) -> BoxFuture<'system, Result<Box<dyn AsyncWrite + Send + Unpin + 'system>>> {
+        Box::pin(files::create(self, path))
     }
 
     #[inline]
-    fn create_temp_dir(&self) -> io::Result<Box<dyn TempDirHandle>> {
-        let temp_dir = TempDir::new()?;
-        Ok(Box::new(RealTempDir { inner: temp_dir }))
+    fn create_dir_all<'system>(
+        &'system self,
+        path: &'system Path,
+    ) -> BoxFuture<'system, Result<()>> {
+        Box::pin(files::create_dir_all(self, path))
     }
 
     #[inline]
-    fn current_dir(&self) -> io::Result<PathBuf> {
-        env::current_dir()
+    fn create_temp_dir<'system>(
+        &'system self,
+    ) -> BoxFuture<'system, Result<Box<dyn TempDirHandle + 'system>>> {
+        Box::pin(async {
+            let handle: Box<dyn TempDirHandle + 'system> = Box::new(RealTempDir {
+                inner: TempDir::new()?,
+            });
+            Ok(handle)
+        })
     }
 
     #[inline]
-    fn current_exe(&self) -> io::Result<PathBuf> {
-        env::current_exe()
+    fn current_dir(&self) -> Result<PathBuf> {
+        Ok(env::current_dir()?)
     }
 
     #[inline]
-    fn env_var(&self, key: &str) -> Result<String, VarError> {
+    fn current_exe(&self) -> Result<PathBuf> {
+        Ok(env::current_exe()?)
+    }
+
+    #[inline]
+    fn env_var(&self, key: &str) -> result::Result<String, VarError> {
         env::var(key)
     }
 
     #[inline]
-    fn exists(&self, path: &Path) -> io::Result<bool> {
-        Ok(path.exists())
+    fn exists<'system>(&'system self, path: &'system Path) -> BoxFuture<'system, Result<bool>> {
+        Box::pin(files::exists(self, path))
     }
 
     #[inline]
-    fn is_dir(&self, path: &Path) -> io::Result<bool> {
-        Ok(path.is_dir())
+    fn guarantees(&self) -> Guarantees {
+        self.bucket.guarantees()
     }
 
     #[inline]
-    fn is_file(&self, path: &Path) -> io::Result<bool> {
-        Ok(path.is_file())
+    fn is_dir<'system>(&'system self, path: &'system Path) -> BoxFuture<'system, Result<bool>> {
+        Box::pin(files::is_dir(self, path))
+    }
+
+    #[inline]
+    fn is_file<'system>(&'system self, path: &'system Path) -> BoxFuture<'system, Result<bool>> {
+        Box::pin(files::is_file(self, path))
     }
 
     #[cfg(feature = "process")]
@@ -169,15 +213,11 @@ impl System for RealSystem {
     }
 
     #[inline]
-    fn metadata(&self, path: &Path) -> io::Result<FileMetadata> {
-        let meta = fs::metadata(path)?;
-        Ok(FileMetadata {
-            is_dir: meta.is_dir(),
-            is_file: meta.is_file(),
-            len: meta.len(),
-            modified: Some(meta.modified()?),
-            revision: None,
-        })
+    fn metadata<'system>(
+        &'system self,
+        path: &'system Path,
+    ) -> BoxFuture<'system, Result<FileMetadata>> {
+        Box::pin(files::metadata(self, path))
     }
 
     #[inline]
@@ -186,50 +226,74 @@ impl System for RealSystem {
     }
 
     #[inline]
-    fn open(&self, path: &Path) -> io::Result<Box<dyn Read + '_>> {
-        let file = fs::File::open(path)?;
-        Ok(Box::new(file))
+    fn open<'system>(
+        &'system self,
+        path: &'system Path,
+    ) -> BoxFuture<'system, Result<Box<dyn AsyncRead + Send + Unpin + 'system>>> {
+        Box::pin(files::open(self, path))
     }
 
     #[inline]
-    fn open_append(&self, path: &Path) -> io::Result<Box<dyn Write + '_>> {
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-        Ok(Box::new(file))
+    fn open_append<'system>(
+        &'system self,
+        path: &'system Path,
+    ) -> BoxFuture<'system, Result<Box<dyn AsyncWrite + Send + Unpin + 'system>>> {
+        Box::pin(files::open_append(self, path))
     }
 
     #[inline]
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>> {
-        fs::read_dir(path)?
-            .map(|entry| entry.map(|dir_entry| dir_entry.path()))
-            .collect()
+    fn read<'system>(
+        &'system self,
+        path: &'system Path,
+    ) -> BoxFuture<'system, Result<(Vec<u8>, RevisionToken)>> {
+        Box::pin(files::read(self, path))
     }
 
     #[inline]
-    fn read_to_string(&self, path: &Path) -> io::Result<String> {
-        fs::read_to_string(path)
+    fn read_dir<'system>(
+        &'system self,
+        path: &'system Path,
+    ) -> BoxFuture<'system, Result<Vec<PathBuf>>> {
+        Box::pin(files::read_dir(self, path))
     }
 
     #[inline]
-    fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
-        fs::remove_dir_all(path)
+    fn read_to_string<'system>(
+        &'system self,
+        path: &'system Path,
+    ) -> BoxFuture<'system, Result<String>> {
+        Box::pin(files::read_to_string(self, path))
     }
 
     #[inline]
-    fn remove_file(&self, path: &Path) -> io::Result<()> {
-        fs::remove_file(path)
+    fn remove_dir_all<'system>(
+        &'system self,
+        path: &'system Path,
+    ) -> BoxFuture<'system, Result<()>> {
+        Box::pin(files::remove_dir_all(self, path))
     }
 
     #[inline]
-    fn remove_file_if(&self, path: &Path, contents: &[u8]) -> io::Result<bool> {
-        remove_opened_if(fs::File::open(path)?, path, contents)
+    fn remove_file<'system>(&'system self, path: &'system Path) -> BoxFuture<'system, Result<()>> {
+        Box::pin(files::remove_file(self, path))
     }
 
     #[inline]
-    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
-        fs::rename(from, to)
+    fn remove_file_if<'system>(
+        &'system self,
+        path: &'system Path,
+        token: &'system RevisionToken,
+    ) -> BoxFuture<'system, Result<bool>> {
+        Box::pin(files::remove_file_if(self, path, token))
+    }
+
+    #[inline]
+    fn rename<'system>(
+        &'system self,
+        from: &'system Path,
+        to: &'system Path,
+    ) -> BoxFuture<'system, Result<()>> {
+        Box::pin(files::rename(self, from, to))
     }
 
     #[inline]
@@ -242,17 +306,14 @@ impl System for RealSystem {
     }
 
     #[inline]
-    fn sleep(&self, duration: Duration) -> io::Result<()> {
+    fn sleep(&self, duration: Duration) -> Result<()> {
         thread::sleep(duration);
         Ok(())
     }
 
     #[cfg(feature = "async")]
     #[inline]
-    fn sleep_async(
-        &self,
-        duration: Duration,
-    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+    fn sleep_async(&self, duration: Duration) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
             time::sleep(duration).await;
             Ok(())
@@ -260,45 +321,23 @@ impl System for RealSystem {
     }
 
     #[inline]
-    fn walk_dir(
-        &self,
-        path: &Path,
+    fn walk_dir<'system>(
+        &'system self,
+        path: &'system Path,
         follow_links: bool,
         hidden: bool,
-    ) -> io::Result<Vec<WalkEntry>> {
-        let mut entries = Vec::new();
-
-        // `hidden` here means "include hidden files", but `WalkBuilder::hidden(true)` excludes
-        // them, so the flag is forwarded negated.
-        for result in WalkBuilder::new(path)
-            .follow_links(follow_links)
-            .hidden(!hidden)
-            .build()
-            .skip(1)
-        {
-            let entry = result.map_err(io::Error::other)?;
-            let entry_path = entry.path().to_path_buf();
-
-            entries.push(WalkEntry {
-                is_dir: entry_path.is_dir(),
-                is_file: entry_path.is_file(),
-                path: entry_path.clone(),
-            });
-        }
-
-        Ok(entries)
+    ) -> BoxFuture<'system, Result<Vec<WalkEntry>>> {
+        Box::pin(files::walk_dir(self, path, follow_links, hidden))
     }
 
     #[inline]
-    fn write(&self, path: &Path, contents: &[u8], mode: WriteMode) -> io::Result<()> {
-        match mode {
-            WriteMode::CreateNew => fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)?
-                .write_all(contents),
-            WriteMode::Replace => fs::write(path, contents),
-        }
+    fn write<'system>(
+        &'system self,
+        path: &'system Path,
+        contents: &'system [u8],
+        condition: Condition,
+    ) -> BoxFuture<'system, Result<RevisionToken>> {
+        Box::pin(files::write(self, path, contents, condition))
     }
 }
 
@@ -320,30 +359,12 @@ impl TempDirHandle for RealTempDir {
 
     #[cfg(feature = "zip")]
     #[inline]
-    fn to_zip_stream(&self) -> io::Result<Box<dyn Read>> {
-        RealSystem::new().to_zip_stream(self.inner.path())
+    fn to_zip_stream(&self) -> BoxFuture<'_, Result<Box<dyn Read + Send>>> {
+        Box::pin(async move {
+            let system = RealSystem::new();
+            system.to_zip_stream(self.inner.path()).await
+        })
     }
-}
-
-/// The steps of `remove_file_if` after it opens `path` as `file`.
-fn remove_opened_if(file: fs::File, path: &Path, contents: &[u8]) -> io::Result<bool> {
-    file.lock()?;
-    let mut held = Vec::new();
-    (&file).read_to_end(&mut held)?;
-    if held != contents {
-        return Ok(false);
-    }
-    let opened = Handle::from_file(file)?;
-    let still_named = match Handle::from_path(path) {
-        Ok(named) => named == opened,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-        Err(error) => return Err(error),
-    };
-    if !still_named {
-        return Ok(false);
-    }
-    fs::remove_file(path)?;
-    Ok(true)
 }
 
 #[cfg(test)]

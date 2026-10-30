@@ -1,38 +1,41 @@
 use super::*;
+use crate::bucket::Condition;
+use crate::error::ErrorKind;
+use crate::streams::{close, read_to_end, write_all};
 use std::path::Path;
 
-#[test]
-fn metadata_returns_correct_len_for_file() {
+#[tokio::test(flavor = "current_thread")]
+async fn metadata_returns_correct_len_for_file() {
     let system = MemorySystem::new()
         .with_file("/test/file.txt", b"hello")
         .unwrap();
 
-    let meta = system.metadata(Path::new("/test/file.txt")).unwrap();
+    let meta = system.metadata(Path::new("/test/file.txt")).await.unwrap();
     assert!(meta.is_file);
     assert!(!meta.is_dir);
     assert_eq!(meta.len, 5);
 }
 
-#[test]
-fn metadata_returns_dir_info() {
+#[tokio::test(flavor = "current_thread")]
+async fn metadata_returns_dir_info() {
     let system = MemorySystem::new().with_dir("/mydir").unwrap();
 
-    let meta = system.metadata(Path::new("/mydir")).unwrap();
+    let meta = system.metadata(Path::new("/mydir")).await.unwrap();
     assert!(meta.is_dir);
     assert!(!meta.is_file);
     assert_eq!(meta.len, 0);
 }
 
-#[test]
-fn metadata_not_found() {
+#[tokio::test(flavor = "current_thread")]
+async fn metadata_not_found() {
     let system = MemorySystem::new();
-    let result = system.metadata(Path::new("/missing"));
+    let result = system.metadata(Path::new("/missing")).await;
     assert!(result.is_err());
-    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::NotFound);
+    assert_eq!(result.unwrap_err().kind(), ErrorKind::NotFound);
 }
 
-#[test]
-fn metadata_modified_updates_on_write() {
+#[tokio::test(flavor = "current_thread")]
+async fn metadata_modified_updates_on_write() {
     let start = SystemTime::UNIX_EPOCH
         .checked_add(Duration::from_secs(1_700_000_000))
         .unwrap();
@@ -43,19 +46,23 @@ fn metadata_modified_updates_on_write() {
         .unwrap();
 
     system
-        .write(Path::new("/test/file.txt"), b"first", WriteMode::Replace)
+        .write(Path::new("/test/file.txt"), b"first", Condition::None)
+        .await
         .unwrap();
     let mtime1 = system
         .metadata(Path::new("/test/file.txt"))
+        .await
         .unwrap()
         .modified;
 
     system.advance(Duration::from_secs(1)).unwrap();
     system
-        .write(Path::new("/test/file.txt"), b"second", WriteMode::Replace)
+        .write(Path::new("/test/file.txt"), b"second", Condition::None)
+        .await
         .unwrap();
     let mtime2 = system
         .metadata(Path::new("/test/file.txt"))
+        .await
         .unwrap()
         .modified;
 
@@ -103,26 +110,30 @@ fn advance_that_overflows_errors_and_keeps_the_time() {
     assert_eq!(system.now(), SystemTime::UNIX_EPOCH);
 }
 
-#[test]
-fn rename_file_moves_content() {
+#[tokio::test(flavor = "current_thread")]
+async fn rename_file_moves_content() {
     let system = MemorySystem::new()
         .with_file("/test/a.txt", b"content")
         .unwrap();
 
     system
         .rename(Path::new("/test/a.txt"), Path::new("/test/b.txt"))
+        .await
         .unwrap();
 
-    assert!(!system.exists(Path::new("/test/a.txt")).unwrap());
-    assert!(system.exists(Path::new("/test/b.txt")).unwrap());
+    assert!(!system.exists(Path::new("/test/a.txt")).await.unwrap());
+    assert!(system.exists(Path::new("/test/b.txt")).await.unwrap());
     assert_eq!(
-        system.read_to_string(Path::new("/test/b.txt")).unwrap(),
+        system
+            .read_to_string(Path::new("/test/b.txt"))
+            .await
+            .unwrap(),
         "content"
     );
 }
 
-#[test]
-fn rename_keeps_the_modification_time() {
+#[tokio::test(flavor = "current_thread")]
+async fn rename_keeps_the_modification_time() {
     let start = SystemTime::UNIX_EPOCH
         .checked_add(Duration::from_secs(1_700_000_000))
         .unwrap();
@@ -132,22 +143,28 @@ fn rename_keeps_the_modification_time() {
         .with_now(start)
         .unwrap();
     system
-        .write(Path::new("/test/m.md"), b"m", WriteMode::Replace)
+        .write(Path::new("/test/m.md"), b"m", Condition::None)
+        .await
         .unwrap();
     system.advance(Duration::from_secs(60)).unwrap();
 
     system
         .rename(Path::new("/test/m.md"), Path::new("/test/n.md"))
+        .await
         .unwrap();
 
     assert_eq!(
-        system.metadata(Path::new("/test/n.md")).unwrap().modified,
+        system
+            .metadata(Path::new("/test/n.md"))
+            .await
+            .unwrap()
+            .modified,
         Some(start)
     );
 }
 
-#[test]
-fn rename_of_a_folder_keeps_its_files_modification_times() {
+#[tokio::test(flavor = "current_thread")]
+async fn rename_of_a_folder_keeps_its_files_modification_times() {
     let start = SystemTime::UNIX_EPOCH
         .checked_add(Duration::from_secs(1_700_000_000))
         .unwrap();
@@ -157,56 +174,76 @@ fn rename_of_a_folder_keeps_its_files_modification_times() {
         .with_now(start)
         .unwrap();
     system
-        .write(Path::new("/test/g/k.md"), b"k", WriteMode::Replace)
+        .write(Path::new("/test/g/k.md"), b"k", Condition::None)
+        .await
         .unwrap();
     system.advance(Duration::from_secs(60)).unwrap();
 
     system
         .rename(Path::new("/test/g"), Path::new("/test/h"))
+        .await
         .unwrap();
 
     assert_eq!(
-        system.metadata(Path::new("/test/h/k.md")).unwrap().modified,
+        system
+            .metadata(Path::new("/test/h/k.md"))
+            .await
+            .unwrap()
+            .modified,
         Some(start)
     );
 }
 
-#[test]
-fn rename_nonexistent_returns_error() {
+#[tokio::test(flavor = "current_thread")]
+async fn rename_nonexistent_returns_error() {
     let system = MemorySystem::new();
-    let result = system.rename(Path::new("/missing"), Path::new("/other"));
+    let result = system
+        .rename(Path::new("/missing"), Path::new("/other"))
+        .await;
     assert!(result.is_err());
-    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::NotFound);
+    assert_eq!(result.unwrap_err().kind(), ErrorKind::NotFound);
 }
 
-#[test]
-fn open_append_creates_new_file() {
+#[tokio::test(flavor = "current_thread")]
+async fn open_append_creates_new_file() {
     let system = MemorySystem::new().with_dir("/test").unwrap();
 
-    let mut writer = system.open_append(Path::new("/test/new.txt")).unwrap();
-    writer.write_all(b"hello").unwrap();
-    writer.flush().unwrap();
+    let mut writer = system
+        .open_append(Path::new("/test/new.txt"))
+        .await
+        .unwrap();
+    write_all(&mut *writer, b"hello").await.unwrap();
+    close(&mut *writer).await.unwrap();
     drop(writer);
 
     assert_eq!(
-        system.read_to_string(Path::new("/test/new.txt")).unwrap(),
+        system
+            .read_to_string(Path::new("/test/new.txt"))
+            .await
+            .unwrap(),
         "hello"
     );
 }
 
-#[test]
-fn open_append_extends_existing() {
+#[tokio::test(flavor = "current_thread")]
+async fn open_append_extends_existing() {
     let system = MemorySystem::new()
         .with_file("/test/file.txt", b"hello")
         .unwrap();
 
-    let mut writer = system.open_append(Path::new("/test/file.txt")).unwrap();
-    writer.write_all(b" world").unwrap();
-    writer.flush().unwrap();
+    let mut writer = system
+        .open_append(Path::new("/test/file.txt"))
+        .await
+        .unwrap();
+    write_all(&mut *writer, b" world").await.unwrap();
+    close(&mut *writer).await.unwrap();
     drop(writer);
 
     assert_eq!(
-        system.read_to_string(Path::new("/test/file.txt")).unwrap(),
+        system
+            .read_to_string(Path::new("/test/file.txt"))
+            .await
+            .unwrap(),
         "hello world"
     );
 }
@@ -245,39 +282,45 @@ fn is_pid_alive_checks_mock_pids() {
     assert!(!system.is_pid_alive(9999));
 }
 
-#[test]
-fn canonicalize_passes_absolute_through_and_joins_relative() {
+#[tokio::test(flavor = "current_thread")]
+async fn canonicalize_passes_absolute_through_and_joins_relative() {
     let system = MemorySystem::new().with_current_dir("/base").unwrap();
 
     assert_eq!(
-        system.canonicalize(Path::new("/already/absolute")).unwrap(),
+        system
+            .canonicalize(Path::new("/already/absolute"))
+            .await
+            .unwrap(),
         PathBuf::from("/already/absolute")
     );
     assert_eq!(
-        system.canonicalize(Path::new("rel/path")).unwrap(),
+        system.canonicalize(Path::new("rel/path")).await.unwrap(),
         PathBuf::from("/base/rel/path")
     );
 }
 
-#[test]
-fn create_temp_dir_exists_then_cleaned_up_on_drop() {
+#[tokio::test(flavor = "current_thread")]
+async fn create_temp_dir_exists_then_cleaned_up_on_drop() {
     let system = MemorySystem::new();
-    let temp = system.create_temp_dir().unwrap();
+    let temp = system.create_temp_dir().await.unwrap();
     let path = temp.path().to_path_buf();
 
-    assert!(system.is_dir(&path).unwrap());
+    assert!(system.is_dir(&path).await.unwrap());
     drop(temp);
-    assert!(!system.exists(&path).unwrap());
+    assert!(!system.exists(&path).await.unwrap());
 }
 
-#[test]
-fn read_to_string_rejects_invalid_utf8() {
+#[tokio::test(flavor = "current_thread")]
+async fn read_to_string_rejects_invalid_utf8() {
     let system = MemorySystem::new()
         .with_file("/bad.bin", &[0xff, 0xfe, 0x00])
         .unwrap();
 
-    let err = system.read_to_string(Path::new("/bad.bin")).unwrap_err();
-    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    let err = system
+        .read_to_string(Path::new("/bad.bin"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidData);
 }
 
 #[test]
@@ -292,8 +335,8 @@ fn with_env_sets_env_var() {
     assert_eq!(system.env_var("CONFIGURED").unwrap(), "yes");
 }
 
-#[test]
-fn with_dir_over_a_file_fails_and_keeps_the_file() {
+#[tokio::test(flavor = "current_thread")]
+async fn with_dir_over_a_file_fails_and_keeps_the_file() {
     let system = MemorySystem::new().with_file("/v/a.md", b"a").unwrap();
 
     let kind = system
@@ -303,12 +346,12 @@ fn with_dir_over_a_file_fails_and_keeps_the_file() {
         .map(|err| err.kind());
 
     assert_eq!(kind, Some(io::ErrorKind::AlreadyExists));
-    assert!(system.is_file(Path::new("/v/a.md")).unwrap());
-    assert!(!system.is_dir(Path::new("/v/a.md")).unwrap());
+    assert!(system.is_file(Path::new("/v/a.md")).await.unwrap());
+    assert!(!system.is_dir(Path::new("/v/a.md")).await.unwrap());
 }
 
-#[test]
-fn with_dir_below_a_file_fails_and_keeps_the_file() {
+#[tokio::test(flavor = "current_thread")]
+async fn with_dir_below_a_file_fails_and_keeps_the_file() {
     let system = MemorySystem::new().with_file("/v/a.md", b"a").unwrap();
 
     let kind = system
@@ -318,13 +361,13 @@ fn with_dir_below_a_file_fails_and_keeps_the_file() {
         .map(|err| err.kind());
 
     assert_eq!(kind, Some(io::ErrorKind::NotADirectory));
-    assert!(system.is_file(Path::new("/v/a.md")).unwrap());
-    assert!(!system.is_dir(Path::new("/v/a.md")).unwrap());
-    assert!(!system.exists(Path::new("/v/a.md/sub")).unwrap());
+    assert!(system.is_file(Path::new("/v/a.md")).await.unwrap());
+    assert!(!system.is_dir(Path::new("/v/a.md")).await.unwrap());
+    assert!(!system.exists(Path::new("/v/a.md/sub")).await.unwrap());
 }
 
-#[test]
-fn with_file_below_a_file_fails_and_keeps_the_file() {
+#[tokio::test(flavor = "current_thread")]
+async fn with_file_below_a_file_fails_and_keeps_the_file() {
     let system = MemorySystem::new().with_file("/v/a.md", b"a").unwrap();
 
     let kind = system
@@ -334,13 +377,13 @@ fn with_file_below_a_file_fails_and_keeps_the_file() {
         .map(|err| err.kind());
 
     assert_eq!(kind, Some(io::ErrorKind::NotADirectory));
-    assert!(system.is_file(Path::new("/v/a.md")).unwrap());
-    assert!(!system.is_dir(Path::new("/v/a.md")).unwrap());
-    assert!(!system.exists(Path::new("/v/a.md/b.md")).unwrap());
+    assert!(system.is_file(Path::new("/v/a.md")).await.unwrap());
+    assert!(!system.is_dir(Path::new("/v/a.md")).await.unwrap());
+    assert!(!system.exists(Path::new("/v/a.md/b.md")).await.unwrap());
 }
 
-#[test]
-fn with_file_over_a_folder_fails_and_keeps_the_folder() {
+#[tokio::test(flavor = "current_thread")]
+async fn with_file_over_a_folder_fails_and_keeps_the_folder() {
     let system = MemorySystem::new().with_dir("/v/d").unwrap();
 
     let kind = system
@@ -350,15 +393,15 @@ fn with_file_over_a_folder_fails_and_keeps_the_folder() {
         .map(|err| err.kind());
 
     assert_eq!(kind, Some(io::ErrorKind::IsADirectory));
-    assert!(system.is_dir(Path::new("/v/d")).unwrap());
-    assert!(!system.is_file(Path::new("/v/d")).unwrap());
+    assert!(system.is_dir(Path::new("/v/d")).await.unwrap());
+    assert!(!system.is_file(Path::new("/v/d")).await.unwrap());
 }
 
-#[test]
-fn default_matches_new() {
+#[tokio::test(flavor = "current_thread")]
+async fn default_matches_new() {
     let system = MemorySystem::default();
     assert_eq!(system.current_dir().unwrap(), PathBuf::from("/"));
-    assert!(system.is_dir(Path::new("/")).unwrap());
+    assert!(system.is_dir(Path::new("/")).await.unwrap());
 }
 
 fn epoch_plus(seconds: u64) -> SystemTime {
@@ -393,12 +436,12 @@ fn sleep_that_overflows_the_clock_is_invalid_input_and_leaves_it_unchanged() {
 
     let err = system.sleep(Duration::MAX).unwrap_err();
 
-    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
     assert_eq!(system.now(), near_end);
 }
 
-#[test]
-fn files_written_after_a_sleep_take_the_moved_clock_as_modified() {
+#[tokio::test(flavor = "current_thread")]
+async fn files_written_after_a_sleep_take_the_moved_clock_as_modified() {
     let system = MemorySystem::new()
         .with_dir("/test")
         .unwrap()
@@ -407,10 +450,11 @@ fn files_written_after_a_sleep_take_the_moved_clock_as_modified() {
 
     system.sleep(Duration::from_secs(2)).unwrap();
     system
-        .write(Path::new("/test/file.txt"), b"x", WriteMode::Replace)
+        .write(Path::new("/test/file.txt"), b"x", Condition::None)
+        .await
         .unwrap();
 
-    let meta = system.metadata(Path::new("/test/file.txt")).unwrap();
+    let meta = system.metadata(Path::new("/test/file.txt")).await.unwrap();
     assert_eq!(meta.modified, Some(epoch_plus(102)));
 }
 
@@ -445,6 +489,116 @@ async fn sleep_async_that_overflows_the_clock_is_invalid_input_and_leaves_it_unc
 
     let err = system.sleep_async(Duration::MAX).await.unwrap_err();
 
-    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
     assert_eq!(system.now(), near_end);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_relative_path_is_resolved_against_the_current_dir() {
+    let system = MemorySystem::new()
+        .with_dir("/work")
+        .unwrap()
+        .with_current_dir("/work")
+        .unwrap();
+
+    system
+        .write(Path::new("a.txt"), b"relative", Condition::Absent)
+        .await
+        .unwrap();
+
+    assert!(system.exists(Path::new("/work/a.txt")).await.unwrap());
+    assert_eq!(
+        system.read_to_string(Path::new("a.txt")).await.unwrap(),
+        "relative"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn streams_on_a_relative_path_land_at_the_resolved_path() {
+    let system = MemorySystem::new()
+        .with_dir("/work")
+        .unwrap()
+        .with_current_dir("/work")
+        .unwrap();
+
+    let mut created = system.create(Path::new("c.txt")).await.unwrap();
+    write_all(&mut *created, b"created").await.unwrap();
+    close(&mut *created).await.unwrap();
+    drop(created);
+    let mut appended = system.open_append(Path::new("c.txt")).await.unwrap();
+    write_all(&mut *appended, b"+more").await.unwrap();
+    close(&mut *appended).await.unwrap();
+    drop(appended);
+    let mut opened = system.open(Path::new("c.txt")).await.unwrap();
+    let bytes = read_to_end(&mut *opened).await.unwrap();
+
+    assert_eq!(bytes, b"created+more");
+    assert_eq!(
+        system
+            .read_to_string(Path::new("/work/c.txt"))
+            .await
+            .unwrap(),
+        "created+more"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_stale_token_leaves_the_file() {
+    let system = MemorySystem::new();
+    let path = Path::new("/lock");
+    let first = system.write(path, b"one", Condition::Absent).await.unwrap();
+    system.write(path, b"two", Condition::None).await.unwrap();
+
+    assert!(!system.remove_file_if(path, &first).await.unwrap());
+
+    assert_eq!(system.read_to_string(path).await.unwrap(), "two");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn guarantees_are_the_buckets() {
+    assert_eq!(
+        MemorySystem::new().guarantees(),
+        MemoryBucket::default().guarantees()
+    );
+    assert_eq!(
+        MemorySystem::with_bucket(MemoryBucket::default()).guarantees(),
+        MemoryBucket::default().guarantees()
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_system_over_another_bucket_keeps_the_bucket_clock() {
+    let bucket = MemoryBucket::new(Arc::new(|| SystemTime::UNIX_EPOCH + Duration::from_secs(7)));
+    let system = MemorySystem::with_bucket(bucket);
+    system.advance(Duration::from_secs(60)).unwrap();
+
+    system
+        .write(Path::new("/f"), b"x", Condition::Absent)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        system.metadata(Path::new("/f")).await.unwrap().modified,
+        Some(SystemTime::UNIX_EPOCH + Duration::from_secs(7))
+    );
+    assert_eq!(
+        system.now(),
+        SystemTime::UNIX_EPOCH + Duration::from_secs(60)
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_temporary_folder_lives_in_the_bucket_and_goes_with_its_handle() {
+    let system = MemorySystem::new();
+    let bucket = system.bucket.clone();
+
+    let handle = system.create_temp_dir().await.unwrap();
+    let path = handle.path().to_path_buf();
+    assert!(bucket.head(&path).await.unwrap().is_dir);
+
+    drop(handle);
+    assert_eq!(
+        bucket.head(&path).await.unwrap_err().kind(),
+        ErrorKind::NotFound
+    );
 }

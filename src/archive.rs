@@ -6,10 +6,10 @@
 //! os-shim = { version = "0.1", features = ["zip"] }
 //! ```
 //!
-//! Every read and write goes through [`System`]. The same code packs from and
-//! unpacks to the real disk with `RealSystem`, or to memory with `MemorySystem`.
-//! A test can build a tree in memory, zip it, load the bytes back and compare,
-//! with no temporary files.
+//! Every read and write goes through [`System`], and the functions are async.
+//! The same code packs from and unpacks to the real disk with `RealSystem`, or
+//! to memory with `MemorySystem`. A test can build a tree in memory, zip it,
+//! load the bytes back and compare, with no temporary files.
 //!
 //! # Where things live
 //!
@@ -30,17 +30,21 @@
 //! use std::io::Cursor;
 //! use std::path::Path;
 //!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! # tokio::runtime::Builder::new_current_thread().build()?.block_on(async {
 //! let source = MemorySystem::new()
 //!     .with_file("/project/readme.txt", b"hello")?
 //!     .with_file("/project/src/main.rs", b"fn main() {}")?;
 //!
 //! // The directory's contents are archived, not the directory itself.
-//! let bytes = source.to_zip_vec(Path::new("/project"))?;
+//! let bytes = source.to_zip_vec(Path::new("/project")).await?;
 //!
 //! let copy = MemorySystem::from_zip_reader(Cursor::new(bytes))?;
-//! assert_eq!(copy.read_to_string(Path::new("/readme.txt"))?, "hello");
-//! assert_eq!(copy.read_to_string(Path::new("/src/main.rs"))?, "fn main() {}");
-//! # Ok::<(), std::io::Error>(())
+//! assert_eq!(copy.read_to_string(Path::new("/readme.txt")).await?, "hello");
+//! assert_eq!(copy.read_to_string(Path::new("/src/main.rs")).await?, "fn main() {}");
+//! # Ok(())
+//! # })
+//! # }
 //! ```
 //!
 //! # Example: leave out hidden entries
@@ -54,6 +58,8 @@
 //! use std::io::Cursor;
 //! use std::path::Path;
 //!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! # tokio::runtime::Builder::new_current_thread().build()?.block_on(async {
 //! let source = MemorySystem::new()
 //!     .with_file("/project/app.txt", b"app")?
 //!     .with_file("/project/.env", b"SECRET=1")?
@@ -61,13 +67,15 @@
 //!
 //! let mut bytes = Vec::new();
 //! let options = ZipOptions::default().with_hidden(false);
-//! to_zip_writer(&source, Path::new("/project"), &mut bytes, options)?;
+//! to_zip_writer(&source, Path::new("/project"), &mut bytes, options).await?;
 //!
 //! let copy = MemorySystem::from_zip_reader(Cursor::new(bytes))?;
-//! assert!(copy.exists(Path::new("/app.txt"))?);
-//! assert!(!copy.exists(Path::new("/.env"))?);
-//! assert!(!copy.exists(Path::new("/.cache"))?);
-//! # Ok::<(), std::io::Error>(())
+//! assert!(copy.exists(Path::new("/app.txt")).await?);
+//! assert!(!copy.exists(Path::new("/.env")).await?);
+//! assert!(!copy.exists(Path::new("/.cache")).await?);
+//! # Ok(())
+//! # })
+//! # }
 //! ```
 //!
 //! # Ignore rules
@@ -103,6 +111,8 @@
 //!   a cycle cannot loop forever.
 
 use crate::System;
+use crate::error::{ErrorKind, Result, StorageError};
+use crate::streams::{close, read_chunk, write_all};
 use alloc::collections::BTreeSet;
 use std::io::{self, Cursor, Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
@@ -186,9 +196,12 @@ impl Default for ZipOptions {
 ///
 /// // Read it back with the seekable loader, not `load_zip`.
 /// let system = MemorySystem::from_zip_reader(Cursor::new(bytes))?;
-/// assert_eq!(system.read_to_string(Path::new("/notes/hello.txt"))?, "hello");
-/// assert_eq!(system.read_to_string(Path::new("/notes/bye.txt"))?, "bye");
-/// # Ok::<(), std::io::Error>(())
+/// # tokio::runtime::Builder::new_current_thread().build()?.block_on(async {
+/// assert_eq!(system.read_to_string(Path::new("/notes/hello.txt")).await?, "hello");
+/// assert_eq!(system.read_to_string(Path::new("/notes/bye.txt")).await?, "bye");
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// # })?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub struct ZipStreamWriter<W: Write> {
     /// The zip writer over the sink.
@@ -253,14 +266,15 @@ impl<W: Write> Write for ZipStreamWriter<W> {
 }
 
 /// Stream the file at `path` into `sink` through a heap-allocated buffer.
-fn copy_into<S>(system: &S, path: &Path, sink: &mut dyn Write) -> io::Result<()>
+async fn copy_into<S, W>(system: &S, path: &Path, sink: &mut W) -> Result<()>
 where
     S: System + ?Sized,
+    W: Write + Send,
 {
-    let mut reader = system.open(path)?;
+    let mut reader = system.open(path).await?;
     let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
     loop {
-        let filled = reader.read(&mut buffer)?;
+        let filled = read_chunk(&mut *reader, &mut buffer).await?;
         if filled == 0 {
             break;
         }
@@ -273,7 +287,7 @@ where
 }
 
 /// Archive entry name for `path`, relative to `source`.
-fn entry_name(source: &Path, path: &Path) -> io::Result<String> {
+fn entry_name(source: &Path, path: &Path) -> Result<String> {
     let relative = path.strip_prefix(source).map_err(io::Error::other)?;
     let mut name = String::new();
     let mut first = true;
@@ -282,7 +296,8 @@ fn entry_name(source: &Path, path: &Path) -> io::Result<String> {
             return Err(io::Error::other(format!(
                 "Unsupported path component in {}",
                 path.display()
-            )));
+            ))
+            .into());
         };
         let text = part.to_str().ok_or_else(|| {
             io::Error::other(format!("Non-UTF-8 path component in {}", path.display()))
@@ -302,12 +317,13 @@ fn entry_name(source: &Path, path: &Path) -> io::Result<String> {
 /// resolution. Anything outside that clamps to the nearest end rather than
 /// failing the archive -- the in-memory filesystem stamps un-written directories
 /// with the Unix epoch, which predates the format's floor by a decade.
-fn entry_options<S>(system: &S, path: &Path) -> io::Result<SimpleFileOptions>
+async fn entry_options<S>(system: &S, path: &Path) -> Result<SimpleFileOptions>
 where
     S: System + ?Sized,
 {
     let modified = system
-        .metadata(path)?
+        .metadata(path)
+        .await?
         .modified
         .unwrap_or(SystemTime::UNIX_EPOCH);
     let offset = OffsetDateTime::from(modified);
@@ -323,13 +339,14 @@ where
 }
 
 /// Archive entry name for a lone file: its final component and nothing else.
-fn file_name_of(path: &Path) -> io::Result<String> {
+fn file_name_of(path: &Path) -> Result<String> {
     let name = path
         .file_name()
         .ok_or_else(|| io::Error::other(format!("Path has no file name: {}", path.display())))?;
-    name.to_str()
+    Ok(name
+        .to_str()
         .map(str::to_owned)
-        .ok_or_else(|| io::Error::other(format!("Non-UTF-8 file name in {}", path.display())))
+        .ok_or_else(|| io::Error::other(format!("Non-UTF-8 file name in {}", path.display())))?)
 }
 
 /// Per-entry zip options for a file, pinned to zip64.
@@ -346,11 +363,11 @@ fn file_name_of(path: &Path) -> io::Result<String> {
 /// local header to replace the zip64 placeholder sizes it stamped there --
 /// `u64::MAX` for both -- and a streaming reader then waits for that many bytes
 /// of entry data and hits end of file. A directory carries no data anyway.
-fn file_options<S>(system: &S, path: &Path) -> io::Result<SimpleFileOptions>
+async fn file_options<S>(system: &S, path: &Path) -> Result<SimpleFileOptions>
 where
     S: System + ?Sized,
 {
-    Ok(entry_options(system, path)?.large_file(true))
+    Ok(entry_options(system, path).await?.large_file(true))
 }
 
 /// Whether `path`'s final component is dot-prefixed.
@@ -377,14 +394,18 @@ fn is_hidden(path: &Path) -> bool {
 /// use os_shim::{System, mock::MemorySystem};
 /// use std::path::Path;
 ///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # tokio::runtime::Builder::new_current_thread().build()?.block_on(async {
 /// let source = MemorySystem::new().with_file("/data/a.txt", b"alpha")?;
-/// let bytes = source.to_zip_vec(Path::new("/data"))?;
+/// let bytes = source.to_zip_vec(Path::new("/data")).await?;
 ///
 /// let target = MemorySystem::new();
 /// let mut reader: &[u8] = &bytes;
-/// load_zip(&target, &mut reader, Path::new("/unpacked"))?;
-/// assert_eq!(target.read_to_string(Path::new("/unpacked/a.txt"))?, "alpha");
-/// # Ok::<(), std::io::Error>(())
+/// load_zip(&target, &mut reader, Path::new("/unpacked")).await?;
+/// assert_eq!(target.read_to_string(Path::new("/unpacked/a.txt")).await?, "alpha");
+/// # Ok(())
+/// # })
+/// # }
 /// ```
 ///
 /// # Errors
@@ -394,13 +415,17 @@ fn is_hidden(path: &Path) -> bool {
 /// with `..` that climbs out), or an entry cannot be written. Entries written
 /// before the failure stay in place.
 #[inline]
-pub fn load_zip<S>(system: &S, mut source: &mut dyn Read, destination: &Path) -> io::Result<()>
+pub async fn load_zip<S>(
+    system: &S,
+    mut source: &mut (dyn Read + Send),
+    destination: &Path,
+) -> Result<()>
 where
     S: System + ?Sized,
 {
-    system.create_dir_all(destination)?;
+    system.create_dir_all(destination).await?;
     while let Some(mut entry) = read_zipfile_from_stream(&mut source).map_err(io::Error::other)? {
-        materialise_entry(system, &mut entry, destination)?;
+        materialise_entry(system, &mut entry, destination).await?;
     }
     Ok(())
 }
@@ -422,15 +447,19 @@ where
 /// use std::io::{Cursor, Write};
 /// use std::path::Path;
 ///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # tokio::runtime::Builder::new_current_thread().build()?.block_on(async {
 /// let mut writer = ZipStreamWriter::new(Vec::new());
 /// writer.start_entry("logs/today.txt")?;
 /// writer.write_all(b"ok")?;
 /// let bytes = writer.finish()?;
 ///
 /// let system = MemorySystem::new();
-/// load_zip_seekable(&system, Cursor::new(bytes), Path::new("/restore"))?;
-/// assert_eq!(system.read_to_string(Path::new("/restore/logs/today.txt"))?, "ok");
-/// # Ok::<(), std::io::Error>(())
+/// load_zip_seekable(&system, Cursor::new(bytes), Path::new("/restore")).await?;
+/// assert_eq!(system.read_to_string(Path::new("/restore/logs/today.txt")).await?, "ok");
+/// # Ok(())
+/// # })
+/// # }
 /// ```
 ///
 /// # Errors
@@ -439,48 +468,57 @@ where
 /// destination (an absolute name or one with `..` that climbs out), or an entry
 /// cannot be written. Entries written before the failure stay in place.
 #[inline]
-pub fn load_zip_seekable<S, R>(system: &S, source: R, destination: &Path) -> io::Result<()>
+pub async fn load_zip_seekable<S, R>(system: &S, source: R, destination: &Path) -> Result<()>
 where
     S: System + ?Sized,
-    R: Read + Seek,
+    R: Read + Seek + Send,
 {
     let mut archive = ZipArchive::new(source).map_err(io::Error::other)?;
-    system.create_dir_all(destination)?;
+    system.create_dir_all(destination).await?;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).map_err(io::Error::other)?;
-        materialise_entry(system, &mut entry, destination)?;
+        materialise_entry(system, &mut entry, destination).await?;
     }
     Ok(())
 }
 
 /// Write one archive entry under `destination`: a directory, or a file and its parents.
-fn materialise_entry<S, R>(
+async fn materialise_entry<S, R>(
     system: &S,
     entry: &mut ZipFile<'_, R>,
     destination: &Path,
-) -> io::Result<()>
+) -> Result<()>
 where
     S: System + ?Sized,
-    R: Read + ?Sized,
+    R: Read + Send + ?Sized,
 {
     let Some(relative) = entry.enclosed_name() else {
         return Err(io::Error::other(format!(
             "Archive entry escapes the destination: {}",
             String::from_utf8_lossy(entry.name_raw())
-        )));
+        ))
+        .into());
     };
     let target = destination.join(relative);
     if entry.is_dir() {
-        return system.create_dir_all(&target);
+        return system.create_dir_all(&target).await;
     }
     if let Some(parent) = target.parent() {
-        system.create_dir_all(parent)?;
+        system.create_dir_all(parent).await?;
     }
-    // Streamed through a fixed buffer, not read whole: `read_to_end` would hold the
-    // entry's full uncompressed length in memory.
-    let mut sink = system.create(&target)?;
-    io::copy(entry, &mut sink)?;
-    sink.flush()
+    let mut sink = system.create(&target).await?;
+    let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
+    loop {
+        let filled = entry.read(&mut buffer)?;
+        if filled == 0 {
+            break;
+        }
+        let chunk = buffer
+            .get(..filled)
+            .ok_or_else(|| io::Error::other("Read reported more bytes than the buffer holds"))?;
+        write_all(&mut *sink, chunk).await?;
+    }
+    Ok(close(&mut *sink).await?)
 }
 
 /// Write `source` into `sink` as a zip archive.
@@ -501,15 +539,19 @@ where
 /// use os_shim::archive::{ZipOptions, to_zip_writer};
 /// use std::path::Path;
 ///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # tokio::runtime::Builder::new_current_thread().build()?.block_on(async {
 /// let system = MemorySystem::new().with_file("/docs/guide.txt", b"read me")?;
 ///
 /// let mut bytes = Vec::new();
-/// to_zip_writer(&system, Path::new("/docs/guide.txt"), &mut bytes, ZipOptions::default())?;
+/// to_zip_writer(&system, Path::new("/docs/guide.txt"), &mut bytes, ZipOptions::default()).await?;
 /// assert!(!bytes.is_empty());
 ///
-/// let missing = to_zip_writer(&system, Path::new("/nope"), &mut Vec::new(), ZipOptions::default());
-/// assert_eq!(missing.unwrap_err().kind(), std::io::ErrorKind::NotFound);
-/// # Ok::<(), std::io::Error>(())
+/// let missing = to_zip_writer(&system, Path::new("/nope"), &mut Vec::new(), ZipOptions::default()).await;
+/// assert_eq!(missing.unwrap_err().kind(), os_shim::error::ErrorKind::NotFound);
+/// # Ok(())
+/// # })
+/// # }
 /// ```
 ///
 /// # Errors
@@ -520,12 +562,12 @@ where
 ///   no zip representation.
 /// - The sink cannot be written.
 #[inline]
-pub fn to_zip_writer<S>(
+pub async fn to_zip_writer<S>(
     system: &S,
     source: &Path,
-    sink: &mut dyn Write,
+    sink: &mut (dyn Write + Send),
     options: ZipOptions,
-) -> io::Result<()>
+) -> Result<()>
 where
     S: System + ?Sized,
 {
@@ -534,27 +576,27 @@ where
     let mut buffer = Cursor::new(Vec::<u8>::new());
     let mut writer = ZipWriter::new(&mut buffer);
 
-    if system.is_dir(source)? {
-        let (dirs, files) = walk(system, source, options)?;
+    if system.is_dir(source).await? {
+        let (dirs, files) = walk(system, source, options).await?;
         for dir in &dirs {
             writer
-                .add_directory(entry_name(source, dir)?, entry_options(system, dir)?)
+                .add_directory(entry_name(source, dir)?, entry_options(system, dir).await?)
                 .map_err(io::Error::other)?;
         }
         for file in &files {
             writer
-                .start_file(entry_name(source, file)?, file_options(system, file)?)
+                .start_file(entry_name(source, file)?, file_options(system, file).await?)
                 .map_err(io::Error::other)?;
-            copy_into(system, file, &mut writer)?;
+            copy_into(system, file, &mut writer).await?;
         }
-    } else if system.is_file(source)? {
+    } else if system.is_file(source).await? {
         writer
-            .start_file(file_name_of(source)?, file_options(system, source)?)
+            .start_file(file_name_of(source)?, file_options(system, source).await?)
             .map_err(io::Error::other)?;
-        copy_into(system, source, &mut writer)?;
+        copy_into(system, source, &mut writer).await?;
     } else {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
+        return Err(StorageError::new(
+            ErrorKind::NotFound,
             format!("Archive source not found: {}", source.display()),
         ));
     }
@@ -565,11 +607,11 @@ where
 }
 
 /// Collect the directories and files under `source`, guarding against symlink cycles.
-fn walk<S>(
+async fn walk<S>(
     system: &S,
     source: &Path,
     options: ZipOptions,
-) -> io::Result<(Vec<PathBuf>, Vec<PathBuf>)>
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>)>
 where
     S: System + ?Sized,
 {
@@ -579,18 +621,18 @@ where
     // A directory that canonicalizes to a path already walked is a symlink back into
     // the tree; descending would recurse until the path is too deep.
     let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
-    seen.insert(system.canonicalize(source)?);
+    seen.insert(system.canonicalize(source).await?);
 
     while let Some(current) = stack.pop() {
-        let mut children = system.read_dir(&current)?;
+        let mut children = system.read_dir(&current).await?;
         children.sort();
         for child in children {
             if !options.include_hidden && is_hidden(&child) {
                 continue;
             }
-            if system.is_dir(&child)? {
+            if system.is_dir(&child).await? {
                 dirs.push(child.clone());
-                if seen.insert(system.canonicalize(&child)?) {
+                if seen.insert(system.canonicalize(&child).await?) {
                     stack.push(child);
                 }
             } else {

@@ -1,14 +1,21 @@
 //! Tests for zip archive production and loading.
 
 use super::{ZipOptions, ZipStreamWriter, to_zip_writer};
+use crate::bucket::{Condition, Guarantees, RevisionToken};
+use crate::error::{ErrorKind, Result};
 use crate::mock::MemorySystem;
 use crate::real::RealSystem;
-use crate::{FileMetadata, System, TempDirHandle, WalkEntry, WriteMode};
-#[cfg(feature = "async")]
-use core::pin::Pin;
+#[cfg(slow_tests)]
+use crate::streams::read_chunk;
+use crate::streams::{close, write_all};
+use crate::{BoxFuture, FileMetadata, System, TempDirHandle, WalkEntry};
+use core::result;
 use core::time::Duration;
+use futures_io::{AsyncRead, AsyncWrite};
 use std::env::VarError;
-use std::io::{self, Cursor, Read, Write, pipe};
+#[cfg(slow_tests)]
+use std::fs::File;
+use std::io::{self, Cursor, Read as _, Write, pipe};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(slow_tests)]
@@ -16,6 +23,7 @@ use std::process::Stdio;
 use std::thread;
 use std::time::SystemTime;
 use time::OffsetDateTime;
+use tokio::runtime::Builder;
 use zip::ZipArchive;
 use zip::write::{SimpleFileOptions, StreamWriter, ZipWriter};
 
@@ -56,47 +64,66 @@ struct PlainTempDir {
 }
 
 impl System for MinimalSystem {
-    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+    fn canonicalize<'system>(
+        &'system self,
+        path: &'system Path,
+    ) -> BoxFuture<'system, Result<PathBuf>> {
         self.inner.canonicalize(path)
     }
 
-    fn copy(&self, from: &Path, to: &Path) -> io::Result<u64> {
+    fn copy<'system>(
+        &'system self,
+        from: &'system Path,
+        to: &'system Path,
+    ) -> BoxFuture<'system, Result<u64>> {
         self.inner.copy(from, to)
     }
 
-    fn create(&self, path: &Path) -> io::Result<Box<dyn Write + '_>> {
+    fn create<'system>(
+        &'system self,
+        path: &'system Path,
+    ) -> BoxFuture<'system, Result<Box<dyn AsyncWrite + Send + Unpin + 'system>>> {
         self.inner.create(path)
     }
 
-    fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+    fn create_dir_all<'system>(
+        &'system self,
+        path: &'system Path,
+    ) -> BoxFuture<'system, Result<()>> {
         self.inner.create_dir_all(path)
     }
 
-    fn create_temp_dir(&self) -> io::Result<Box<dyn TempDirHandle>> {
+    fn create_temp_dir<'system>(
+        &'system self,
+    ) -> BoxFuture<'system, Result<Box<dyn TempDirHandle + 'system>>> {
         self.inner.create_temp_dir()
     }
 
-    fn current_dir(&self) -> io::Result<PathBuf> {
+    fn current_dir(&self) -> Result<PathBuf> {
         self.inner.current_dir()
     }
 
-    fn current_exe(&self) -> io::Result<PathBuf> {
+    fn current_exe(&self) -> Result<PathBuf> {
         self.inner.current_exe()
     }
 
-    fn env_var(&self, key: &str) -> Result<String, VarError> {
+    fn env_var(&self, key: &str) -> result::Result<String, VarError> {
         self.inner.env_var(key)
     }
 
-    fn exists(&self, path: &Path) -> io::Result<bool> {
+    fn exists<'system>(&'system self, path: &'system Path) -> BoxFuture<'system, Result<bool>> {
         self.inner.exists(path)
     }
 
-    fn is_dir(&self, path: &Path) -> io::Result<bool> {
+    fn guarantees(&self) -> Guarantees {
+        self.inner.guarantees()
+    }
+
+    fn is_dir<'system>(&'system self, path: &'system Path) -> BoxFuture<'system, Result<bool>> {
         self.inner.is_dir(path)
     }
 
-    fn is_file(&self, path: &Path) -> io::Result<bool> {
+    fn is_file<'system>(&'system self, path: &'system Path) -> BoxFuture<'system, Result<bool>> {
         self.inner.is_file(path)
     }
 
@@ -105,7 +132,10 @@ impl System for MinimalSystem {
         self.inner.is_pid_alive(pid)
     }
 
-    fn metadata(&self, path: &Path) -> io::Result<FileMetadata> {
+    fn metadata<'system>(
+        &'system self,
+        path: &'system Path,
+    ) -> BoxFuture<'system, Result<FileMetadata>> {
         self.inner.metadata(path)
     }
 
@@ -113,35 +143,65 @@ impl System for MinimalSystem {
         self.inner.now()
     }
 
-    fn open(&self, path: &Path) -> io::Result<Box<dyn Read + '_>> {
+    fn open<'system>(
+        &'system self,
+        path: &'system Path,
+    ) -> BoxFuture<'system, Result<Box<dyn AsyncRead + Send + Unpin + 'system>>> {
         self.inner.open(path)
     }
 
-    fn open_append(&self, path: &Path) -> io::Result<Box<dyn Write + '_>> {
+    fn open_append<'system>(
+        &'system self,
+        path: &'system Path,
+    ) -> BoxFuture<'system, Result<Box<dyn AsyncWrite + Send + Unpin + 'system>>> {
         self.inner.open_append(path)
     }
 
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>> {
+    fn read<'system>(
+        &'system self,
+        path: &'system Path,
+    ) -> BoxFuture<'system, Result<(Vec<u8>, RevisionToken)>> {
+        self.inner.read(path)
+    }
+
+    fn read_dir<'system>(
+        &'system self,
+        path: &'system Path,
+    ) -> BoxFuture<'system, Result<Vec<PathBuf>>> {
         self.inner.read_dir(path)
     }
 
-    fn read_to_string(&self, path: &Path) -> io::Result<String> {
+    fn read_to_string<'system>(
+        &'system self,
+        path: &'system Path,
+    ) -> BoxFuture<'system, Result<String>> {
         self.inner.read_to_string(path)
     }
 
-    fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
+    fn remove_dir_all<'system>(
+        &'system self,
+        path: &'system Path,
+    ) -> BoxFuture<'system, Result<()>> {
         self.inner.remove_dir_all(path)
     }
 
-    fn remove_file(&self, path: &Path) -> io::Result<()> {
+    fn remove_file<'system>(&'system self, path: &'system Path) -> BoxFuture<'system, Result<()>> {
         self.inner.remove_file(path)
     }
 
-    fn remove_file_if(&self, path: &Path, contents: &[u8]) -> io::Result<bool> {
-        self.inner.remove_file_if(path, contents)
+    fn remove_file_if<'system>(
+        &'system self,
+        path: &'system Path,
+        token: &'system RevisionToken,
+    ) -> BoxFuture<'system, Result<bool>> {
+        self.inner.remove_file_if(path, token)
     }
 
-    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+    fn rename<'system>(
+        &'system self,
+        from: &'system Path,
+        to: &'system Path,
+    ) -> BoxFuture<'system, Result<()>> {
         self.inner.rename(from, to)
     }
 
@@ -149,29 +209,31 @@ impl System for MinimalSystem {
         self.inner.set_env_var(key, value);
     }
 
-    fn sleep(&self, duration: Duration) -> io::Result<()> {
+    fn sleep(&self, duration: Duration) -> Result<()> {
         self.inner.sleep(duration)
     }
 
     #[cfg(feature = "async")]
-    fn sleep_async(
-        &self,
-        duration: Duration,
-    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+    fn sleep_async(&self, duration: Duration) -> BoxFuture<'_, Result<()>> {
         self.inner.sleep_async(duration)
     }
 
-    fn walk_dir(
-        &self,
-        path: &Path,
+    fn walk_dir<'system>(
+        &'system self,
+        path: &'system Path,
         follow_links: bool,
         hidden: bool,
-    ) -> io::Result<Vec<WalkEntry>> {
+    ) -> BoxFuture<'system, Result<Vec<WalkEntry>>> {
         self.inner.walk_dir(path, follow_links, hidden)
     }
 
-    fn write(&self, path: &Path, contents: &[u8], mode: WriteMode) -> io::Result<()> {
-        self.inner.write(path, contents, mode)
+    fn write<'system>(
+        &'system self,
+        path: &'system Path,
+        contents: &'system [u8],
+        condition: Condition,
+    ) -> BoxFuture<'system, Result<RevisionToken>> {
+        self.inner.write(path, contents, condition)
     }
 }
 
@@ -273,8 +335,8 @@ fn with_hidden_true_restores_the_default() {
     assert!(options.include_hidden);
 }
 
-#[test]
-fn directory_contributes_its_contents_at_the_top_level() {
+#[tokio::test(flavor = "current_thread")]
+async fn directory_contributes_its_contents_at_the_top_level() {
     let system = memory_project();
     let mut archive = Vec::new();
     to_zip_writer(
@@ -283,6 +345,7 @@ fn directory_contributes_its_contents_at_the_top_level() {
         &mut archive,
         ZipOptions::default(),
     )
+    .await
     .unwrap();
 
     assert_eq!(
@@ -302,8 +365,8 @@ fn directory_contributes_its_contents_at_the_top_level() {
     assert_eq!(entry_bytes(&archive, "src/main.rs"), b"fn main() {}\n");
 }
 
-#[test]
-fn empty_directory_survives_as_an_explicit_entry() {
+#[tokio::test(flavor = "current_thread")]
+async fn empty_directory_survives_as_an_explicit_entry() {
     let system = memory_project();
     let mut archive = Vec::new();
     to_zip_writer(
@@ -312,13 +375,14 @@ fn empty_directory_survives_as_an_explicit_entry() {
         &mut archive,
         ZipOptions::default(),
     )
+    .await
     .unwrap();
 
     assert!(entry_names(&archive).contains(&"empty/".to_owned()));
 }
 
-#[test]
-fn hidden_entries_are_dropped_when_the_option_is_off() {
+#[tokio::test(flavor = "current_thread")]
+async fn hidden_entries_are_dropped_when_the_option_is_off() {
     let system = memory_project();
     let mut archive = Vec::new();
     to_zip_writer(
@@ -327,6 +391,7 @@ fn hidden_entries_are_dropped_when_the_option_is_off() {
         &mut archive,
         ZipOptions::default().with_hidden(false),
     )
+    .await
     .unwrap();
 
     let names = entry_names(&archive);
@@ -335,8 +400,8 @@ fn hidden_entries_are_dropped_when_the_option_is_off() {
     assert!(names.contains(&"README.md".to_owned()));
 }
 
-#[test]
-fn single_file_yields_exactly_one_bare_entry() {
+#[tokio::test(flavor = "current_thread")]
+async fn single_file_yields_exactly_one_bare_entry() {
     let system = MemorySystem::new()
         .with_file("/notes/notes.txt", b"jotted")
         .unwrap();
@@ -347,14 +412,15 @@ fn single_file_yields_exactly_one_bare_entry() {
         &mut archive,
         ZipOptions::default(),
     )
+    .await
     .unwrap();
 
     assert_eq!(entry_names(&archive), vec!["notes.txt".to_owned()]);
     assert_eq!(entry_bytes(&archive, "notes.txt"), b"jotted");
 }
 
-#[test]
-fn missing_source_reports_not_found() {
+#[tokio::test(flavor = "current_thread")]
+async fn missing_source_reports_not_found() {
     let system = MemorySystem::new();
     let mut archive = Vec::new();
     let result = to_zip_writer(
@@ -362,13 +428,14 @@ fn missing_source_reports_not_found() {
         Path::new("/absent"),
         &mut archive,
         ZipOptions::default(),
-    );
+    )
+    .await;
 
-    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::NotFound);
+    assert_eq!(result.unwrap_err().kind(), ErrorKind::NotFound);
 }
 
-#[test]
-fn directory_timestamp_older_than_the_zip_floor_is_clamped_up() {
+#[tokio::test(flavor = "current_thread")]
+async fn directory_timestamp_older_than_the_zip_floor_is_clamped_up() {
     // `MemorySystem` stamps unwritten directories with the Unix epoch, before any date a
     // ZIP entry can carry.
     let system = MemorySystem::new().with_dir("/proj/empty").unwrap();
@@ -379,48 +446,51 @@ fn directory_timestamp_older_than_the_zip_floor_is_clamped_up() {
         &mut archive,
         ZipOptions::default(),
     )
+    .await
     .unwrap();
 
     assert_eq!(entry_year(&archive, "empty/"), 1980);
 }
 
-#[test]
-fn entry_carries_the_source_modification_time() {
+#[tokio::test(flavor = "current_thread")]
+async fn entry_carries_the_source_modification_time() {
     let system = RealSystem::new();
-    let temp = system.create_temp_dir().unwrap();
+    let temp = system.create_temp_dir().await.unwrap();
     let file = temp.path().join("fresh.txt");
-    system.write(&file, b"now", WriteMode::Replace).unwrap();
+    system.write(&file, b"now", Condition::None).await.unwrap();
 
     let mut archive = Vec::new();
-    to_zip_writer(&system, &file, &mut archive, ZipOptions::default()).unwrap();
+    to_zip_writer(&system, &file, &mut archive, ZipOptions::default())
+        .await
+        .unwrap();
 
-    let modified = system.metadata(&file).unwrap().modified.unwrap();
+    let modified = system.metadata(&file).await.unwrap().modified.unwrap();
     let expected = OffsetDateTime::from(modified);
     let expected_year = u16::try_from(expected.year()).unwrap();
     assert_eq!(entry_year(&archive, "fresh.txt"), expected_year);
     assert!(expected_year > 1980);
 }
 
-#[test]
-fn gitignored_file_inside_a_git_repository_is_archived() {
+#[tokio::test(flavor = "current_thread")]
+async fn gitignored_file_inside_a_git_repository_is_archived() {
     let system = RealSystem::new();
-    let temp = system.create_temp_dir().unwrap();
+    let temp = system.create_temp_dir().await.unwrap();
     let root = temp.path().join("repo");
-    system.create_dir_all(&root.join(".git")).unwrap();
+    system.create_dir_all(&root.join(".git")).await.unwrap();
     system
-        .write(&root.join(".gitignore"), b"target/\n", WriteMode::Replace)
+        .write(&root.join(".gitignore"), b"target/\n", Condition::None)
+        .await
         .unwrap();
-    system.create_dir_all(&root.join("target")).unwrap();
+    system.create_dir_all(&root.join("target")).await.unwrap();
     system
-        .write(
-            &root.join("target/artifact.bin"),
-            b"built",
-            WriteMode::Replace,
-        )
+        .write(&root.join("target/artifact.bin"), b"built", Condition::None)
+        .await
         .unwrap();
 
     let mut archive = Vec::new();
-    to_zip_writer(&system, &root, &mut archive, ZipOptions::default()).unwrap();
+    to_zip_writer(&system, &root, &mut archive, ZipOptions::default())
+        .await
+        .unwrap();
 
     let names = entry_names(&archive);
     assert!(names.contains(&"target/artifact.bin".to_owned()));
@@ -429,18 +499,20 @@ fn gitignored_file_inside_a_git_repository_is_archived() {
 }
 
 #[cfg(unix)]
-#[test]
-fn symlink_back_to_an_ancestor_terminates_as_an_empty_directory() {
+#[tokio::test(flavor = "current_thread")]
+async fn symlink_back_to_an_ancestor_terminates_as_an_empty_directory() {
     use std::os::unix::fs::symlink;
 
     let system = RealSystem::new();
-    let temp = system.create_temp_dir().unwrap();
+    let temp = system.create_temp_dir().await.unwrap();
     let root = temp.path().join("root");
-    system.create_dir_all(&root.join("inner")).unwrap();
+    system.create_dir_all(&root.join("inner")).await.unwrap();
     symlink(&root, root.join("inner/loop")).unwrap();
 
     let mut archive = Vec::new();
-    to_zip_writer(&system, &root, &mut archive, ZipOptions::default()).unwrap();
+    to_zip_writer(&system, &root, &mut archive, ZipOptions::default())
+        .await
+        .unwrap();
 
     assert_eq!(
         entry_names(&archive),
@@ -448,22 +520,25 @@ fn symlink_back_to_an_ancestor_terminates_as_an_empty_directory() {
     );
 }
 
-#[test]
-fn real_and_memory_agree_on_names_and_contents() {
+#[tokio::test(flavor = "current_thread")]
+async fn real_and_memory_agree_on_names_and_contents() {
     let real = RealSystem::new();
-    let temp = real.create_temp_dir().unwrap();
+    let temp = real.create_temp_dir().await.unwrap();
     let root = temp.path().join("proj");
-    real.create_dir_all(&root.join("empty")).unwrap();
-    real.create_dir_all(&root.join("src")).unwrap();
-    real.write(&root.join(".hidden"), b"dot", WriteMode::Replace)
+    real.create_dir_all(&root.join("empty")).await.unwrap();
+    real.create_dir_all(&root.join("src")).await.unwrap();
+    real.write(&root.join(".hidden"), b"dot", Condition::None)
+        .await
         .unwrap();
-    real.write(&root.join("README.md"), b"hi\n", WriteMode::Replace)
+    real.write(&root.join("README.md"), b"hi\n", Condition::None)
+        .await
         .unwrap();
     real.write(
         &root.join("src/main.rs"),
         b"fn main() {}\n",
-        WriteMode::Replace,
+        Condition::None,
     )
+    .await
     .unwrap();
 
     let memory = MemorySystem::new()
@@ -477,7 +552,9 @@ fn real_and_memory_agree_on_names_and_contents() {
         .unwrap();
 
     let mut from_real = Vec::new();
-    to_zip_writer(&real, &root, &mut from_real, ZipOptions::default()).unwrap();
+    to_zip_writer(&real, &root, &mut from_real, ZipOptions::default())
+        .await
+        .unwrap();
     let mut from_memory = Vec::new();
     to_zip_writer(
         &memory,
@@ -485,6 +562,7 @@ fn real_and_memory_agree_on_names_and_contents() {
         &mut from_memory,
         ZipOptions::default(),
     )
+    .await
     .unwrap();
 
     assert_eq!(entry_names(&from_real), entry_names(&from_memory));
@@ -496,28 +574,31 @@ fn real_and_memory_agree_on_names_and_contents() {
     }
 }
 
-#[test]
-fn info_zip_reports_a_clean_archive() {
+#[tokio::test(flavor = "current_thread")]
+async fn info_zip_reports_a_clean_archive() {
     let system = RealSystem::new();
-    let temp = system.create_temp_dir().unwrap();
+    let temp = system.create_temp_dir().await.unwrap();
     let root = temp.path().join("proj");
-    system.create_dir_all(&root.join("empty")).unwrap();
-    system.create_dir_all(&root.join("src")).unwrap();
+    system.create_dir_all(&root.join("empty")).await.unwrap();
+    system.create_dir_all(&root.join("src")).await.unwrap();
     system
-        .write(&root.join("README.md"), b"hi\n", WriteMode::Replace)
+        .write(&root.join("README.md"), b"hi\n", Condition::None)
+        .await
         .unwrap();
     system
         .write(
             &root.join("src/main.rs"),
             b"fn main() {}\n",
-            WriteMode::Replace,
+            Condition::None,
         )
+        .await
         .unwrap();
 
     let bundle = temp.path().join("proj.zip");
-    let mut sink = system.create(&bundle).unwrap();
-    to_zip_writer(&system, &root, &mut sink, ZipOptions::default()).unwrap();
-    drop(sink);
+    let archive = system.to_zip_vec(&root).await.unwrap();
+    let mut sink = system.create(&bundle).await.unwrap();
+    write_all(&mut *sink, &archive).await.unwrap();
+    close(&mut *sink).await.unwrap();
 
     // `unzip` may not be installed; the reader-based tests cover the archive then.
     let Ok(output) = Command::new("unzip").arg("-t").arg(&bundle).output() else {
@@ -526,17 +607,21 @@ fn info_zip_reports_a_clean_archive() {
     assert!(output.status.success());
 }
 
-#[test]
-fn the_three_zip_shapes_agree_byte_for_byte() {
+#[tokio::test(flavor = "current_thread")]
+async fn the_three_zip_shapes_agree_byte_for_byte() {
     let system = memory_project();
     let source = Path::new("/proj");
 
     let mut from_writer = Vec::new();
-    system.to_zip_writer(source, &mut from_writer).unwrap();
-    let from_vec = system.to_zip_vec(source).unwrap();
+    system
+        .to_zip_writer(source, &mut from_writer)
+        .await
+        .unwrap();
+    let from_vec = system.to_zip_vec(source).await.unwrap();
     let mut from_stream = Vec::new();
     system
         .to_zip_stream(source)
+        .await
         .unwrap()
         .read_to_end(&mut from_stream)
         .unwrap();
@@ -546,42 +631,44 @@ fn the_three_zip_shapes_agree_byte_for_byte() {
     assert!(entry_names(&from_vec).contains(&"README.md".to_owned()));
 }
 
-#[test]
-fn zip_methods_are_reachable_through_trait_objects() {
+#[tokio::test(flavor = "current_thread")]
+async fn zip_methods_are_reachable_through_trait_objects() {
     let owned = memory_project();
     let borrowed: &dyn System = &owned;
     let boxed: Box<dyn System> = Box::new(memory_project());
 
-    let from_borrowed = borrowed.to_zip_vec(Path::new("/proj")).unwrap();
-    let from_boxed = boxed.to_zip_vec(Path::new("/proj")).unwrap();
+    let from_borrowed = borrowed.to_zip_vec(Path::new("/proj")).await.unwrap();
+    let from_boxed = boxed.to_zip_vec(Path::new("/proj")).await.unwrap();
 
     assert_eq!(entry_names(&from_borrowed), entry_names(&from_boxed));
     assert_eq!(entry_bytes(&from_borrowed, "README.md"), b"hi\n");
     assert_eq!(entry_bytes(&from_boxed, "src/main.rs"), b"fn main() {}\n");
 }
 
-#[test]
-fn a_type_with_only_the_required_methods_gains_the_zip_methods() {
+#[tokio::test(flavor = "current_thread")]
+async fn a_type_with_only_the_required_methods_gains_the_zip_methods() {
     let system = MinimalSystem {
         inner: memory_project(),
     };
 
-    let archive = system.to_zip_vec(Path::new("/proj")).unwrap();
+    let archive = system.to_zip_vec(Path::new("/proj")).await.unwrap();
 
     assert!(entry_names(&archive).contains(&"src/main.rs".to_owned()));
     assert_eq!(entry_bytes(&archive, "README.md"), b"hi\n");
 }
 
-#[test]
-fn real_temp_dir_archives_its_own_contents() {
+#[tokio::test(flavor = "current_thread")]
+async fn real_temp_dir_archives_its_own_contents() {
     let system = RealSystem::new();
-    let temp = system.create_temp_dir().unwrap();
+    let temp = system.create_temp_dir().await.unwrap();
     system
-        .write(&temp.path().join("inside.txt"), b"kept", WriteMode::Replace)
+        .write(&temp.path().join("inside.txt"), b"kept", Condition::None)
+        .await
         .unwrap();
 
     let mut archive = Vec::new();
     temp.to_zip_stream()
+        .await
         .unwrap()
         .read_to_end(&mut archive)
         .unwrap();
@@ -590,16 +677,18 @@ fn real_temp_dir_archives_its_own_contents() {
     assert_eq!(entry_bytes(&archive, "inside.txt"), b"kept");
 }
 
-#[test]
-fn memory_temp_dir_archives_its_own_contents() {
+#[tokio::test(flavor = "current_thread")]
+async fn memory_temp_dir_archives_its_own_contents() {
     let system = MemorySystem::new();
-    let temp = system.create_temp_dir().unwrap();
+    let temp = system.create_temp_dir().await.unwrap();
     system
-        .write(&temp.path().join("inside.txt"), b"kept", WriteMode::Replace)
+        .write(&temp.path().join("inside.txt"), b"kept", Condition::None)
+        .await
         .unwrap();
 
     let mut archive = Vec::new();
     temp.to_zip_stream()
+        .await
         .unwrap()
         .read_to_end(&mut archive)
         .unwrap();
@@ -608,59 +697,68 @@ fn memory_temp_dir_archives_its_own_contents() {
     assert_eq!(entry_bytes(&archive, "inside.txt"), b"kept");
 }
 
-#[test]
-fn a_handle_without_an_override_reports_unsupported() {
+#[tokio::test(flavor = "current_thread")]
+async fn a_handle_without_an_override_reports_unsupported() {
     let handle = PlainTempDir {
         path: PathBuf::from("/nowhere"),
     };
 
-    let kind = handle.to_zip_stream().err().map(|error| error.kind());
+    let kind = handle.to_zip_stream().await.err().map(|error| error.kind());
 
-    assert_eq!(kind, Some(io::ErrorKind::Unsupported));
+    assert_eq!(kind, Some(ErrorKind::Unsupported));
 }
 
-#[test]
-fn a_real_tree_round_trips_into_an_in_memory_filesystem() {
+#[tokio::test(flavor = "current_thread")]
+async fn a_real_tree_round_trips_into_an_in_memory_filesystem() {
     let real = RealSystem::new();
-    let temp = real.create_temp_dir().unwrap();
+    let temp = real.create_temp_dir().await.unwrap();
     let root = temp.path().join("proj");
-    real.create_dir_all(&root.join("empty")).unwrap();
-    real.create_dir_all(&root.join("src")).unwrap();
-    real.write(&root.join("README.md"), b"hi\n", WriteMode::Replace)
+    real.create_dir_all(&root.join("empty")).await.unwrap();
+    real.create_dir_all(&root.join("src")).await.unwrap();
+    real.write(&root.join("README.md"), b"hi\n", Condition::None)
+        .await
         .unwrap();
     real.write(
         &root.join("src/main.rs"),
         b"fn main() {}\n",
-        WriteMode::Replace,
+        Condition::None,
     )
+    .await
     .unwrap();
 
-    let mut stream = real.to_zip_stream(&root).unwrap();
+    let mut stream = real.to_zip_stream(&root).await.unwrap();
     let loaded = MemorySystem::from_zip_stream(&mut stream).unwrap();
 
     assert_eq!(
-        loaded.read_to_string(Path::new("/README.md")).unwrap(),
+        loaded
+            .read_to_string(Path::new("/README.md"))
+            .await
+            .unwrap(),
         "hi\n"
     );
     assert_eq!(
-        loaded.read_to_string(Path::new("/src/main.rs")).unwrap(),
+        loaded
+            .read_to_string(Path::new("/src/main.rs"))
+            .await
+            .unwrap(),
         "fn main() {}\n"
     );
-    assert!(loaded.is_dir(Path::new("/empty")).unwrap());
+    assert!(loaded.is_dir(Path::new("/empty")).await.unwrap());
 }
 
-#[test]
-fn a_loaded_filesystem_can_be_edited_and_archived_again() {
+#[tokio::test(flavor = "current_thread")]
+async fn a_loaded_filesystem_can_be_edited_and_archived_again() {
     let source = memory_project();
-    let mut stream = source.to_zip_stream(Path::new("/proj")).unwrap();
+    let mut stream = source.to_zip_stream(Path::new("/proj")).await.unwrap();
     let loaded = MemorySystem::from_zip_stream(&mut stream).unwrap();
 
-    loaded.remove_dir_all(Path::new("/target")).unwrap();
+    loaded.remove_dir_all(Path::new("/target")).await.unwrap();
     loaded
-        .write(Path::new("/added.txt"), b"new", WriteMode::Replace)
+        .write(Path::new("/added.txt"), b"new", Condition::None)
+        .await
         .unwrap();
 
-    let republished = loaded.to_zip_vec(Path::new("/")).unwrap();
+    let republished = loaded.to_zip_vec(Path::new("/")).await.unwrap();
 
     let names = entry_names(&republished);
     assert!(names.contains(&"added.txt".to_owned()));
@@ -669,24 +767,29 @@ fn a_loaded_filesystem_can_be_edited_and_archived_again() {
     assert_eq!(entry_bytes(&republished, "src/main.rs"), b"fn main() {}\n");
 }
 
-#[test]
-fn an_unseekable_pipe_is_a_valid_source() {
+#[tokio::test(flavor = "current_thread")]
+async fn an_unseekable_pipe_is_a_valid_source() {
     let real = RealSystem::new();
-    let temp = real.create_temp_dir().unwrap();
+    let temp = real.create_temp_dir().await.unwrap();
     let root = temp.path().join("proj");
-    real.create_dir_all(&root.join("src")).unwrap();
-    real.write(&root.join("README.md"), b"hi\n", WriteMode::Replace)
+    real.create_dir_all(&root.join("src")).await.unwrap();
+    real.write(&root.join("README.md"), b"hi\n", Condition::None)
+        .await
         .unwrap();
     real.write(
         &root.join("src/main.rs"),
         b"fn main() {}\n",
-        WriteMode::Replace,
+        Condition::None,
     )
+    .await
     .unwrap();
 
     let (mut reader, mut writer) = pipe().unwrap();
     let producer = thread::spawn(move || {
-        RealSystem::new().to_zip_writer(&root, &mut writer).unwrap();
+        let runtime = Builder::new_current_thread().build().unwrap();
+        runtime
+            .block_on(RealSystem::new().to_zip_writer(&root, &mut writer))
+            .unwrap();
         drop(writer);
     });
 
@@ -694,11 +797,17 @@ fn an_unseekable_pipe_is_a_valid_source() {
     producer.join().unwrap();
 
     assert_eq!(
-        loaded.read_to_string(Path::new("/README.md")).unwrap(),
+        loaded
+            .read_to_string(Path::new("/README.md"))
+            .await
+            .unwrap(),
         "hi\n"
     );
     assert_eq!(
-        loaded.read_to_string(Path::new("/src/main.rs")).unwrap(),
+        loaded
+            .read_to_string(Path::new("/src/main.rs"))
+            .await
+            .unwrap(),
         "fn main() {}\n"
     );
 }
@@ -768,23 +877,25 @@ fn a_data_descriptor_archive_is_refused_by_the_stream_reader() {
     assert!(message.contains("The file length is not available in the local header"));
 }
 
-#[test]
-fn a_data_descriptor_archive_loads_from_a_seekable_reader() {
+#[tokio::test(flavor = "current_thread")]
+async fn a_data_descriptor_archive_loads_from_a_seekable_reader() {
     let loaded = MemorySystem::from_zip_reader(Cursor::new(data_descriptor_archive())).unwrap();
 
     assert_eq!(
         loaded
             .read_to_string(Path::new("/word/document.xml"))
+            .await
             .unwrap(),
         "<w:document/>"
     );
     assert_eq!(
         loaded
             .read_to_string(Path::new("/[Content_Types].xml"))
+            .await
             .unwrap(),
         "<Types/>"
     );
-    assert!(loaded.is_dir(Path::new("/word")).unwrap());
+    assert!(loaded.is_dir(Path::new("/word")).await.unwrap());
 }
 
 /// The repeated text of the large entry in the streamed archive.
@@ -821,18 +932,28 @@ fn local_header_bytes(archive: &[u8], offset: usize) -> Vec<Vec<u8>> {
         .collect()
 }
 
-#[test]
-fn a_streamed_archive_loads_with_every_entry_intact() {
+#[tokio::test(flavor = "current_thread")]
+async fn a_streamed_archive_loads_with_every_entry_intact() {
     let loaded = MemorySystem::from_zip_reader(Cursor::new(streamed_archive())).unwrap();
 
-    assert_eq!(loaded.read_to_string(Path::new("/empty.xml")).unwrap(), "");
     assert_eq!(
-        loaded.read_to_string(Path::new("/word/large.xml")).unwrap(),
+        loaded
+            .read_to_string(Path::new("/empty.xml"))
+            .await
+            .unwrap(),
+        ""
+    );
+    assert_eq!(
+        loaded
+            .read_to_string(Path::new("/word/large.xml"))
+            .await
+            .unwrap(),
         streamed_large_entry()
     );
     assert_eq!(
         loaded
             .read_to_string(Path::new("/[Content_Types].xml"))
+            .await
             .unwrap(),
         "<Types/>"
     );
@@ -876,26 +997,31 @@ fn a_streamed_archive_is_written_to_a_sink_that_only_writes() {
     assert!(sink.count > b"<w:document/>".len());
 }
 
-#[test]
-fn a_streamed_archive_with_no_entries_loads_as_empty() {
+#[tokio::test(flavor = "current_thread")]
+async fn a_streamed_archive_with_no_entries_loads_as_empty() {
     let bytes = ZipStreamWriter::new(Vec::<u8>::new()).finish().unwrap();
 
     let loaded = MemorySystem::from_zip_reader(Cursor::new(bytes)).unwrap();
 
-    assert_eq!(loaded.read_dir(Path::new("/")).unwrap().len(), 0);
+    assert_eq!(loaded.read_dir(Path::new("/")).await.unwrap().len(), 0);
 }
 
-#[test]
-fn the_seekable_reader_loads_what_the_writer_produces() {
-    let archive = memory_project().to_zip_vec(Path::new("/proj")).unwrap();
+#[tokio::test(flavor = "current_thread")]
+async fn the_seekable_reader_loads_what_the_writer_produces() {
+    let archive = memory_project()
+        .to_zip_vec(Path::new("/proj"))
+        .await
+        .unwrap();
 
     let from_reader = MemorySystem::from_zip_reader(Cursor::new(archive.clone()))
         .unwrap()
         .to_zip_vec(Path::new("/"))
+        .await
         .unwrap();
     let from_stream = MemorySystem::from_zip_stream(&mut Cursor::new(archive.clone()))
         .unwrap()
         .to_zip_vec(Path::new("/"))
+        .await
         .unwrap();
 
     // Names and contents only: a loaded file is stamped with its load time.
@@ -940,8 +1066,8 @@ fn bytes_that_are_not_an_archive_report_an_error() {
     assert!(MemorySystem::from_zip_stream(&mut source).is_err());
 }
 
-#[test]
-fn every_file_entry_carries_a_zip64_local_header() {
+#[tokio::test(flavor = "current_thread")]
+async fn every_file_entry_carries_a_zip64_local_header() {
     // The zip64 extra field lets an entry declare a length past 0xFFFFFFFF; `file_options`
     // sets `large_file(true)`, so every file carries it.
     let system = memory_project();
@@ -952,6 +1078,7 @@ fn every_file_entry_carries_a_zip64_local_header() {
         &mut archive,
         ZipOptions::default(),
     )
+    .await
     .unwrap();
 
     let files: Vec<String> = entry_names(&archive)
@@ -968,8 +1095,8 @@ fn every_file_entry_carries_a_zip64_local_header() {
     }
 }
 
-#[test]
-fn directory_entries_stay_off_the_zip64_path() {
+#[tokio::test(flavor = "current_thread")]
+async fn directory_entries_stay_off_the_zip64_path() {
     // `add_directory` never revisits its local header, so a zip64 extra field there keeps
     // `u64::MAX` placeholder sizes and a streaming reader waits for data that never comes.
     let system = memory_project();
@@ -980,6 +1107,7 @@ fn directory_entries_stay_off_the_zip64_path() {
         &mut archive,
         ZipOptions::default(),
     )
+    .await
     .unwrap();
 
     let directories: Vec<String> = entry_names(&archive)
@@ -1042,9 +1170,9 @@ fn sha256_of_file(path: &Path) -> String {
 /// Random data, because deflate must not be able to hide four gibibytes behind a
 /// small compressed length: that would leave the zip64 path untouched.
 #[cfg(slow_tests)]
-fn write_incompressible_file(system: RealSystem, path: &Path, bytes: u64) {
-    let mut entropy = system.open(Path::new("/dev/urandom")).unwrap();
-    let mut sink = system.create(path).unwrap();
+async fn write_incompressible_file(system: &RealSystem, path: &Path, bytes: u64) {
+    let mut entropy = system.open(Path::new("/dev/urandom")).await.unwrap();
+    let mut sink = system.create(path).await.unwrap();
     let mut buffer = vec![0_u8; LARGE_ENTRY_CHUNK_BYTES];
     let mut remaining = bytes;
     while remaining != 0 {
@@ -1052,28 +1180,36 @@ fn write_incompressible_file(system: RealSystem, path: &Path, bytes: u64) {
             .unwrap_or(LARGE_ENTRY_CHUNK_BYTES)
             .min(LARGE_ENTRY_CHUNK_BYTES);
         let (slot, _rest) = buffer.split_at_mut(want);
-        entropy.read_exact(slot).unwrap();
-        sink.write_all(slot).unwrap();
+        let mut filled = 0;
+        while filled < want {
+            let (_done, tail) = slot.split_at_mut(filled);
+            let count = read_chunk(&mut *entropy, tail).await.unwrap();
+            assert_ne!(count, 0, "/dev/urandom ended");
+            filled = filled.saturating_add(count);
+        }
+        write_all(&mut *sink, slot).await.unwrap();
         remaining = remaining.saturating_sub(u64::try_from(want).unwrap());
     }
-    sink.flush().unwrap();
+    close(&mut *sink).await.unwrap();
 }
 
 /// An entry past 32 bits archives with zip64 and survives the round trip byte for byte.
 ///
 /// Needs a disk-backed `TMPDIR` and double-digit gibibytes of headroom.
 #[cfg(slow_tests)]
-#[test]
-fn an_entry_above_four_gibibytes_archives_and_extracts() {
+#[tokio::test(flavor = "current_thread")]
+async fn an_entry_above_four_gibibytes_archives_and_extracts() {
     let real = RealSystem::new();
-    let temp = real.create_temp_dir().unwrap();
+    let temp = real.create_temp_dir().await.unwrap();
     let source = temp.path().join("big.bin");
-    write_incompressible_file(real, &source, LARGE_ENTRY_BYTES);
-    assert_eq!(real.metadata(&source).unwrap().len, LARGE_ENTRY_BYTES);
+    write_incompressible_file(&real, &source, LARGE_ENTRY_BYTES).await;
+    assert_eq!(real.metadata(&source).await.unwrap().len, LARGE_ENTRY_BYTES);
 
     let destination = temp.path().join("big.zip");
-    let mut sink = real.create(&destination).unwrap();
-    to_zip_writer(&real, &source, &mut sink, ZipOptions::default()).unwrap();
+    let mut sink = File::create(&destination).unwrap();
+    to_zip_writer(&real, &source, &mut sink, ZipOptions::default())
+        .await
+        .unwrap();
     drop(sink);
 
     let tested = Command::new("unzip")
