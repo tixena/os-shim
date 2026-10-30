@@ -3,7 +3,7 @@
 //! MinIO-compatible server, `s3_tests` against an AWS bucket.
 
 use super::{
-    BlockingBucket, Bucket, Condition, MemoryBucket, Object, ObjectError, ObjectErrorKind,
+    BlockingBucket, Bucket, Condition, Head, MemoryBucket, Object, ObjectError, ObjectErrorKind,
 };
 #[cfg(minio_tests)]
 use super::{MinioBucket, MinioConfig};
@@ -118,6 +118,11 @@ fn get_line(answer: &Result<Object, ObjectError>) -> String {
     shape(answer, |object| format!("bytes {:?}", object.bytes))
 }
 
+/// The line for a head's answer.
+fn head_line(answer: &Result<Head, ObjectError>) -> String {
+    shape(answer, |head| format!("size {}", head.size))
+}
+
 /// The line for a delete's answer.
 fn delete_line(answer: &Result<(), ObjectError>) -> String {
     shape(answer, |&()| "deleted".to_owned())
@@ -145,6 +150,26 @@ where
         got.unwrap().etag == put.unwrap()
     ));
     transcript
+}
+
+/// A head of a key that holds nothing, then of the same key after a put, against the put's tag.
+fn head_after_put<B>(bucket: &BlockingBucket<B>, prefix: &str) -> Vec<String>
+where
+    B: Bucket,
+{
+    let key = format!("{prefix}note.md");
+    let missing = bucket.head(&key);
+    let put = bucket.put(&key, b"12345", &Condition::None);
+    let found = bucket.head(&key);
+    vec![
+        head_line(&missing),
+        put_line(&put),
+        head_line(&found),
+        format!(
+            "head tag equals put tag: {}",
+            found.unwrap().etag == put.unwrap()
+        ),
+    ]
 }
 
 /// Puts and deletes under `Absent` and under current and stale tags.
@@ -272,6 +297,16 @@ fn put_and_get_agree_with_the_server() {
 
 #[cfg(minio_tests)]
 #[test]
+fn head_after_put_agrees_with_the_server() {
+    assert_agree(
+        "head after put",
+        &head_after_put(&memory(), "a/"),
+        &head_after_put(&server(), "head-after-put/"),
+    );
+}
+
+#[cfg(minio_tests)]
+#[test]
 fn conditional_writes_agree_with_the_server() {
     assert_agree(
         "conditional writes",
@@ -376,6 +411,7 @@ fn a_missing_bucket_is_other_on_the_server() {
     let got = bucket.get(key);
     let transcript = vec![
         get_line(&got),
+        head_line(&bucket.head(key)),
         put_line(&bucket.put(key, b"# Note\n", &Condition::None)),
         put_line(&bucket.put(key, b"# Note\n", &Condition::ETag("\"stale\"".to_owned()))),
         shape(&bucket.list("missing-bucket/"), |keys| {
@@ -383,7 +419,7 @@ fn a_missing_bucket_is_other_on_the_server() {
         }),
     ];
     eprintln!("missing bucket on the server:\n{}", transcript.join("\n"));
-    assert_eq!(transcript, ["Other", "Other", "Other", "Other"]);
+    assert_eq!(transcript, ["Other", "Other", "Other", "Other", "Other"]);
     let message = got.unwrap_err().to_string();
     assert!(message.starts_with("404 NoSuchBucket"), "{message}");
 }
@@ -476,6 +512,16 @@ fn put_and_get_agree_with_aws() {
         "put and get",
         &put_and_get(&memory(), "a/"),
         &aws_transcript("put-and-get", put_and_get),
+    );
+}
+
+#[cfg(s3_tests)]
+#[test]
+fn head_after_put_agrees_with_aws() {
+    assert_agree(
+        "head after put",
+        &head_after_put(&memory(), "a/"),
+        &aws_transcript("head-after-put", head_after_put),
     );
 }
 

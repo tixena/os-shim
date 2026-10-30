@@ -1,6 +1,8 @@
 //! Tests for the in-memory bucket, the blocking wrapper, the bucket error and the `MinIO` and AWS S3 clients.
 
-use super::{BlockingBucket, Bucket as _, Condition, MemoryBucket, ObjectError, ObjectErrorKind};
+use super::{
+    BlockingBucket, Bucket, Condition, Head, MemoryBucket, Object, ObjectError, ObjectErrorKind,
+};
 #[cfg(feature = "minio")]
 use super::{MinioBucket, MinioConfig};
 #[cfg(feature = "s3")]
@@ -21,6 +23,36 @@ use std::{
     sync::Mutex,
     thread,
 };
+
+/// A bucket that implements only the required methods, so its `head` is the trait's default body.
+struct RequiredOnly(MemoryBucket);
+
+impl Bucket for RequiredOnly {
+    fn delete(
+        &self,
+        key: &str,
+        condition: &Condition,
+    ) -> impl Future<Output = Result<(), ObjectError>> + Send {
+        self.0.delete(key, condition)
+    }
+
+    fn get(&self, key: &str) -> impl Future<Output = Result<Object, ObjectError>> + Send {
+        self.0.get(key)
+    }
+
+    fn list(&self, prefix: &str) -> impl Future<Output = Result<Vec<String>, ObjectError>> + Send {
+        self.0.list(prefix)
+    }
+
+    fn put(
+        &self,
+        key: &str,
+        bytes: &[u8],
+        condition: &Condition,
+    ) -> impl Future<Output = Result<String, ObjectError>> + Send {
+        self.0.put(key, bytes, condition)
+    }
+}
 
 fn blocking() -> BlockingBucket<MemoryBucket> {
     BlockingBucket::new(MemoryBucket::default()).unwrap()
@@ -59,6 +91,55 @@ async fn async_get_of_a_missing_key_is_not_found() {
         .get("vault/none.md")
         .await
         .unwrap_err();
+    assert_eq!(error.kind(), ObjectErrorKind::NotFound);
+}
+
+#[test]
+fn head_gives_the_size_and_the_put_tag() {
+    let bucket = blocking();
+    let tag = bucket
+        .put("org/a.docx", b"PK\x03\x04", &Condition::None)
+        .unwrap();
+    assert_eq!(
+        bucket.head("org/a.docx").unwrap(),
+        Head { etag: tag, size: 4 }
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn async_head_gives_the_size_and_the_put_tag() {
+    let bucket = MemoryBucket::default();
+    let tag = bucket
+        .put("org/a.docx", b"PK\x03\x04", &Condition::None)
+        .await
+        .unwrap();
+    assert_eq!(
+        bucket.head("org/a.docx").await.unwrap(),
+        Head { etag: tag, size: 4 }
+    );
+}
+
+#[test]
+fn head_of_a_missing_key_is_not_found() {
+    let error = blocking().head("org/b.docx").unwrap_err();
+    assert_eq!(error.kind(), ObjectErrorKind::NotFound);
+}
+
+#[test]
+fn default_head_gives_the_size_and_the_tag_get_gives() {
+    let bucket = BlockingBucket::new(RequiredOnly(MemoryBucket::default())).unwrap();
+    bucket
+        .put("org/a.docx", b"12345", &Condition::None)
+        .unwrap();
+    let object = bucket.get("org/a.docx").unwrap();
+    assert_eq!(
+        bucket.head("org/a.docx").unwrap(),
+        Head {
+            etag: object.etag,
+            size: 5
+        }
+    );
+    let error = bucket.head("org/b.docx").unwrap_err();
     assert_eq!(error.kind(), ObjectErrorKind::NotFound);
 }
 
@@ -290,6 +371,12 @@ fn answer(status: &str, headers: &str, body: &str) -> String {
         "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\n\r\n{body}",
         body.len()
     )
+}
+
+/// A 200 answer to a `HEAD`: the header lines in `headers`, which declare the length themselves, and no body.
+#[cfg(any(feature = "minio", feature = "s3"))]
+fn head_answer(headers: &str) -> String {
+    format!("HTTP/1.1 200 OK\r\n{headers}\r\n")
 }
 
 /// A 404 answer whose S3 error body carries `code` and `message`.
@@ -586,6 +673,66 @@ fn minio_put_with_a_tag_answered_404_no_such_bucket_is_other() {
     assert_eq!(requests(&seen), ["PUT if-match=\"a\""]);
 }
 
+#[cfg(feature = "minio")]
+#[test]
+fn minio_head_gives_the_size_and_the_tag_from_one_head() {
+    let (endpoint, seen) = canned(vec![head_answer("ETag: \"a\"\r\nContent-Length: 5\r\n")]);
+    assert_eq!(
+        minio(endpoint).head("task.md").unwrap(),
+        Head {
+            etag: "\"a\"".to_owned(),
+            size: 5
+        }
+    );
+    assert_eq!(requests(&seen), ["HEAD if-match=-"]);
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_head_of_a_missing_object_in_an_existing_bucket_is_not_found() {
+    let (endpoint, seen) = canned(vec![
+        answer("404 Not Found", "", ""),
+        answer("200 OK", "", ""),
+    ]);
+    let error = minio(endpoint).head("task.md").unwrap_err();
+    assert_eq!(error.kind(), ObjectErrorKind::NotFound);
+    assert_eq!(requests(&seen), ["HEAD if-match=-", "HEAD if-match=-"]);
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_head_in_a_missing_bucket_is_other_naming_the_bucket() {
+    let (endpoint, seen) = canned(vec![
+        answer("404 Not Found", "", ""),
+        answer("404 Not Found", "", ""),
+    ]);
+    let error = minio(endpoint).head("task.md").unwrap_err();
+    assert_eq!(error.kind(), ObjectErrorKind::Other);
+    assert_eq!(error.to_string(), "404: the bucket archie does not exist");
+    assert_eq!(requests(&seen), ["HEAD if-match=-", "HEAD if-match=-"]);
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_head_without_an_etag_is_other() {
+    let (endpoint, _seen) = canned(vec![head_answer("Content-Length: 5\r\n")]);
+    let error = minio(endpoint).head("task.md").unwrap_err();
+    assert_eq!(error.kind(), ObjectErrorKind::Other);
+    assert_eq!(error.to_string(), "the answer carries no ETag header");
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_head_without_a_content_length_is_other() {
+    let (endpoint, _seen) = canned(vec![head_answer("ETag: \"a\"\r\n")]);
+    let error = minio(endpoint).head("task.md").unwrap_err();
+    assert_eq!(error.kind(), ObjectErrorKind::Other);
+    assert_eq!(
+        error.to_string(),
+        "the answer carries no Content-Length header"
+    );
+}
+
 /// The configuration every AWS S3 scenario uses.
 #[cfg(feature = "s3")]
 fn s3_config() -> S3Config {
@@ -684,6 +831,32 @@ fn s3_get_answered_503_is_other_after_one_request() {
     let error = s3(&endpoint).get("task.md").unwrap_err();
     assert_eq!(error.kind(), ObjectErrorKind::Other);
     assert_eq!(requests(&seen), ["GET if-match=-"]);
+}
+
+#[cfg(feature = "s3")]
+#[test]
+fn s3_head_gives_the_size_and_the_tag_from_one_head() {
+    let (endpoint, seen) = canned(vec![head_answer("ETag: \"a\"\r\nContent-Length: 5\r\n")]);
+    assert_eq!(
+        s3(&endpoint).head("task.md").unwrap(),
+        Head {
+            etag: "\"a\"".to_owned(),
+            size: 5
+        }
+    );
+    assert_eq!(requests(&seen), ["HEAD if-match=-"]);
+}
+
+#[cfg(feature = "s3")]
+#[test]
+fn s3_head_of_a_missing_object_in_an_existing_bucket_is_not_found() {
+    let (endpoint, seen) = canned(vec![
+        answer("404 Not Found", "", ""),
+        answer("200 OK", "", ""),
+    ]);
+    let error = s3(&endpoint).head("task.md").unwrap_err();
+    assert_eq!(error.kind(), ObjectErrorKind::NotFound);
+    assert_eq!(requests(&seen), ["HEAD if-match=-", "HEAD if-match=-"]);
 }
 
 #[cfg(feature = "s3")]

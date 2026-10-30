@@ -6,9 +6,10 @@
 //!
 //! # What it is
 //!
-//! The module reads, writes, deletes and lists whole objects by key. It has no
-//! ranges, no streaming, no metadata, no copy and no versions. Every put and
-//! delete takes a [`Condition`]:
+//! The module reads, writes, deletes and lists whole objects by key, and reads
+//! an object's size and tag without its bytes. It has no ranges, no streaming,
+//! no custom metadata, no copy and no versions. Every put and delete takes a
+//! [`Condition`]:
 //!
 //! - [`Condition::None`]: no check. A put replaces, a delete removes.
 //! - [`Condition::Absent`]: the put succeeds only if no object is at the key.
@@ -16,13 +17,14 @@
 //!   key has this entity tag.
 //!
 //! A put returns the new entity tag. A get returns the bytes with their tag
-//! ([`Object`]). A failed condition is an [`ObjectError`] whose
+//! ([`Object`]), a head the size with the tag ([`Head`]). A failed condition is an [`ObjectError`] whose
 //! [`kind`](ObjectError::kind) is [`ObjectErrorKind::PreconditionFailed`], the
 //! same on every implementation.
 //!
 //! # The pieces
 //!
-//! - `Bucket`: the asynchronous trait with `get`, `put`, `delete` and `list`.
+//! - `Bucket`: the asynchronous trait with `get`, `head`, `put`, `delete` and
+//!   `list`.
 //!   Its methods return `impl Future + Send`, so it cannot be a trait object;
 //!   take a generic `B: Bucket`.
 //! - `MinioBucket` and `MinioConfig` (feature `minio`): a client for `MinIO`,
@@ -120,6 +122,17 @@ use tokio::runtime::{Builder, Runtime};
 #[cfg(feature = "async")]
 declare_bucket!();
 
+/// What a store says about one object without sending its bytes.
+///
+/// Returned by `head`. It cannot be built outside this crate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Head {
+    /// The `ETag` exactly as the store gave it, quotes included.
+    pub etag: String,
+    pub size: u64,
+}
+
 /// One object: its bytes and the entity tag the store gave it.
 ///
 /// Returned by `get`. It cannot be built outside this crate. Pass `etag` back
@@ -158,7 +171,7 @@ pub enum Condition {
 /// Read it with [`ObjectError::kind`]. The enum is `non_exhaustive`: a `match`
 /// outside this crate needs a `_` arm.
 ///
-/// Only `get` returns `NotFound`; a missing bucket is `Other`. Nothing is
+/// Only `get` and `head` return `NotFound`; a missing bucket is `Other`. Nothing is
 /// retried for you, so a transient `Other` is yours to retry. After
 /// `PreconditionFailed` the object is unchanged: get it again and decide.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -312,6 +325,21 @@ impl MemoryBucket {
         Ok(Object { bytes, etag })
     }
 
+    /// The size and tag of the object at `key`, read without copying its bytes.
+    fn head_now(&self, key: &str) -> Result<Head, ObjectError> {
+        let (etag, length) = self
+            .objects
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(key)
+            .map(|bytes| (tag_of(bytes), bytes.len()))
+            .ok_or_else(ObjectError::not_found)?;
+        Ok(Head {
+            etag,
+            size: u64::try_from(length).map_err(io::Error::other)?,
+        })
+    }
+
     /// Every key that starts with `prefix`, in order.
     fn list_now(&self, prefix: &str) -> Vec<String> {
         let objects = self.objects.read().unwrap_or_else(PoisonError::into_inner);
@@ -352,6 +380,11 @@ impl Bucket for MemoryBucket {
     #[inline]
     fn get(&self, key: &str) -> impl Future<Output = Result<Object, ObjectError>> + Send {
         ready(self.get_now(key))
+    }
+
+    #[inline]
+    fn head(&self, key: &str) -> impl Future<Output = Result<Head, ObjectError>> + Send {
+        ready(self.head_now(key))
     }
 
     #[inline]
@@ -415,6 +448,21 @@ impl<B: Bucket> BlockingBucket<B> {
     #[inline]
     pub fn get(&self, key: &str) -> Result<Object, ObjectError> {
         self.runtime.block_on(self.bucket.get(key))
+    }
+
+    /// The size and entity tag of the object at `key`, without its bytes.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` when no object is at `key`.
+    /// `Other` when the store cannot be reached or the bucket is missing.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from inside a tokio runtime.
+    #[inline]
+    pub fn head(&self, key: &str) -> Result<Head, ObjectError> {
+        self.runtime.block_on(self.bucket.head(key))
     }
 
     /// Every key that starts with `prefix`, every page of the listing read.
@@ -550,6 +598,36 @@ impl SdkBucket {
             bytes: collected.into_bytes().to_vec(),
             etag,
         })
+    }
+
+    /// The size and tag of the object at `key`, from a `HEAD` on it.
+    async fn head(&self, key: &str) -> Result<Head, ObjectError> {
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(classify)
+        {
+            Ok(head) => Ok(Head {
+                etag: head.e_tag().map(str::to_owned).ok_or_else(missing_etag)?,
+                size: head
+                    .content_length()
+                    .and_then(|length| u64::try_from(length).ok())
+                    .ok_or_else(|| {
+                        ObjectError::from(io::Error::other(
+                            "the answer carries no Content-Length header",
+                        ))
+                    })?,
+            }),
+            Err(error) if error.kind() == ObjectErrorKind::NotFound => {
+                self.object_is_missing().await?;
+                Err(ObjectError::not_found())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Every key that starts with `prefix`, every page of the listing read.
@@ -734,6 +812,11 @@ impl Bucket for MinioBucket {
     }
 
     #[inline]
+    fn head(&self, key: &str) -> impl Future<Output = Result<Head, ObjectError>> + Send {
+        self.0.head(key)
+    }
+
+    #[inline]
     fn list(&self, prefix: &str) -> impl Future<Output = Result<Vec<String>, ObjectError>> + Send {
         self.0.list(prefix)
     }
@@ -855,6 +938,11 @@ impl Bucket for S3Bucket {
     #[inline]
     fn get(&self, key: &str) -> impl Future<Output = Result<Object, ObjectError>> + Send {
         self.0.get(key)
+    }
+
+    #[inline]
+    fn head(&self, key: &str) -> impl Future<Output = Result<Head, ObjectError>> + Send {
+        self.0.head(key)
     }
 
     #[inline]

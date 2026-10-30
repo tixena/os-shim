@@ -2,7 +2,7 @@
 //! `async` feature, and in this private module without it, where it cannot be named.
 
 #[cfg(not(feature = "async"))]
-use super::{Condition, Object, ObjectError};
+use super::{Condition, Head, Object, ObjectError};
 
 /// Declares the `Bucket` trait where it is invoked.
 macro_rules! declare_bucket {
@@ -42,6 +42,28 @@ macro_rules! declare_bucket {
             /// `Other` when the store cannot be reached, the bucket is missing
             /// or the answer cannot be read.
             fn get(&self, key: &str) -> impl Future<Output = Result<Object, ObjectError>> + Send;
+
+            /// The size and entity tag of the object at `key`.
+            ///
+            /// `MemoryBucket`, `MinioBucket` and `S3Bucket` answer without the
+            /// bytes. The default body reads the whole object with `get`, so a
+            /// bucket written outside this crate keeps compiling; override it.
+            ///
+            /// # Errors
+            ///
+            /// `NotFound` when no object is at `key`.
+            /// `Other` when the store cannot be reached or the bucket is missing.
+            #[inline]
+            fn head(&self, key: &str) -> impl Future<Output = Result<Head, ObjectError>> + Send {
+                let read = self.get(key);
+                async move {
+                    let object = read.await?;
+                    Ok(Head {
+                        etag: object.etag,
+                        size: u64::try_from(object.bytes.len()).map_err(std::io::Error::other)?,
+                    })
+                }
+            }
 
             /// Every key that starts with `prefix`, every page of the listing read.
             ///
