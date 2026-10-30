@@ -111,6 +111,8 @@ mod defaults;
 pub mod disk;
 mod memory;
 mod paths;
+#[cfg(any(feature = "minio", feature = "s3"))]
+mod streams;
 
 use self::defaults::{
     BufferedWriter, BytesReader, Target, append_by_rewrite, copy_by_rewrite, rename_by_copy,
@@ -1033,37 +1035,36 @@ impl SdkBucket {
     /// Write `bytes` at `path` when `condition` holds, and give the new token.
     async fn put(&self, path: &Path, bytes: &[u8], condition: &Condition) -> Result<RevisionToken> {
         self.check_put(path).await?;
-        let key = key_of(&self.prefix, path)?;
+        self.put_key(&key_of(&self.prefix, path)?, bytes.to_vec(), condition)
+            .await
+    }
+
+    /// `PutObject` of `bytes` at `key` when `condition` holds, giving the new token.
+    async fn put_key(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+        condition: &Condition,
+    ) -> Result<RevisionToken> {
         let unconditional = self
             .client
             .put_object()
             .bucket(&self.bucket)
             .key(key)
-            .body(ByteStream::from(bytes.to_vec()));
+            .body(ByteStream::from(bytes));
         let request = match condition.clone() {
             Condition::None => unconditional,
             Condition::Absent => unconditional.if_none_match("*"),
             Condition::Matches(token) => unconditional.if_match(token.as_str()),
         };
-        match request.send().await.map_err(classify) {
-            Ok(output) => output
-                .e_tag()
-                .map(RevisionToken::new)
-                .ok_or_else(missing_etag),
-            Err(error)
-                if error.kind() == ErrorKind::PreconditionFailed
-                    && matches!(*condition, Condition::Absent) =>
-            {
-                Err(StorageError::from_kind(ErrorKind::AlreadyExists))
-            }
-            Err(error)
-                if error.kind() == ErrorKind::NotFound
-                    && matches!(*condition, Condition::Matches(_)) =>
-            {
-                Err(StorageError::from_kind(ErrorKind::PreconditionFailed))
-            }
-            Err(error) => Err(error),
-        }
+        request
+            .send()
+            .await
+            .map_err(classify)
+            .map_err(|error| for_condition(error, condition))?
+            .e_tag()
+            .map(RevisionToken::new)
+            .ok_or_else(missing_etag)
     }
 
     /// Delete every key below the folder at `path`, markers included.
@@ -1273,6 +1274,14 @@ impl MinioBucket {
 #[cfg(feature = "minio")]
 impl Bucket for MinioBucket {
     #[inline]
+    fn append_stream<'bucket>(
+        &'bucket self,
+        path: &'bucket Path,
+    ) -> impl Future<Output = Result<Box<dyn AsyncWrite + Send + Unpin + 'bucket>>> + Send {
+        streams::append_stream(&self.0, path)
+    }
+
+    #[inline]
     fn copy(&self, from: &Path, to: &Path) -> impl Future<Output = Result<u64>> + Send {
         self.0.copy(from, to)
     }
@@ -1326,6 +1335,14 @@ impl Bucket for MinioBucket {
     }
 
     #[inline]
+    fn read_stream<'bucket>(
+        &'bucket self,
+        path: &'bucket Path,
+    ) -> impl Future<Output = Result<Box<dyn AsyncRead + Send + Unpin + 'bucket>>> + Send {
+        streams::read_stream(&self.0, path)
+    }
+
+    #[inline]
     fn remove_folder(&self, path: &Path) -> impl Future<Output = Result<()>> + Send {
         self.0.remove_folder(path)
     }
@@ -1333,6 +1350,15 @@ impl Bucket for MinioBucket {
     #[inline]
     fn rename(&self, from: &Path, to: &Path) -> impl Future<Output = Result<()>> + Send {
         self.0.rename(from, to)
+    }
+
+    #[inline]
+    fn write_stream<'bucket>(
+        &'bucket self,
+        path: &'bucket Path,
+        condition: Condition,
+    ) -> impl Future<Output = Result<Box<dyn AsyncWrite + Send + Unpin + 'bucket>>> + Send {
+        streams::write_stream(&self.0, path, condition)
     }
 }
 
@@ -1514,6 +1540,14 @@ impl S3Bucket {
 #[cfg(feature = "s3")]
 impl Bucket for S3Bucket {
     #[inline]
+    fn append_stream<'bucket>(
+        &'bucket self,
+        path: &'bucket Path,
+    ) -> impl Future<Output = Result<Box<dyn AsyncWrite + Send + Unpin + 'bucket>>> + Send {
+        streams::append_stream(&self.0, path)
+    }
+
+    #[inline]
     fn copy(&self, from: &Path, to: &Path) -> impl Future<Output = Result<u64>> + Send {
         self.0.copy(from, to)
     }
@@ -1567,6 +1601,14 @@ impl Bucket for S3Bucket {
     }
 
     #[inline]
+    fn read_stream<'bucket>(
+        &'bucket self,
+        path: &'bucket Path,
+    ) -> impl Future<Output = Result<Box<dyn AsyncRead + Send + Unpin + 'bucket>>> + Send {
+        streams::read_stream(&self.0, path)
+    }
+
+    #[inline]
     fn remove_folder(&self, path: &Path) -> impl Future<Output = Result<()>> + Send {
         self.0.remove_folder(path)
     }
@@ -1574,6 +1616,15 @@ impl Bucket for S3Bucket {
     #[inline]
     fn rename(&self, from: &Path, to: &Path) -> impl Future<Output = Result<()>> + Send {
         self.0.rename(from, to)
+    }
+
+    #[inline]
+    fn write_stream<'bucket>(
+        &'bucket self,
+        path: &'bucket Path,
+        condition: Condition,
+    ) -> impl Future<Output = Result<Box<dyn AsyncWrite + Send + Unpin + 'bucket>>> + Send {
+        streams::write_stream(&self.0, path, condition)
     }
 }
 
@@ -1634,6 +1685,21 @@ where
             source: Box::new(error),
         },
     )
+}
+
+/// `error` as a write under `condition` reports it: a failed `Absent` is `AlreadyExists`, and a
+/// `Matches` whose object is missing is `PreconditionFailed`.
+#[cfg(any(feature = "minio", feature = "s3"))]
+fn for_condition(error: StorageError, condition: &Condition) -> StorageError {
+    match (error.kind(), condition.clone()) {
+        (ErrorKind::PreconditionFailed, Condition::Absent) => {
+            StorageError::from_kind(ErrorKind::AlreadyExists)
+        }
+        (ErrorKind::NotFound, Condition::Matches(_)) => {
+            StorageError::from_kind(ErrorKind::PreconditionFailed)
+        }
+        _ => error,
+    }
 }
 
 /// `text` with every byte outside `A-Z a-z 0-9 - _ . ~ /` written as `%` and two hex digits.

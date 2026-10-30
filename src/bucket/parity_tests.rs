@@ -7,9 +7,9 @@ use super::{BlockingBucket, Bucket, Condition, Depth, MemoryBucket, RevisionToke
 use super::{MinioBucket, MinioConfig};
 #[cfg(s3_tests)]
 use super::{S3Bucket, S3Config};
-#[cfg(minio_tests)]
-use crate::error::ErrorKind;
 use crate::error::Result;
+#[cfg(minio_tests)]
+use crate::error::{ErrorKind, StorageError};
 use crate::{FileMetadata, WalkEntry};
 #[cfg(minio_tests)]
 use aws_sdk_s3::primitives::ByteStream;
@@ -21,6 +21,8 @@ use aws_sdk_s3::{
     error::SdkError,
 };
 use core::result;
+#[cfg(minio_tests)]
+use futures_util::{AsyncReadExt as _, AsyncWriteExt as _};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -791,6 +793,160 @@ fn observe_a_put_with_the_tag_stripped_of_its_quotes() {
     );
     eprintln!("put with an unquoted tag: {}", put_line(&answer));
     eprintln!("object afterwards: {}", get_line(&bucket.get(path)));
+}
+
+/// A server bucket whose folder `name` exists and holds nothing.
+#[cfg(minio_tests)]
+async fn empty_folder(name: &str) -> (MinioBucket, PathBuf) {
+    let bucket = MinioBucket::new(ready_config());
+    let folder = PathBuf::from(format!("/{name}"));
+    drop(bucket.remove_folder(&folder).await);
+    bucket.create_folder(&folder).await.unwrap();
+    (bucket, folder)
+}
+
+/// The bytes of `reader`, read to its end through a small buffer.
+#[cfg(minio_tests)]
+async fn drain(reader: &mut (dyn futures_io::AsyncRead + Send + Unpin + '_)) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).await.unwrap();
+        if read == 0 {
+            return bytes;
+        }
+        bytes.extend(buffer.iter().take(read));
+    }
+}
+
+#[cfg(minio_tests)]
+#[test]
+fn a_20_mib_stream_is_written_and_read_back_on_the_server() {
+    runtime().block_on(async {
+        let (bucket, folder) = empty_folder("stream-round-trip").await;
+        let path = folder.join("20mib.bin");
+        let mut writer = bucket.write_stream(&path, Condition::Absent).await.unwrap();
+        for index in 0..20_u8 {
+            writer.write_all(&vec![index; 1024 * 1024]).await.unwrap();
+        }
+        writer.close().await.unwrap();
+        assert_eq!(bucket.head(&path).await.unwrap().len, 20 * 1024 * 1024);
+
+        let mut reader = bucket.read_stream(&path).await.unwrap();
+        let bytes = drain(&mut *reader).await;
+        assert_eq!(bytes.len(), 20 * 1024 * 1024);
+        for (index, chunk) in bytes.chunks(1024 * 1024).enumerate() {
+            assert!(
+                chunk.iter().all(|&byte| usize::from(byte) == index),
+                "{index}"
+            );
+        }
+    });
+}
+
+#[cfg(minio_tests)]
+#[test]
+fn a_stream_write_under_absent_on_an_existing_key_is_already_exists_on_the_server() {
+    runtime().block_on(async {
+        let (bucket, folder) = empty_folder("stream-absent").await;
+        let path = folder.join("taken.bin");
+        bucket.put(&path, b"first", &Condition::None).await.unwrap();
+
+        let mut small = bucket.write_stream(&path, Condition::Absent).await.unwrap();
+        small.write_all(b"second").await.unwrap();
+        let refused_small = StorageError::from(small.close().await.unwrap_err());
+        assert_eq!(refused_small.kind(), ErrorKind::AlreadyExists);
+
+        let mut large = bucket.write_stream(&path, Condition::Absent).await.unwrap();
+        large.write_all(&vec![1_u8; 9 * 1024 * 1024]).await.unwrap();
+        let refused_large = StorageError::from(large.close().await.unwrap_err());
+        assert_eq!(refused_large.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(bucket.get(&path).await.unwrap().0, b"first");
+    });
+}
+
+#[cfg(minio_tests)]
+#[test]
+fn a_stream_write_under_a_stale_tag_is_precondition_failed_on_the_server() {
+    runtime().block_on(async {
+        let (bucket, folder) = empty_folder("stream-matches").await;
+        let path = folder.join("tagged.bin");
+        let stale = bucket.put(&path, b"first", &Condition::None).await.unwrap();
+        bucket
+            .put(&path, b"second", &Condition::None)
+            .await
+            .unwrap();
+
+        let mut small = bucket
+            .write_stream(&path, Condition::Matches(stale.clone()))
+            .await
+            .unwrap();
+        small.write_all(b"third").await.unwrap();
+        let refused_small = StorageError::from(small.close().await.unwrap_err());
+        assert_eq!(refused_small.kind(), ErrorKind::PreconditionFailed);
+
+        let mut large = bucket
+            .write_stream(&path, Condition::Matches(stale))
+            .await
+            .unwrap();
+        large.write_all(&vec![1_u8; 9 * 1024 * 1024]).await.unwrap();
+        let refused_large = StorageError::from(large.close().await.unwrap_err());
+        assert_eq!(refused_large.kind(), ErrorKind::PreconditionFailed);
+        assert_eq!(bucket.get(&path).await.unwrap().0, b"second");
+    });
+}
+
+#[cfg(minio_tests)]
+#[test]
+fn an_append_stream_keeps_the_old_bytes_first_on_the_server() {
+    runtime().block_on(async {
+        let (bucket, folder) = empty_folder("stream-append").await;
+        for (name, old_len) in [("six.bin", 6 * 1024 * 1024), ("small.bin", 3)] {
+            let path = folder.join(name);
+            bucket
+                .put(&path, &vec![1_u8; old_len], &Condition::None)
+                .await
+                .unwrap();
+            let mut writer = bucket.append_stream(&path).await.unwrap();
+            writer.write_all(&vec![2_u8; 1024 * 1024]).await.unwrap();
+            writer.close().await.unwrap();
+            let (bytes, _token) = bucket.get(&path).await.unwrap();
+            assert_eq!(bytes.len(), old_len + 1024 * 1024, "{name}");
+            assert!(bytes.iter().take(old_len).all(|&byte| byte == 1), "{name}");
+            assert!(bytes.iter().skip(old_len).all(|&byte| byte == 2), "{name}");
+        }
+        let missing = folder.join("missing.bin");
+        let mut writer = bucket.append_stream(&missing).await.unwrap();
+        writer.write_all(b"new").await.unwrap();
+        writer.close().await.unwrap();
+        assert_eq!(bucket.get(&missing).await.unwrap().0, b"new");
+    });
+}
+
+#[cfg(minio_tests)]
+#[test]
+fn a_write_stream_dropped_without_close_stores_nothing_on_the_server() {
+    runtime().block_on(async {
+        let (bucket, folder) = empty_folder("stream-dropped").await;
+        let small = folder.join("small.bin");
+        let large = folder.join("large.bin");
+        let mut first = bucket.write_stream(&small, Condition::None).await.unwrap();
+        first.write_all(b"lost").await.unwrap();
+        drop(first);
+        let mut second = bucket.write_stream(&large, Condition::None).await.unwrap();
+        second
+            .write_all(&vec![1_u8; 9 * 1024 * 1024])
+            .await
+            .unwrap();
+        second.flush().await.unwrap();
+        drop(second);
+        for path in [small, large] {
+            assert_eq!(
+                bucket.head(&path).await.unwrap_err().kind(),
+                ErrorKind::NotFound
+            );
+        }
+    });
 }
 
 /// Not a parity sequence, since `MemoryBucket` never holds a file and a folder at one path: keys
