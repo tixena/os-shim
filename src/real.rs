@@ -34,21 +34,24 @@
 use crate::bucket::disk::DiskBucket;
 use crate::bucket::{Bucket, Condition, Guarantees, RevisionToken};
 use crate::error::Result;
-use crate::files::{self, Machine};
+use crate::error::StorageError;
+use crate::files::{self, LiveTemps, LocalTempDir, Machine};
 use crate::{BoxFuture, FileMetadata, System, TempDirHandle, WalkEntry};
+use alloc::sync::Arc;
+use core::future::Future;
+use core::pin::Pin;
 use core::result;
+use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 use futures_io::{AsyncRead, AsyncWrite};
 use std::env;
 use std::env::VarError;
-#[cfg(feature = "zip")]
-use std::io::Read;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 use std::thread;
 use std::time::SystemTime;
-use tempfile::TempDir;
-#[cfg(feature = "async")]
-use tokio::time;
+use tempfile::Builder;
 
 /// Production implementation of [`System`]: the machine's environment,
 /// processes and clock, with its files in a bucket, the local disk by default.
@@ -62,10 +65,11 @@ use tokio::time;
 /// - [`walk_dir`](System::walk_dir) respects `.gitignore` files over the disk.
 /// - [`set_env_var`](System::set_env_var) changes the environment of the whole
 ///   process.
-/// - [`sleep`](System::sleep) blocks the thread; `sleep_async` (feature
-///   `async`) needs a tokio runtime with its timer on.
-/// - [`create_temp_dir`](System::create_temp_dir) makes a real directory,
-///   handed back as a [`RealTempDir`].
+/// - [`sleep`](System::sleep) waits on a thread of its own, so it needs no
+///   runtime.
+/// - [`create_temp_dir`](System::create_temp_dir) makes a real directory on the
+///   machine's disk, whatever the bucket is; every path under it goes to the
+///   disk while the handle lives.
 /// - [`is_pid_alive`](System::is_pid_alive) (feature `process`) works on Unix
 ///   only.
 ///
@@ -87,15 +91,21 @@ use tokio::time;
 pub struct RealSystem<B = DiskBucket> {
     /// The bucket that holds the files.
     bucket: B,
+    /// The machine's disk, for the paths under a live temporary directory.
+    local: DiskBucket,
+    /// The roots of the temporary directories whose handles are alive.
+    temps: LiveTemps,
 }
 
 impl RealSystem<DiskBucket> {
     /// The machine with its files on the local disk.
     #[must_use]
     #[inline]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             bucket: DiskBucket::new(),
+            local: DiskBucket::new(),
+            temps: LiveTemps::default(),
         }
     }
 }
@@ -104,17 +114,32 @@ impl<B: Bucket> RealSystem<B> {
     /// The machine with its files in `bucket`.
     #[must_use]
     #[inline]
-    pub const fn with_bucket(bucket: B) -> Self {
-        Self { bucket }
+    pub fn with_bucket(bucket: B) -> Self {
+        Self {
+            bucket,
+            local: DiskBucket::new(),
+            temps: LiveTemps::default(),
+        }
     }
 }
 
 impl<B: Bucket> Machine for RealSystem<B> {
+    type Local = DiskBucket;
     type Store = B;
+
+    #[inline]
+    fn local(&self) -> &DiskBucket {
+        &self.local
+    }
 
     #[inline]
     fn store(&self) -> &B {
         &self.bucket
+    }
+
+    #[inline]
+    fn temps(&self) -> &LiveTemps {
+        &self.temps
     }
 
     #[inline]
@@ -161,10 +186,9 @@ impl<B: Bucket> System for RealSystem<B> {
     fn create_temp_dir<'system>(
         &'system self,
     ) -> BoxFuture<'system, Result<Box<dyn TempDirHandle + 'system>>> {
-        Box::pin(async {
-            let handle: Box<dyn TempDirHandle + 'system> = Box::new(RealTempDir {
-                inner: TempDir::new()?,
-            });
+        Box::pin(async move {
+            let path = Builder::new().tempdir()?.keep();
+            let handle: Box<dyn TempDirHandle + 'system> = Box::new(LocalTempDir::new(self, path));
             Ok(handle)
         })
     }
@@ -306,17 +330,10 @@ impl<B: Bucket> System for RealSystem<B> {
     }
 
     #[inline]
-    fn sleep(&self, duration: Duration) -> Result<()> {
-        thread::sleep(duration);
-        Ok(())
-    }
-
-    #[cfg(feature = "async")]
-    #[inline]
-    fn sleep_async(&self, duration: Duration) -> BoxFuture<'_, Result<()>> {
-        Box::pin(async move {
-            time::sleep(duration).await;
-            Ok(())
+    fn sleep(&self, duration: Duration) -> BoxFuture<'_, Result<()>> {
+        Box::pin(ThreadSleep {
+            duration,
+            shared: None,
         })
     }
 
@@ -341,29 +358,63 @@ impl<B: Bucket> System for RealSystem<B> {
     }
 }
 
-/// The temporary directory [`RealSystem::create_temp_dir`] makes, removed from
-/// disk when dropped.
-///
-/// It is reached through the [`TempDirHandle`] it is returned as, and cannot be
-/// built directly.
-pub struct RealTempDir {
-    /// The underlying `tempfile::TempDir` that manages cleanup on drop.
-    inner: TempDir,
+/// A wait that a thread of its own times and that wakes the task when done.
+struct ThreadSleep {
+    /// How long to wait.
+    duration: Duration,
+    /// The state the thread shares with the future, once the first poll started it.
+    shared: Option<Arc<Mutex<SleepState>>>,
 }
 
-impl TempDirHandle for RealTempDir {
-    #[inline]
-    fn path(&self) -> &Path {
-        self.inner.path()
-    }
+/// What the waiting thread and the future share.
+struct SleepState {
+    /// Whether the duration has passed.
+    done: bool,
+    /// The waker of the task that polled last.
+    waker: Option<Waker>,
+}
 
-    #[cfg(feature = "zip")]
-    #[inline]
-    fn to_zip_stream(&self) -> BoxFuture<'_, Result<Box<dyn Read + Send>>> {
-        Box::pin(async move {
-            let system = RealSystem::new();
-            system.to_zip_stream(self.inner.path()).await
-        })
+impl Future for ThreadSleep {
+    type Output = Result<()>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if let Some(shared) = self.shared.as_ref() {
+            let mut state = shared.lock().unwrap_or_else(PoisonError::into_inner);
+            let done = state.done;
+            if !done {
+                state.waker = Some(cx.waker().clone());
+            }
+            drop(state);
+            return if done {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            };
+        }
+        let shared = Arc::new(Mutex::new(SleepState {
+            done: false,
+            waker: Some(cx.waker().clone()),
+        }));
+        let thread_shared = Arc::clone(&shared);
+        let duration = self.duration;
+        let spawned = thread::Builder::new().spawn(move || {
+            thread::sleep(duration);
+            let waker = {
+                let mut state = thread_shared.lock().unwrap_or_else(PoisonError::into_inner);
+                state.done = true;
+                state.waker.take()
+            };
+            if let Some(waiting) = waker {
+                waiting.wake();
+            }
+        });
+        match spawned {
+            Ok(_handle) => {
+                self.shared = Some(shared);
+                Poll::Pending
+            }
+            Err(failure) => Poll::Ready(Err(StorageError::from(io::Error::other(failure)))),
+        }
     }
 }
 

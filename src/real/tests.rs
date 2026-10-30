@@ -6,18 +6,39 @@
 
 use super::RealSystem;
 use crate::System as _;
-use crate::bucket::Condition;
+use crate::bucket::{Bucket as _, Condition, Depth, MemoryBucket};
 use crate::error::ErrorKind;
+use crate::files::run_without_runtime;
 use crate::streams::{close, read_to_end, write_all};
-#[cfg(any(feature = "async", slow_tests))]
+#[cfg(slow_tests)]
+use alloc::sync::Arc;
+#[cfg(slow_tests)]
+use alloc::task::Wake;
+#[cfg(slow_tests)]
+use core::future::Future;
+#[cfg(slow_tests)]
+use core::pin::pin;
+#[cfg(slow_tests)]
+use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 use std::env::VarError;
+use std::fs;
 use std::path::Path;
+#[cfg(slow_tests)]
+use std::thread::{self, Thread};
 #[cfg(slow_tests)]
 use std::time::Instant as MachineInstant;
 use std::time::SystemTime;
-#[cfg(feature = "async")]
-use tokio::time::{Instant, timeout};
+
+#[cfg(slow_tests)]
+struct ParkedThread(Thread);
+
+#[cfg(slow_tests)]
+impl Wake for ParkedThread {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+}
 
 #[tokio::test(flavor = "current_thread")]
 async fn write_then_read_to_string_roundtrips() {
@@ -550,38 +571,169 @@ async fn walk_dir_follow_links_false_does_not_descend_symlinked_dir() {
     assert!(!names.iter().any(|name| name == "link/inside.txt"));
 }
 
-#[cfg(feature = "async")]
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn sleep_async_waits_exactly_the_duration_on_tokios_paused_clock() {
+#[test]
+fn a_sleep_polled_once_is_pending_without_waiting() {
     let system = RealSystem::new();
-    let start = Instant::now();
 
-    system.sleep_async(Duration::from_secs(2)).await.unwrap();
+    let outcome = run_without_runtime(system.sleep(Duration::from_secs(3600)));
 
-    assert_eq!(start.elapsed(), Duration::from_secs(2));
+    assert!(outcome.is_none());
 }
 
-#[cfg(feature = "async")]
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn sleep_async_holds_for_its_whole_duration() {
+#[cfg(slow_tests)]
+fn block_on_parking<F>(future: F) -> F::Output
+where
+    F: Future,
+{
+    let mut pinned = pin!(future);
+    let waker = Waker::from(Arc::new(ParkedThread(thread::current())));
+    let mut context = Context::from_waker(&waker);
+    loop {
+        if let Poll::Ready(output) = pinned.as_mut().poll(&mut context) {
+            return output;
+        }
+        thread::park();
+    }
+}
+
+#[cfg(slow_tests)]
+#[tokio::test(flavor = "current_thread")]
+async fn sleep_waits_at_least_the_duration_on_a_current_thread_runtime() {
     let system = RealSystem::new();
+    let start = MachineInstant::now();
 
-    let outcome = timeout(
-        Duration::from_secs(1),
-        system.sleep_async(Duration::from_secs(10)),
-    )
-    .await;
+    system.sleep(Duration::from_millis(50)).await.unwrap();
 
-    outcome.unwrap_err();
+    assert!(start.elapsed() >= Duration::from_millis(50));
 }
 
 #[cfg(slow_tests)]
 #[test]
-fn sleep_waits_at_least_the_duration() {
+fn sleep_waits_at_least_the_duration_on_an_executor_that_is_not_tokio() {
     let system = RealSystem::new();
     let start = MachineInstant::now();
 
-    system.sleep(Duration::from_millis(50)).unwrap();
+    block_on_parking(system.sleep(Duration::from_millis(50))).unwrap();
 
     assert!(start.elapsed() >= Duration::from_millis(50));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_temporary_directory_stays_on_the_machine() {
+    let bucket = MemoryBucket::default();
+    let system = RealSystem::with_bucket(bucket.clone());
+    let dir = system.create_temp_dir().await.unwrap();
+    let scratch = dir.path().join("note.txt");
+
+    system
+        .write(&scratch, b"scratch", Condition::None)
+        .await
+        .unwrap();
+
+    assert!(scratch.exists());
+    assert!(
+        bucket
+            .list(Path::new("/"), Depth::All)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    drop(dir);
+    assert!(!scratch.exists());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_path_outside_a_temporary_directory_goes_to_the_bucket() {
+    let bucket = MemoryBucket::default();
+    let system = RealSystem::with_bucket(bucket.clone());
+    let _dir = system.create_temp_dir().await.unwrap();
+
+    system
+        .write(Path::new("/kept.txt"), b"kept", Condition::None)
+        .await
+        .unwrap();
+
+    assert_eq!(bucket.get(Path::new("/kept.txt")).await.unwrap().0, b"kept");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn renaming_out_of_a_temporary_directory_moves_the_file_into_the_bucket() {
+    let bucket = MemoryBucket::default();
+    let system = RealSystem::with_bucket(bucket.clone());
+    let dir = system.create_temp_dir().await.unwrap();
+    let scratch = dir.path().join("note.txt");
+    system
+        .write(&scratch, b"scratch", Condition::None)
+        .await
+        .unwrap();
+
+    system
+        .rename(&scratch, Path::new("/moved.txt"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        bucket.get(Path::new("/moved.txt")).await.unwrap().0,
+        b"scratch"
+    );
+    assert!(!scratch.exists());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn renaming_a_folder_out_of_a_temporary_directory_moves_every_file() {
+    let bucket = MemoryBucket::default();
+    let system = RealSystem::with_bucket(bucket.clone());
+    let dir = system.create_temp_dir().await.unwrap();
+    let folder = dir.path().join("tree");
+    system.create_dir_all(&folder.join("inner")).await.unwrap();
+    system
+        .write(&folder.join("inner/a.txt"), b"a", Condition::None)
+        .await
+        .unwrap();
+
+    system.rename(&folder, Path::new("/tree")).await.unwrap();
+
+    assert_eq!(
+        bucket.get(Path::new("/tree/inner/a.txt")).await.unwrap().0,
+        b"a"
+    );
+    assert!(!folder.exists());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn copying_into_a_temporary_directory_leaves_the_source_in_the_bucket() {
+    let bucket = MemoryBucket::default();
+    let system = RealSystem::with_bucket(bucket.clone());
+    system
+        .write(Path::new("/source.txt"), b"source", Condition::None)
+        .await
+        .unwrap();
+    let dir = system.create_temp_dir().await.unwrap();
+    let copy = dir.path().join("copy.txt");
+
+    let copied = system.copy(Path::new("/source.txt"), &copy).await.unwrap();
+
+    assert_eq!(copied, 6);
+    assert_eq!(fs::read(&copy).unwrap(), b"source");
+    assert_eq!(
+        bucket.get(Path::new("/source.txt")).await.unwrap().0,
+        b"source"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dropping_a_handle_removes_its_directory_and_its_files() {
+    let system = RealSystem::new();
+    let dir = system.create_temp_dir().await.unwrap();
+    let root = dir.path().to_path_buf();
+    system.create_dir_all(&root.join("deep")).await.unwrap();
+    system
+        .write(&root.join("deep/a.txt"), b"a", Condition::None)
+        .await
+        .unwrap();
+
+    drop(dir);
+
+    assert!(!root.exists());
 }

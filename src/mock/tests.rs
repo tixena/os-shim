@@ -1,5 +1,5 @@
 use super::*;
-use crate::bucket::Condition;
+use crate::bucket::{Condition, Depth, MemoryBucket};
 use crate::error::ErrorKind;
 use crate::streams::{close, read_to_end, write_all};
 use std::path::Path;
@@ -410,31 +410,31 @@ fn epoch_plus(seconds: u64) -> SystemTime {
         .unwrap()
 }
 
-#[test]
-fn sleep_moves_the_clock_forward_by_the_duration() {
+#[tokio::test(flavor = "current_thread")]
+async fn sleep_moves_the_clock_forward_by_the_duration() {
     let system = MemorySystem::new().with_now(epoch_plus(100)).unwrap();
 
-    system.sleep(Duration::from_secs(2)).unwrap();
+    system.sleep(Duration::from_secs(2)).await.unwrap();
 
     assert_eq!(system.now(), epoch_plus(102));
 }
 
-#[test]
-fn sleeping_twice_adds_the_durations() {
+#[tokio::test(flavor = "current_thread")]
+async fn sleeping_twice_adds_the_durations() {
     let system = MemorySystem::new().with_now(epoch_plus(100)).unwrap();
 
-    system.sleep(Duration::from_secs(2)).unwrap();
-    system.sleep(Duration::from_secs(3)).unwrap();
+    system.sleep(Duration::from_secs(2)).await.unwrap();
+    system.sleep(Duration::from_secs(3)).await.unwrap();
 
     assert_eq!(system.now(), epoch_plus(105));
 }
 
-#[test]
-fn sleep_that_overflows_the_clock_is_invalid_input_and_leaves_it_unchanged() {
+#[tokio::test(flavor = "current_thread")]
+async fn sleep_that_overflows_the_clock_is_invalid_input_and_leaves_it_unchanged() {
     let near_end = epoch_plus(1_000);
     let system = MemorySystem::new().with_now(near_end).unwrap();
 
-    let err = system.sleep(Duration::MAX).unwrap_err();
+    let err = system.sleep(Duration::MAX).await.unwrap_err();
 
     assert_eq!(err.kind(), ErrorKind::InvalidInput);
     assert_eq!(system.now(), near_end);
@@ -448,7 +448,7 @@ async fn files_written_after_a_sleep_take_the_moved_clock_as_modified() {
         .with_now(epoch_plus(100))
         .unwrap();
 
-    system.sleep(Duration::from_secs(2)).unwrap();
+    system.sleep(Duration::from_secs(2)).await.unwrap();
     system
         .write(Path::new("/test/file.txt"), b"x", Condition::None)
         .await
@@ -458,39 +458,25 @@ async fn files_written_after_a_sleep_take_the_moved_clock_as_modified() {
     assert_eq!(meta.modified, Some(epoch_plus(102)));
 }
 
-#[cfg(feature = "async")]
 #[tokio::test(flavor = "current_thread")]
-async fn sleep_async_through_dyn_system_moves_the_clock_when_awaited() {
+async fn sleep_through_dyn_system_moves_the_clock_when_awaited() {
     let system = MemorySystem::new().with_now(epoch_plus(100)).unwrap();
     let shared: &dyn System = &system;
 
-    let pending = shared.sleep_async(Duration::from_secs(3));
+    let pending = shared.sleep(Duration::from_secs(3));
     assert_eq!(system.now(), epoch_plus(100));
     pending.await.unwrap();
 
     assert_eq!(system.now(), epoch_plus(103));
 }
 
-#[cfg(feature = "async")]
 #[tokio::test(flavor = "current_thread")]
-async fn sleep_async_dropped_unawaited_leaves_the_clock_where_it_was() {
+async fn sleep_dropped_unawaited_leaves_the_clock_where_it_was() {
     let system = MemorySystem::new().with_now(epoch_plus(100)).unwrap();
 
-    drop(system.sleep_async(Duration::from_secs(3)));
+    drop(system.sleep(Duration::from_secs(3)));
 
     assert_eq!(system.now(), epoch_plus(100));
-}
-
-#[cfg(feature = "async")]
-#[tokio::test(flavor = "current_thread")]
-async fn sleep_async_that_overflows_the_clock_is_invalid_input_and_leaves_it_unchanged() {
-    let near_end = epoch_plus(1_000);
-    let system = MemorySystem::new().with_now(near_end).unwrap();
-
-    let err = system.sleep_async(Duration::MAX).await.unwrap_err();
-
-    assert_eq!(err.kind(), ErrorKind::InvalidInput);
-    assert_eq!(system.now(), near_end);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -601,4 +587,68 @@ async fn a_temporary_folder_lives_in_the_bucket_and_goes_with_its_handle() {
         bucket.head(&path).await.unwrap_err().kind(),
         ErrorKind::NotFound
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_temporary_directory_of_a_system_over_a_bucket_stays_out_of_the_bucket() {
+    let bucket = MemoryBucket::default();
+    let system = MemorySystem::with_bucket(bucket.clone());
+    let dir = system.create_temp_dir().await.unwrap();
+    let scratch = dir.path().join("note.txt");
+
+    system
+        .write(&scratch, b"scratch", Condition::None)
+        .await
+        .unwrap();
+
+    assert!(system.exists(&scratch).await.unwrap());
+    bucket.head(&scratch).await.unwrap_err();
+    assert!(
+        bucket
+            .list(Path::new("/"), Depth::All)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    drop(dir);
+    assert!(!system.exists(&scratch).await.unwrap());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_temporary_directory_of_a_new_system_is_in_the_tree_of_its_other_files() {
+    let system = MemorySystem::new();
+    let dir = system.create_temp_dir().await.unwrap();
+    let scratch = dir.path().join("note.txt");
+
+    system
+        .write(&scratch, b"scratch", Condition::None)
+        .await
+        .unwrap();
+
+    assert!(system.is_dir(Path::new("/tmp")).await.unwrap());
+    assert_eq!(system.read_to_string(&scratch).await.unwrap(), "scratch");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn renaming_out_of_a_temporary_directory_moves_the_file_into_the_bucket() {
+    let bucket = MemoryBucket::default();
+    let system = MemorySystem::with_bucket(bucket.clone());
+    let dir = system.create_temp_dir().await.unwrap();
+    let scratch = dir.path().join("note.txt");
+    system
+        .write(&scratch, b"scratch", Condition::None)
+        .await
+        .unwrap();
+
+    system
+        .rename(&scratch, Path::new("/moved.txt"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        bucket.get(Path::new("/moved.txt")).await.unwrap().0,
+        b"scratch"
+    );
+    assert!(!system.exists(&scratch).await.unwrap());
 }
