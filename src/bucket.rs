@@ -108,6 +108,7 @@
 mod interface;
 
 mod defaults;
+pub mod disk;
 mod memory;
 mod paths;
 

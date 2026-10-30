@@ -13,7 +13,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
 use futures_io::{AsyncRead, AsyncWrite};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 macro_rules! forward_required {
@@ -67,7 +67,7 @@ macro_rules! forward_required {
 }
 
 /// What a scenario saw, line by line, or why it could not go on.
-type Observed = result::Result<Vec<String>, Box<dyn Error>>;
+pub(super) type Observed = result::Result<Vec<String>, Box<dyn Error>>;
 
 /// A bucket that implements only the required methods, so every other method is the trait's default.
 struct RequiredOnly(MemoryBucket);
@@ -129,7 +129,7 @@ impl Bucket for ChangesBeforeDelete {
 }
 
 /// Assert that a scenario saw exactly `expected`.
-fn assert_observed(observed: Observed, expected: &[&str]) {
+pub(super) fn assert_observed(observed: Observed, expected: &[&str]) {
     assert_eq!(
         observed.map_err(|error| error.to_string()),
         Ok(expected.iter().map(ToString::to_string).collect())
@@ -149,18 +149,23 @@ fn moving_clock() -> (Clock, Arc<AtomicU64>) {
 }
 
 /// What an outcome looks like with its tokens hidden: `ok`, or the kind of its error.
-fn shape<T>(outcome: &Result<T>) -> String {
+pub(super) fn shape<T>(outcome: &Result<T>) -> String {
     match outcome.as_ref() {
         Ok(_) => "ok".to_owned(),
         Err(error) => format!("{:?}", error.kind()),
     }
 }
 
-/// The paths of `entries`.
-fn paths(entries: &[WalkEntry]) -> Vec<String> {
+/// `path` with the folder `root` standing for `/`.
+fn rooted(path: &Path, root: &Path) -> PathBuf {
+    Path::new("/").join(path.strip_prefix(root).unwrap_or(path))
+}
+
+/// The paths of `entries`, each shown with `root` standing for `/`.
+fn paths(entries: &[WalkEntry], root: &Path) -> Vec<String> {
     entries
         .iter()
-        .map(|entry| entry.path.display().to_string())
+        .map(|entry| rooted(&entry.path, root).display().to_string())
         .collect()
 }
 
@@ -196,162 +201,174 @@ async fn close(writer: &mut (dyn AsyncWrite + Send + Unpin + '_)) -> io::Result<
 }
 
 /// Files: put, append, copy, rename and the heads and gets that show them.
-async fn file_operations<B>(bucket: &B) -> Observed
+pub(super) async fn file_operations<B>(bucket: &B, root: &Path) -> Observed
 where
     B: Bucket,
 {
-    let first = Path::new("/d/a.txt");
-    let second = Path::new("/d/b.txt");
+    let folder = root.join("d");
+    let first = folder.join("a.txt");
+    let second = folder.join("b.txt");
     let mut lines = Vec::new();
-    bucket.create_folder(Path::new("/d")).await?;
-    lines.push(shape(&bucket.put(first, b"one", &Condition::None).await));
-    lines.push(shape(&bucket.append(first, b"-two").await));
-    lines.push(shape(&bucket.append(second, b"new").await));
-    lines.push(format!("get {:?}", bucket.get(first).await?.0));
-    lines.push(format!("get {:?}", bucket.get(second).await?.0));
+    bucket.create_folder(&folder).await?;
+    lines.push(shape(&bucket.put(&first, b"one", &Condition::None).await));
+    lines.push(shape(&bucket.append(&first, b"-two").await));
+    lines.push(shape(&bucket.append(&second, b"new").await));
+    lines.push(format!("get {:?}", bucket.get(&first).await?.0));
+    lines.push(format!("get {:?}", bucket.get(&second).await?.0));
     lines.push(format!(
         "copy {:?}",
-        bucket.copy(first, Path::new("/d/c.txt")).await?
+        bucket.copy(&first, &folder.join("c.txt")).await?
     ));
-    lines.push(shape(&bucket.copy(Path::new("/d/none"), second).await));
-    lines.push(shape(&bucket.rename(first, Path::new("/d/e.txt")).await));
-    lines.push(shape(&bucket.rename(first, Path::new("/d/f.txt")).await));
-    lines.push(shape(&bucket.head(first).await));
+    lines.push(shape(&bucket.copy(&folder.join("none"), &second).await));
+    lines.push(shape(&bucket.rename(&first, &folder.join("e.txt")).await));
+    lines.push(shape(&bucket.rename(&first, &folder.join("f.txt")).await));
+    lines.push(shape(&bucket.head(&first).await));
     lines.push(format!(
         "renamed {:?}",
-        bucket.get(Path::new("/d/e.txt")).await?.0
+        bucket.get(&folder.join("e.txt")).await?.0
     ));
     Ok(lines)
 }
 
 /// Folders: a subtree renamed, walked with and without hidden entries, and removed.
-async fn folder_operations<B>(bucket: &B) -> Observed
+pub(super) async fn folder_operations<B>(bucket: &B, root: &Path) -> Observed
 where
     B: Bucket,
 {
+    let folder = root.join("d");
+    let moved = root.join("moved");
     let mut lines = Vec::new();
-    bucket.create_folder(Path::new("/d/sub/deeper")).await?;
+    bucket.create_folder(&folder.join("sub/deeper")).await?;
     bucket
-        .put(Path::new("/d/sub/deeper/x.txt"), b"x", &Condition::None)
+        .put(&folder.join("sub/deeper/x.txt"), b"x", &Condition::None)
         .await?;
     bucket
-        .put(Path::new("/d/.hidden"), b"h", &Condition::None)
+        .put(&folder.join(".hidden"), b"h", &Condition::None)
         .await?;
-    lines.push(shape(
-        &bucket.rename(Path::new("/d"), Path::new("/moved")).await,
-    ));
-    lines.push(format!(
-        "old {}",
-        shape(&bucket.head(Path::new("/d")).await)
-    ));
+    lines.push(shape(&bucket.rename(&folder, &moved).await));
+    lines.push(format!("old {}", shape(&bucket.head(&folder).await)));
     lines.push(format!(
         "moved {:?}",
-        bucket.get(Path::new("/moved/sub/deeper/x.txt")).await?.0
+        bucket.get(&moved.join("sub/deeper/x.txt")).await?.0
     ));
     for hidden in [true, false] {
-        let walked = bucket.walk(Path::new("/moved"), false, hidden).await?;
-        lines.push(format!("walk hidden={hidden} {:?}", paths(&walked)));
+        let walked = bucket.walk(&moved, false, hidden).await?;
+        lines.push(format!("walk hidden={hidden} {:?}", paths(&walked, root)));
     }
-    lines.push(format!(
-        "canonicalize {:?}",
-        bucket.canonicalize(Path::new("/a/./b/../c")).await?
-    ));
+    let resolved = bucket
+        .canonicalize(&moved.join("sub/./deeper/../deeper"))
+        .await?;
+    lines.push(format!("canonicalize {:?}", rooted(&resolved, root)));
     lines.push(shape(&bucket.canonicalize(Path::new("relative")).await));
-    lines.push(shape(&bucket.remove_folder(Path::new("/moved")).await));
-    lines.push(shape(&bucket.head(Path::new("/moved")).await));
+    lines.push(shape(&bucket.remove_folder(&moved).await));
+    lines.push(shape(&bucket.head(&moved).await));
     Ok(lines)
 }
 
-/// Streams: a reader, a writer closed, a second close, and an appender.
-async fn stream_operations<B>(bucket: &B) -> Observed
+/// Streams: a reader, a writer closed, a second create-only writer refused at open or close, and an appender.
+pub(super) async fn stream_operations<B>(bucket: &B, root: &Path) -> Observed
 where
     B: Bucket,
 {
-    let source = Path::new("/s.txt");
-    let target = Path::new("/streamed.txt");
+    let source = root.join("s.txt");
+    let target = root.join("streamed.txt");
     let mut lines = Vec::new();
-    bucket.put(source, b"abcdefghij", &Condition::None).await?;
-    let mut reader = bucket.read_stream(source).await?;
+    bucket.put(&source, b"abcdefghij", &Condition::None).await?;
+    let mut reader = bucket.read_stream(&source).await?;
     lines.push(format!("read {:?}", read_all(&mut *reader).await?));
     drop(reader);
-    let mut writer = bucket.write_stream(target, Condition::Absent).await?;
+    let mut writer = bucket.write_stream(&target, Condition::Absent).await?;
     write_all(&mut *writer, b"stream").await?;
     close(&mut *writer).await?;
     drop(writer);
-    lines.push(format!("streamed {:?}", bucket.get(target).await?.0));
-    let mut again = bucket.write_stream(target, Condition::Absent).await?;
-    write_all(&mut *again, b"late").await?;
-    let refused = close(&mut *again).await.map_err(StorageError::from);
-    lines.push(format!(
-        "second {:?}",
-        refused.err().map(|error| error.kind())
-    ));
-    drop(again);
-    let mut tail = bucket.append_stream(target).await?;
+    lines.push(format!("streamed {:?}", bucket.get(&target).await?.0));
+    let refused = match bucket.write_stream(&target, Condition::Absent).await {
+        Err(error) => Some(error.kind()),
+        Ok(mut again) => {
+            write_all(&mut *again, b"late").await?;
+            close(&mut *again)
+                .await
+                .map_err(StorageError::from)
+                .err()
+                .map(|error| error.kind())
+        }
+    };
+    lines.push(format!("second {refused:?}"));
+    let mut tail = bucket.append_stream(&target).await?;
     write_all(&mut *tail, b"+tail").await?;
     close(&mut *tail).await?;
     drop(tail);
-    lines.push(format!("appended {:?}", bucket.get(target).await?.0));
+    lines.push(format!("appended {:?}", bucket.get(&target).await?.0));
     Ok(lines)
 }
 
 /// Files, folders and streams, one after the other on the same bucket.
-async fn every_operation<B>(bucket: &B) -> Observed
+pub(super) async fn every_operation<B>(bucket: &B, root: &Path) -> Observed
 where
     B: Bucket,
 {
-    let mut lines = file_operations(bucket).await?;
-    lines.extend(folder_operations(bucket).await?);
-    lines.extend(stream_operations(bucket).await?);
+    let mut lines = file_operations(bucket, root).await?;
+    lines.extend(folder_operations(bucket, root).await?);
+    lines.extend(stream_operations(bucket, root).await?);
     Ok(lines)
 }
 
 /// Two callers race for a lock; the second is refused and the first bytes stay.
-async fn lock_taken_twice() -> Observed {
-    let bucket = MemoryBucket::default();
-    bucket.create_folder(Path::new("/jobs")).await?;
-    let lock = Path::new("/jobs/42.lock");
+pub(super) async fn lock_taken_twice<B>(bucket: &B, root: &Path) -> Observed
+where
+    B: Bucket,
+{
+    let jobs = root.join("jobs");
+    bucket.create_folder(&jobs).await?;
+    let lock = jobs.join("42.lock");
     let mut lines = vec![shape(
-        &bucket.put(lock, b"worker-a", &Condition::Absent).await,
+        &bucket.put(&lock, b"worker-a", &Condition::Absent).await,
     )];
     lines.push(shape(
-        &bucket.put(lock, b"worker-b", &Condition::Absent).await,
+        &bucket.put(&lock, b"worker-b", &Condition::Absent).await,
     ));
-    lines.push(format!("{:?}", bucket.get(lock).await?.0));
+    lines.push(format!("{:?}", bucket.get(&lock).await?.0));
     Ok(lines)
 }
 
 /// A release with a token from before an append is refused; the current token releases.
-async fn stale_release() -> Observed {
-    let bucket = MemoryBucket::default();
-    bucket.create_folder(Path::new("/jobs")).await?;
-    let lock = Path::new("/jobs/42.lock");
-    let ours = bucket.put(lock, b"worker-a", &Condition::Absent).await?;
-    bucket.append(lock, b" renewed").await?;
-    let mut lines = vec![shape(&bucket.delete(lock, &Condition::Matches(ours)).await)];
-    let (bytes, token) = bucket.get(lock).await?;
+pub(super) async fn stale_release<B>(bucket: &B, root: &Path) -> Observed
+where
+    B: Bucket,
+{
+    let jobs = root.join("jobs");
+    bucket.create_folder(&jobs).await?;
+    let lock = jobs.join("42.lock");
+    let ours = bucket.put(&lock, b"worker-a", &Condition::Absent).await?;
+    bucket.append(&lock, b" renewed").await?;
+    let mut lines = vec![shape(
+        &bucket.delete(&lock, &Condition::Matches(ours)).await,
+    )];
+    let (bytes, token) = bucket.get(&lock).await?;
     lines.push(format!("{bytes:?}"));
     lines.push(shape(
-        &bucket.delete(lock, &Condition::Matches(token)).await,
+        &bucket.delete(&lock, &Condition::Matches(token)).await,
     ));
-    lines.push(shape(&bucket.get(lock).await));
+    lines.push(shape(&bucket.get(&lock).await));
     Ok(lines)
 }
 
 /// Each condition on a path with nothing at it.
-async fn conditions_on_a_missing_file() -> Observed {
-    let bucket = MemoryBucket::default();
-    let path = Path::new("/none.md");
+pub(super) async fn conditions_on_a_missing_file<B>(bucket: &B, root: &Path) -> Observed
+where
+    B: Bucket,
+{
+    let path = root.join("none.md");
     let stale = RevisionToken::new("1");
     Ok(vec![
-        shape(&bucket.delete(path, &Condition::None).await),
-        shape(&bucket.delete(path, &Condition::Absent).await),
+        shape(&bucket.delete(&path, &Condition::None).await),
+        shape(&bucket.delete(&path, &Condition::Absent).await),
         shape(
             &bucket
-                .delete(path, &Condition::Matches(stale.clone()))
+                .delete(&path, &Condition::Matches(stale.clone()))
                 .await,
         ),
-        shape(&bucket.put(path, b"x", &Condition::Matches(stale)).await),
+        shape(&bucket.put(&path, b"x", &Condition::Matches(stale)).await),
     ])
 }
 
@@ -383,23 +400,26 @@ async fn tokens_never_repeat() -> Observed {
 }
 
 /// A put under a missing parent, a file, a folder and the root; folder operations on a file.
-async fn parent_rules() -> Observed {
-    let bucket = MemoryBucket::default();
-    bucket.create_folder(Path::new("/folder")).await?;
-    bucket
-        .put(Path::new("/file"), b"x", &Condition::None)
-        .await?;
+pub(super) async fn parent_rules<B>(bucket: &B, root: &Path) -> Observed
+where
+    B: Bucket,
+{
+    let folder = root.join("folder");
+    let file = root.join("file");
+    bucket.create_folder(&folder).await?;
+    bucket.put(&file, b"x", &Condition::None).await?;
     let mut lines = Vec::new();
-    for target in ["/missing/a", "/file/a", "/folder", "/"] {
-        lines.push(shape(
-            &bucket.put(Path::new(target), b"y", &Condition::None).await,
-        ));
+    for target in [
+        root.join("missing/a"),
+        file.join("a"),
+        folder.clone(),
+        root.to_path_buf(),
+    ] {
+        lines.push(shape(&bucket.put(&target, b"y", &Condition::None).await));
     }
-    lines.push(shape(&bucket.create_folder(Path::new("/file/sub")).await));
-    lines.push(shape(&bucket.remove_folder(Path::new("/file")).await));
-    lines.push(shape(
-        &bucket.copy(Path::new("/folder"), Path::new("/copy")).await,
-    ));
+    lines.push(shape(&bucket.create_folder(&file.join("sub")).await));
+    lines.push(shape(&bucket.remove_folder(&file).await));
+    lines.push(shape(&bucket.copy(&folder, &root.join("copy")).await));
     lines.push(shape(&bucket.get(Path::new("relative")).await));
     lines.push(shape(&bucket.get(Path::new("/../a")).await));
     Ok(lines)
@@ -425,47 +445,54 @@ async fn clock_stamps() -> Observed {
 }
 
 /// A subtree renamed under one lock.
-async fn folder_rename() -> Observed {
-    let bucket = MemoryBucket::default();
-    bucket.create_folder(Path::new("/a/b")).await?;
+pub(super) async fn folder_rename<B>(bucket: &B, root: &Path) -> Observed
+where
+    B: Bucket,
+{
+    let source = root.join("a");
+    let target = root.join("c");
+    bucket.create_folder(&source.join("b")).await?;
     bucket
-        .put(Path::new("/a/b/x"), b"1", &Condition::None)
+        .put(&source.join("b/x"), b"1", &Condition::None)
         .await?;
     bucket
-        .put(Path::new("/a/y"), b"2", &Condition::None)
+        .put(&source.join("y"), b"2", &Condition::None)
         .await?;
-    bucket.rename(Path::new("/a"), Path::new("/c")).await?;
+    bucket.rename(&source, &target).await?;
     Ok(vec![
-        format!("{:?}", bucket.get(Path::new("/c/b/x")).await?.0),
-        format!("{:?}", bucket.get(Path::new("/c/y")).await?.0),
-        shape(&bucket.head(Path::new("/a")).await),
-        format!("{}", bucket.head(Path::new("/c/b")).await?.is_dir),
+        format!("{:?}", bucket.get(&target.join("b/x")).await?.0),
+        format!("{:?}", bucket.get(&target.join("y")).await?.0),
+        shape(&bucket.head(&source).await),
+        format!("{}", bucket.head(&target.join("b")).await?.is_dir),
     ])
 }
 
 /// A listing at each depth, of a file, and of a folder that is not there.
-async fn listings() -> Observed {
-    let bucket = MemoryBucket::default();
-    bucket.create_folder(Path::new("/a/b")).await?;
+pub(super) async fn listings<B>(bucket: &B, root: &Path) -> Observed
+where
+    B: Bucket,
+{
+    let folder = root.join("a");
+    bucket.create_folder(&folder.join("b")).await?;
     bucket
-        .put(Path::new("/a/b/x"), b"1", &Condition::None)
+        .put(&folder.join("b/x"), b"1", &Condition::None)
         .await?;
     bucket
-        .put(Path::new("/a/y"), b"2", &Condition::None)
+        .put(&folder.join("y"), b"2", &Condition::None)
         .await?;
     Ok(vec![
         format!(
             "{:?}",
-            paths(&bucket.list(Path::new("/a"), Depth::Children).await?)
+            paths(&bucket.list(&folder, Depth::Children).await?, root)
         ),
         format!(
             "{:?}",
-            paths(&bucket.list(Path::new("/a"), Depth::All).await?)
+            paths(&bucket.list(&folder, Depth::All).await?, root)
         ),
-        shape(&bucket.list(Path::new("/a/y"), Depth::All).await),
+        shape(&bucket.list(&folder.join("y"), Depth::All).await),
         format!(
             "{:?}",
-            paths(&bucket.list(Path::new("/none"), Depth::All).await?)
+            paths(&bucket.list(&root.join("none"), Depth::All).await?, root)
         ),
     ])
 }
@@ -481,21 +508,29 @@ async fn clones() -> Observed {
     ])
 }
 
-/// A writer dropped without `close`, on the memory bucket and on one with the default writer.
-async fn dropped_writers() -> Observed {
-    let path = Path::new("/a.md");
-    let native = MemoryBucket::default();
-    let mut writer = native.write_stream(path, Condition::Absent).await?;
+/// A writer dropped without `close` keeps the bytes it was given when the bucket promises it.
+pub(super) async fn dropped_writers<B>(bucket: &B, root: &Path) -> Observed
+where
+    B: Bucket,
+{
+    let path = root.join("a.md");
+    let mut writer = bucket.write_stream(&path, Condition::Absent).await?;
     write_all(&mut *writer, b"kept").await?;
     drop(writer);
+    Ok(vec![format!("native {:?}", bucket.get(&path).await?.0)])
+}
+
+/// A writer dropped without `close` on a bucket with the default writer.
+async fn dropped_default_writer() -> Observed {
+    let path = Path::new("/a.md");
     let defaults = RequiredOnly(MemoryBucket::default());
     let mut lost = defaults.write_stream(path, Condition::Absent).await?;
     write_all(&mut *lost, b"lost").await?;
     drop(lost);
-    Ok(vec![
-        format!("native {:?}", native.get(path).await?.0),
-        format!("default {}", shape(&defaults.get(path).await)),
-    ])
+    Ok(vec![format!(
+        "default {}",
+        shape(&defaults.get(path).await)
+    )])
 }
 
 /// A rename whose source changed between the read and the delete: the copy is removed again.
@@ -538,7 +573,7 @@ async fn default_rename() -> Observed {
 #[tokio::test(flavor = "current_thread")]
 async fn a_lock_taken_twice_is_already_exists_and_keeps_the_first_bytes() {
     assert_observed(
-        lock_taken_twice().await,
+        lock_taken_twice(&MemoryBucket::default(), Path::new("/")).await,
         &[
             "ok",
             "AlreadyExists",
@@ -550,7 +585,7 @@ async fn a_lock_taken_twice_is_already_exists_and_keeps_the_first_bytes() {
 #[tokio::test(flavor = "current_thread")]
 async fn a_stale_release_is_precondition_failed_and_the_file_stays() {
     assert_observed(
-        stale_release().await,
+        stale_release(&MemoryBucket::default(), Path::new("/")).await,
         &[
             "PreconditionFailed",
             "[119, 111, 114, 107, 101, 114, 45, 97, 32, 114, 101, 110, 101, 119, 101, 100]",
@@ -563,7 +598,7 @@ async fn a_stale_release_is_precondition_failed_and_the_file_stays() {
 #[tokio::test(flavor = "current_thread")]
 async fn conditions_on_a_missing_file_are_checked() {
     assert_observed(
-        conditions_on_a_missing_file().await,
+        conditions_on_a_missing_file(&MemoryBucket::default(), Path::new("/")).await,
         &["ok", "ok", "PreconditionFailed", "PreconditionFailed"],
     );
 }
@@ -584,7 +619,7 @@ async fn a_token_is_never_handed_out_twice() {
 #[tokio::test(flavor = "current_thread")]
 async fn the_parent_rules() {
     assert_observed(
-        parent_rules().await,
+        parent_rules(&MemoryBucket::default(), Path::new("/")).await,
         &[
             "NotFound",
             "NotADirectory",
@@ -606,13 +641,16 @@ async fn every_write_takes_its_time_from_the_clock() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn renaming_a_folder_moves_its_subtree() {
-    assert_observed(folder_rename().await, &["[49]", "[50]", "NotFound", "true"]);
+    assert_observed(
+        folder_rename(&MemoryBucket::default(), Path::new("/")).await,
+        &["[49]", "[50]", "NotFound", "true"],
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_listing_reaches_the_depth_it_is_given() {
     assert_observed(
-        listings().await,
+        listings(&MemoryBucket::default(), Path::new("/")).await,
         &[
             "[\"/a/b\", \"/a/y\"]",
             "[\"/a/b\", \"/a/b/x\", \"/a/y\"]",
@@ -632,8 +670,15 @@ async fn clones_share_the_files() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_write_stream_dropped_without_close_stores_its_bytes_only_when_native() {
+    let native = dropped_writers(&MemoryBucket::default(), Path::new("/")).await;
+    let default = dropped_default_writer().await;
     assert_observed(
-        dropped_writers().await,
+        native.and_then(|mut lines| {
+            default.map(|more| {
+                lines.extend(more);
+                lines
+            })
+        }),
         &["native [107, 101, 112, 116]", "default NotFound"],
     );
 }
@@ -662,10 +707,10 @@ async fn a_failed_delete_in_the_default_rename_removes_the_copy() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn the_defaults_agree_with_the_memory_bucket() {
-    let native = every_operation(&MemoryBucket::default())
+    let native = every_operation(&MemoryBucket::default(), Path::new("/"))
         .await
         .map_err(|error| error.to_string());
-    let defaults = every_operation(&WithFolders(MemoryBucket::default()))
+    let defaults = every_operation(&WithFolders(MemoryBucket::default()), Path::new("/"))
         .await
         .map_err(|error| error.to_string());
     assert_eq!(defaults, native);

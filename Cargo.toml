@@ -17,6 +17,9 @@ tempfile = "3.7.0"
 ignore = "0.4.17"
 same-file = "1.0.6"
 
+# Revision tokens of the disk bucket
+sha2 = "0.11.1"
+
 # Mock implementation logging
 tracing = "0.1.44"
 
