@@ -78,7 +78,7 @@ impl Bucket for DiskBucket {
     #[inline]
     fn append_stream<'bucket>(
         &'bucket self,
-        path: &'bucket Path,
+        path: &Path,
     ) -> impl Future<Output = Result<Box<dyn AsyncWrite + Send + Unpin + 'bucket>>> + Send {
         on_first_poll(move || {
             let file = OpenOptions::new().create(true).append(true).open(path)?;
@@ -207,7 +207,7 @@ impl Bucket for DiskBucket {
     #[inline]
     fn read_stream<'bucket>(
         &'bucket self,
-        path: &'bucket Path,
+        path: &Path,
     ) -> impl Future<Output = Result<Box<dyn AsyncRead + Send + Unpin + 'bucket>>> + Send {
         on_first_poll(move || {
             let reader: Box<dyn AsyncRead + Send + Unpin + 'bucket> =
@@ -244,7 +244,7 @@ impl Bucket for DiskBucket {
     #[inline]
     fn write_stream<'bucket>(
         &'bucket self,
-        path: &'bucket Path,
+        path: &Path,
         condition: Condition,
     ) -> impl Future<Output = Result<Box<dyn AsyncWrite + Send + Unpin + 'bucket>>> + Send {
         on_first_poll(move || {

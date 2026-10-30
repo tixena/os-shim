@@ -1276,7 +1276,7 @@ impl Bucket for MinioBucket {
     #[inline]
     fn append_stream<'bucket>(
         &'bucket self,
-        path: &'bucket Path,
+        path: &Path,
     ) -> impl Future<Output = Result<Box<dyn AsyncWrite + Send + Unpin + 'bucket>>> + Send {
         streams::append_stream(&self.0, path)
     }
@@ -1337,7 +1337,7 @@ impl Bucket for MinioBucket {
     #[inline]
     fn read_stream<'bucket>(
         &'bucket self,
-        path: &'bucket Path,
+        path: &Path,
     ) -> impl Future<Output = Result<Box<dyn AsyncRead + Send + Unpin + 'bucket>>> + Send {
         streams::read_stream(&self.0, path)
     }
@@ -1355,7 +1355,7 @@ impl Bucket for MinioBucket {
     #[inline]
     fn write_stream<'bucket>(
         &'bucket self,
-        path: &'bucket Path,
+        path: &Path,
         condition: Condition,
     ) -> impl Future<Output = Result<Box<dyn AsyncWrite + Send + Unpin + 'bucket>>> + Send {
         streams::write_stream(&self.0, path, condition)
@@ -1542,7 +1542,7 @@ impl Bucket for S3Bucket {
     #[inline]
     fn append_stream<'bucket>(
         &'bucket self,
-        path: &'bucket Path,
+        path: &Path,
     ) -> impl Future<Output = Result<Box<dyn AsyncWrite + Send + Unpin + 'bucket>>> + Send {
         streams::append_stream(&self.0, path)
     }
@@ -1603,7 +1603,7 @@ impl Bucket for S3Bucket {
     #[inline]
     fn read_stream<'bucket>(
         &'bucket self,
-        path: &'bucket Path,
+        path: &Path,
     ) -> impl Future<Output = Result<Box<dyn AsyncRead + Send + Unpin + 'bucket>>> + Send {
         streams::read_stream(&self.0, path)
     }
@@ -1621,7 +1621,7 @@ impl Bucket for S3Bucket {
     #[inline]
     fn write_stream<'bucket>(
         &'bucket self,
-        path: &'bucket Path,
+        path: &Path,
         condition: Condition,
     ) -> impl Future<Output = Result<Box<dyn AsyncWrite + Send + Unpin + 'bucket>>> + Send {
         streams::write_stream(&self.0, path, condition)

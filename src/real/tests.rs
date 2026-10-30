@@ -21,9 +21,10 @@ use core::pin::pin;
 #[cfg(slow_tests)]
 use core::task::{Context, Poll, Waker};
 use core::time::Duration;
+use std::env;
 use std::env::VarError;
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 #[cfg(slow_tests)]
 use std::thread::{self, Thread};
 #[cfg(slow_tests)]
@@ -616,6 +617,33 @@ fn sleep_waits_at_least_the_duration_on_an_executor_that_is_not_tokio() {
     block_on_parking(system.sleep(Duration::from_millis(50))).unwrap();
 
     assert!(start.elapsed() >= Duration::from_millis(50));
+}
+
+fn relative_to_the_working_dir(target: &Path) -> PathBuf {
+    let working = env::current_dir().unwrap();
+    let climb = working
+        .components()
+        .filter(|part| matches!(part, Component::Normal(_)))
+        .map(|_| Component::ParentDir);
+    let below = target
+        .components()
+        .filter(|part| matches!(part, Component::Normal(_)));
+    climb.chain(below).collect()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_writer_on_a_relative_path_dropped_without_close_keeps_its_bytes() {
+    let system = RealSystem::new();
+    let dir = system.create_temp_dir().await.unwrap();
+    let absolute = dir.path().join("out.bin");
+    let relative = relative_to_the_working_dir(&absolute);
+    assert!(relative.is_relative());
+
+    let mut writer = system.create(&relative).await.unwrap();
+    write_all(&mut *writer, b"kept").await.unwrap();
+    drop(writer);
+
+    assert_eq!(fs::read(&absolute).unwrap(), b"kept");
 }
 
 #[tokio::test(flavor = "current_thread")]
