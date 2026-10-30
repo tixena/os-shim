@@ -23,7 +23,10 @@ const PART_BYTES: u64 = 8 * 1024 * 1024;
 const PART_LEN: usize = 8 * 1024 * 1024;
 
 /// The smallest object S3 accepts as a copied part that is not the last.
-const COPY_MIN_BYTES: u64 = 5 * 1024 * 1024;
+pub(super) const COPY_MIN_BYTES: u64 = 5 * 1024 * 1024;
+
+/// The largest part S3 accepts, and so the largest range one `UploadPartCopy` copies.
+pub(super) const COPY_MAX_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
 /// A request in flight.
 type Flight<'bucket, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'bucket>>;
@@ -314,19 +317,50 @@ async fn append_writer<'bucket>(
         return Ok(MultipartWriter::new(bucket, key, condition, buffer, None));
     }
     let upload_id = create_upload(bucket, &key).await?;
-    match copy_part(bucket, &key, &upload_id, &tag).await {
-        Ok(part) => Ok(MultipartWriter::new(
+    match copy_parts(bucket, &key, &upload_id, &tag, current.len).await {
+        Ok(parts) => Ok(MultipartWriter::new(
             bucket,
             key,
             condition,
             Vec::new(),
-            Some((upload_id, vec![part])),
+            Some((upload_id, parts)),
         )),
         Err(error) => {
             abort(bucket, &key, &upload_id).await;
             Err(error)
         }
     }
+}
+
+/// The byte ranges, both ends included, that copy an object of `length` bytes in the fewest parts:
+/// each at most `COPY_MAX_BYTES`, and each at least `COPY_MIN_BYTES` when `length` is.
+pub(super) fn copy_ranges(length: u64) -> Vec<(u64, u64)> {
+    let count = length.div_ceil(COPY_MAX_BYTES).max(1);
+    let size = length.div_ceil(count);
+    (0..count)
+        .map(|index| {
+            let first = index.saturating_mul(size);
+            (
+                first,
+                first.saturating_add(size).min(length).saturating_sub(1),
+            )
+        })
+        .collect()
+}
+
+/// `UploadPartCopy` of the object at `key`, a range per part from part 1, while it has the tag `tag`.
+async fn copy_parts(
+    bucket: &SdkBucket,
+    key: &str,
+    upload_id: &str,
+    tag: &RevisionToken,
+    length: u64,
+) -> Result<Vec<CompletedPart>> {
+    let mut parts = Vec::new();
+    for (number, range) in (1_i32..).zip(copy_ranges(length)) {
+        parts.push(copy_part(bucket, key, upload_id, tag, number, range).await?);
+    }
+    Ok(parts)
 }
 
 /// `CompleteMultipartUpload` under `condition`.
@@ -361,12 +395,15 @@ async fn complete(
         .map_err(|error| for_condition(error, condition))
 }
 
-/// `UploadPartCopy` of the whole object at `key` as part 1, if it still has the tag `tag`.
+/// `UploadPartCopy` of the bytes `first` to `last` of the object at `key` as part `number`, if it
+/// still has the tag `tag`.
 async fn copy_part(
     bucket: &SdkBucket,
     key: &str,
     upload_id: &str,
     tag: &RevisionToken,
+    number: i32,
+    (first, last): (u64, u64),
 ) -> Result<CompletedPart> {
     let copied = bucket
         .client
@@ -374,9 +411,10 @@ async fn copy_part(
         .bucket(&bucket.bucket)
         .key(key)
         .upload_id(upload_id)
-        .part_number(1)
+        .part_number(number)
         .copy_source(super::percent_encode(&format!("{}/{key}", bucket.bucket)))
         .copy_source_if_match(tag.as_str())
+        .copy_source_range(format!("bytes={first}-{last}"))
         .send()
         .await
         .map_err(classify)?;
@@ -384,7 +422,10 @@ async fn copy_part(
         .copy_part_result()
         .and_then(|result| result.e_tag())
         .ok_or_else(missing_etag)?;
-    Ok(CompletedPart::builder().part_number(1).e_tag(etag).build())
+    Ok(CompletedPart::builder()
+        .part_number(number)
+        .e_tag(etag)
+        .build())
 }
 
 /// `CreateMultipartUpload` for `key`, giving the upload's id.
