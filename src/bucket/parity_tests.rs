@@ -7,8 +7,12 @@ use super::{BlockingBucket, Bucket, Condition, Depth, MemoryBucket, RevisionToke
 use super::{MinioBucket, MinioConfig};
 #[cfg(s3_tests)]
 use super::{S3Bucket, S3Config};
-use crate::error::{ErrorKind, Result};
+#[cfg(minio_tests)]
+use crate::error::ErrorKind;
+use crate::error::Result;
 use crate::{FileMetadata, WalkEntry};
+#[cfg(minio_tests)]
+use aws_sdk_s3::primitives::ByteStream;
 #[cfg(s3_tests)]
 use aws_sdk_s3::types::BucketLocationConstraint;
 use aws_sdk_s3::{
@@ -123,6 +127,34 @@ fn delete_line(answer: &Result<()>) -> String {
     shape(answer, |&()| "deleted".to_owned())
 }
 
+/// The line for a head's answer without the modification time, which a folder has only on a server.
+fn kind_line(answer: &Result<FileMetadata>) -> String {
+    shape(answer, |head| {
+        format!(
+            "file {} dir {} size {} token {}",
+            head.is_file,
+            head.is_dir,
+            head.len,
+            head.revision.is_some()
+        )
+    })
+}
+
+/// The line for the answer of an operation that gives nothing back.
+fn done_line(answer: &Result<()>) -> String {
+    shape(answer, |&()| "done".to_owned())
+}
+
+/// The line for a copy's answer.
+fn copy_line(answer: &Result<u64>) -> String {
+    shape(answer, |length| format!("copied {length} bytes"))
+}
+
+/// The path of `name` in the folder `base`.
+fn at(base: &str, name: &str) -> PathBuf {
+    PathBuf::from(format!("{base}/{name}"))
+}
+
 /// The line for a listing's answer: the paths below `base`, sorted, folders ending in `/`.
 fn list_line(answer: &Result<Vec<WalkEntry>>, base: &str) -> String {
     shape(answer, |entries| {
@@ -148,19 +180,12 @@ fn assert_agree(name: &str, memory_transcript: &[String], server_transcript: &[S
     assert_eq!(memory_transcript, server_transcript);
 }
 
-/// Create the folder where the backend has folders, and do nothing where it has none.
+/// Create the folder.
 fn ensure_folder<B>(bucket: &BlockingBucket<B>, folder: &str)
 where
     B: Bucket,
 {
-    let created = bucket.create_folder(Path::new(folder));
-    if created
-        .as_ref()
-        .is_err_and(|error| error.kind() == ErrorKind::Unsupported)
-    {
-        return;
-    }
-    created.unwrap();
+    bucket.create_folder(Path::new(folder)).unwrap();
 }
 
 /// A put, a get and the token the put returned.
@@ -373,6 +398,170 @@ where
     )]
 }
 
+/// Folders made with their parents, headed, listed and removed.
+fn folders<B>(bucket: &BlockingBucket<B>, base: &str) -> Vec<String>
+where
+    B: Bucket,
+{
+    let nested = at(base, "x/y");
+    let file = at(base, "x/y/f.md");
+    let mut transcript = vec![done_line(&bucket.create_folder(&nested))];
+    transcript.push(kind_line(&bucket.head(&at(base, "x"))));
+    transcript.push(kind_line(&bucket.head(&nested)));
+    transcript.push(put_line(&bucket.put(&file, b"f", &Condition::Absent)));
+    transcript.push(list_line(&bucket.list(Path::new(base), Depth::All), base));
+    transcript.push(list_line(
+        &bucket.list(&at(base, "x"), Depth::Children),
+        &format!("{base}/x"),
+    ));
+    transcript.push(done_line(&bucket.remove_folder(&at(base, "x"))));
+    transcript.push(kind_line(&bucket.head(&at(base, "x"))));
+    transcript.push(done_line(&bucket.remove_folder(&at(base, "x"))));
+    transcript.push(done_line(&bucket.remove_folder(&file)));
+    drop(bucket.remove_folder(Path::new(base)));
+    transcript
+}
+
+/// A file where a folder is wanted, and a folder where a file is wanted.
+fn file_and_folder_conflict<B>(bucket: &BlockingBucket<B>, base: &str) -> Vec<String>
+where
+    B: Bucket,
+{
+    ensure_folder(bucket, base);
+    let file = at(base, "a");
+    let mut transcript = vec![put_line(&bucket.put(&file, b"file", &Condition::None))];
+    transcript.push(put_line(&bucket.put(
+        &at(base, "a/b"),
+        b"under",
+        &Condition::None,
+    )));
+    transcript.push(done_line(&bucket.create_folder(&at(base, "a/b"))));
+    transcript.push(done_line(&bucket.create_folder(&file)));
+    transcript.push(list_line(&bucket.list(&file, Depth::Children), base));
+    transcript.push(list_line(&bucket.list(&file, Depth::All), base));
+    transcript.push(done_line(&bucket.remove_folder(&file)));
+    transcript.push(kind_line(&bucket.head(&file)));
+    ensure_folder(bucket, &format!("{base}/c"));
+    transcript.push(put_line(&bucket.put(
+        &at(base, "c"),
+        b"file",
+        &Condition::None,
+    )));
+    transcript.push(kind_line(&bucket.head(&at(base, "c"))));
+    transcript.push(list_line(
+        &bucket.list(Path::new(base), Depth::Children),
+        base,
+    ));
+    drop(bucket.remove_folder(Path::new(base)));
+    transcript
+}
+
+/// Copies of a file, of a missing file, of a folder, and into a missing folder and over a folder.
+fn copies<B>(bucket: &BlockingBucket<B>, base: &str) -> Vec<String>
+where
+    B: Bucket,
+{
+    ensure_folder(bucket, &format!("{base}/dir"));
+    let source = at(base, "source.md");
+    let mut transcript = vec![put_line(&bucket.put(&source, b"hello", &Condition::None))];
+    let copied = bucket.copy(&source, &at(base, "copy.md"));
+    transcript.push(copy_line(&copied));
+    transcript.push(get_line(&bucket.get(&at(base, "copy.md"))));
+    transcript.push(get_line(&bucket.get(&source)));
+    transcript.push(copy_line(
+        &bucket.copy(&at(base, "nothing.md"), &at(base, "to.md")),
+    ));
+    transcript.push(copy_line(&bucket.copy(&source, &at(base, "missing/to.md"))));
+    transcript.push(copy_line(&bucket.copy(&source, &at(base, "dir"))));
+    transcript.push(copy_line(
+        &bucket.copy(&at(base, "dir"), &at(base, "to.md")),
+    ));
+    drop(bucket.remove_folder(Path::new(base)));
+    transcript
+}
+
+/// Renames of a file: over nothing, over a file, of a missing file, into a missing folder, over a folder.
+fn file_renames<B>(bucket: &BlockingBucket<B>, base: &str) -> Vec<String>
+where
+    B: Bucket,
+{
+    ensure_folder(bucket, &format!("{base}/dir"));
+    let first = at(base, "first.md");
+    let second = at(base, "second.md");
+    let mut transcript = vec![put_line(&bucket.put(&first, b"one", &Condition::None))];
+    transcript.push(done_line(&bucket.rename(&first, &second)));
+    transcript.push(get_line(&bucket.get(&first)));
+    transcript.push(get_line(&bucket.get(&second)));
+    transcript.push(put_line(&bucket.put(&first, b"two", &Condition::None)));
+    transcript.push(done_line(&bucket.rename(&first, &second)));
+    transcript.push(get_line(&bucket.get(&second)));
+    transcript.push(done_line(&bucket.rename(&first, &second)));
+    transcript.push(put_line(&bucket.put(&first, b"three", &Condition::None)));
+    transcript.push(done_line(
+        &bucket.rename(&first, &at(base, "missing/to.md")),
+    ));
+    transcript.push(done_line(&bucket.rename(&first, &at(base, "dir"))));
+    transcript.push(get_line(&bucket.get(&first)));
+    drop(bucket.remove_folder(Path::new(base)));
+    transcript
+}
+
+/// A rename of a folder with files, a subfolder and an empty folder in it.
+fn folder_rename<B>(bucket: &BlockingBucket<B>, base: &str) -> Vec<String>
+where
+    B: Bucket,
+{
+    ensure_folder(bucket, &format!("{base}/s/inner/empty"));
+    for name in ["s/one.md", "s/two.md", "s/inner/three.md"] {
+        bucket
+            .put(&at(base, name), name.as_bytes(), &Condition::None)
+            .unwrap();
+    }
+    let mut transcript = vec![done_line(&bucket.rename(&at(base, "s"), &at(base, "t")))];
+    transcript.push(kind_line(&bucket.head(&at(base, "s"))));
+    transcript.push(kind_line(&bucket.head(&at(base, "t"))));
+    transcript.push(list_line(&bucket.list(Path::new(base), Depth::All), base));
+    transcript.push(get_line(&bucket.get(&at(base, "t/inner/three.md"))));
+    transcript.push(done_line(
+        &bucket.rename(&at(base, "nothing"), &at(base, "u")),
+    ));
+    transcript.push(done_line(
+        &bucket.rename(&at(base, "t"), &at(base, "t/inside")),
+    ));
+    drop(bucket.remove_folder(Path::new(base)));
+    transcript
+}
+
+/// Puts and appends whose parent folder is missing, is a file, or exists.
+fn parent_check<B>(bucket: &BlockingBucket<B>, base: &str) -> Vec<String>
+where
+    B: Bucket,
+{
+    ensure_folder(bucket, base);
+    let mut transcript = vec![put_line(&bucket.put(
+        &at(base, "nothing/f.md"),
+        b"x",
+        &Condition::None,
+    ))];
+    transcript.push(put_line(&bucket.append(&at(base, "nothing/f.md"), b"x")));
+    transcript.push(put_line(&bucket.put(
+        &at(base, "plain"),
+        b"x",
+        &Condition::None,
+    )));
+    transcript.push(put_line(&bucket.put(
+        &at(base, "plain/f.md"),
+        b"x",
+        &Condition::None,
+    )));
+    transcript.push(put_line(&bucket.append(&at(base, "plain/f.md"), b"x")));
+    transcript.push(put_line(&bucket.append(&at(base, "log.md"), b"one")));
+    transcript.push(put_line(&bucket.append(&at(base, "log.md"), b" two")));
+    transcript.push(get_line(&bucket.get(&at(base, "log.md"))));
+    drop(bucket.remove_folder(Path::new(base)));
+    transcript
+}
+
 /// Relative paths and `..` above the root are refused before any request.
 fn refused_paths<B>(bucket: &BlockingBucket<B>) -> Vec<String>
 where
@@ -499,6 +688,66 @@ fn children_listing_agrees_with_the_server() {
 
 #[cfg(minio_tests)]
 #[test]
+fn folders_agrees_with_the_server() {
+    assert_agree(
+        "folders",
+        &folders(&memory(), "/a"),
+        &folders(&server(), "/folders"),
+    );
+}
+
+#[cfg(minio_tests)]
+#[test]
+fn file_and_folder_conflict_agrees_with_the_server() {
+    assert_agree(
+        "file and folder conflict",
+        &file_and_folder_conflict(&memory(), "/a"),
+        &file_and_folder_conflict(&server(), "/file-and-folder-conflict"),
+    );
+}
+
+#[cfg(minio_tests)]
+#[test]
+fn copies_agrees_with_the_server() {
+    assert_agree(
+        "copies",
+        &copies(&memory(), "/a"),
+        &copies(&server(), "/copies"),
+    );
+}
+
+#[cfg(minio_tests)]
+#[test]
+fn file_renames_agrees_with_the_server() {
+    assert_agree(
+        "file renames",
+        &file_renames(&memory(), "/a"),
+        &file_renames(&server(), "/file-renames"),
+    );
+}
+
+#[cfg(minio_tests)]
+#[test]
+fn folder_rename_agrees_with_the_server() {
+    assert_agree(
+        "folder rename",
+        &folder_rename(&memory(), "/a"),
+        &folder_rename(&server(), "/folder-rename"),
+    );
+}
+
+#[cfg(minio_tests)]
+#[test]
+fn parent_check_agrees_with_the_server() {
+    assert_agree(
+        "parent check",
+        &parent_check(&memory(), "/a"),
+        &parent_check(&server(), "/parent-check"),
+    );
+}
+
+#[cfg(minio_tests)]
+#[test]
 fn refused_paths_agree_with_the_server() {
     assert_agree(
         "refused paths",
@@ -514,6 +763,7 @@ fn observe_a_raw_delete_with_a_wrong_if_match() {
     let bucket = server();
     let key = "observe-raw-delete/note.md";
     let path = Path::new("/observe-raw-delete/note.md");
+    ensure_folder(&bucket, "/observe-raw-delete");
     bucket.put(path, b"kept", &Condition::None).unwrap();
     let answer = runtime().block_on(
         client(&config)
@@ -532,6 +782,7 @@ fn observe_a_raw_delete_with_a_wrong_if_match() {
 fn observe_a_put_with_the_tag_stripped_of_its_quotes() {
     let bucket = server();
     let path = Path::new("/observe-unquoted-tag/note.md");
+    ensure_folder(&bucket, "/observe-unquoted-tag");
     let tag = bucket.put(path, b"first", &Condition::None).unwrap();
     let answer = bucket.put(
         path,
@@ -540,6 +791,85 @@ fn observe_a_put_with_the_tag_stripped_of_its_quotes() {
     );
     eprintln!("put with an unquoted tag: {}", put_line(&answer));
     eprintln!("object afterwards: {}", get_line(&bucket.get(path)));
+}
+
+/// Not a parity sequence, since `MemoryBucket` never holds a file and a folder at one path: keys
+/// written straight to the server make `/a` an object and a folder, and the file wins everywhere.
+#[cfg(minio_tests)]
+#[test]
+fn a_file_and_a_folder_made_by_keys_show_the_file_on_the_server() {
+    let config = ready_config();
+    let bucket = server();
+    let sdk = client(&config);
+    ensure_folder(&bucket, "/conflict-made");
+    for key in ["conflict-made/a", "conflict-made/a/b"] {
+        runtime()
+            .block_on(
+                sdk.put_object()
+                    .bucket(&config.bucket)
+                    .key(key)
+                    .body(ByteStream::from_static(b"x"))
+                    .send(),
+            )
+            .unwrap();
+    }
+    let folder = Path::new("/conflict-made");
+    let transcript = vec![
+        kind_line(&bucket.head(&at("/conflict-made", "a"))),
+        list_line(&bucket.list(folder, Depth::Children), "/conflict-made"),
+        list_line(&bucket.list(folder, Depth::All), "/conflict-made"),
+        shape(&bucket.walk(folder, false, true), |entries| {
+            format!("walked {}", entries.len())
+        }),
+        get_line(&bucket.get(&at("/conflict-made", "a/b"))),
+    ];
+    drop(bucket.remove_folder(folder));
+    eprintln!(
+        "file and folder by keys on the server:\n{}",
+        transcript.join("\n")
+    );
+    assert_eq!(
+        transcript,
+        [
+            "file true dir false size 1 token true",
+            "paths [\"a\"]",
+            "paths [\"a\"]",
+            "walked 1",
+            "bytes [120]",
+        ]
+    );
+}
+
+/// Not a parity sequence, since `MemoryBucket` has no markers: a folder `create_folder` made has
+/// the time of its marker, and a folder implied by a key below it has none.
+#[cfg(minio_tests)]
+#[test]
+fn a_made_folder_has_a_time_and_an_implied_folder_has_none_on_the_server() {
+    let config = ready_config();
+    let bucket = server();
+    ensure_folder(&bucket, "/folder-times/made");
+    runtime()
+        .block_on(
+            client(&config)
+                .put_object()
+                .bucket(&config.bucket)
+                .key("folder-times/implied/z")
+                .body(ByteStream::from_static(b"x"))
+                .send(),
+        )
+        .unwrap();
+    let made = bucket.head(Path::new("/folder-times/made"));
+    let implied = bucket.head(Path::new("/folder-times/implied"));
+    let transcript = vec![head_line(&made), head_line(&implied)];
+    drop(bucket.remove_folder(Path::new("/folder-times")));
+    eprintln!("folder times on the server:\n{}", transcript.join("\n"));
+    assert_eq!(
+        transcript,
+        [
+            "file false dir true size 0 modified true token false",
+            "file false dir true size 0 modified false token false",
+        ]
+    );
 }
 
 /// Not a parity sequence, since `MemoryBucket` has no missing-bucket state: every call to
@@ -606,11 +936,18 @@ fn ensure_creates_a_missing_bucket_on_the_server() {
     let before = bucket.get(path);
     let created = bucket.runtime.block_on(bucket.bucket.ensure());
     let again = bucket.runtime.block_on(bucket.bucket.ensure());
+    let folder = bucket.create_folder(Path::new("/ensure"));
     let put = bucket.put(path, b"# Note\n", &Condition::None);
     let got = bucket.get(path);
     let removed = bucket
         .runtime
         .block_on(sdk.delete_object().bucket(&config.bucket).key(key).send());
+    let unmarked = bucket.runtime.block_on(
+        sdk.delete_object()
+            .bucket(&config.bucket)
+            .key("ensure/")
+            .send(),
+    );
     let deleted = bucket
         .runtime
         .block_on(sdk.delete_bucket().bucket(&config.bucket).send());
@@ -618,9 +955,11 @@ fn ensure_creates_a_missing_bucket_on_the_server() {
         get_line(&before),
         shape(&created, |&()| "ensured".to_owned()),
         shape(&again, |&()| "ensured".to_owned()),
+        done_line(&folder),
         put_line(&put),
         get_line(&got),
         status(&removed),
+        status(&unmarked),
         status(&deleted),
     ];
     eprintln!("ensure on the server:\n{}", transcript.join("\n"));
@@ -630,8 +969,10 @@ fn ensure_creates_a_missing_bucket_on_the_server() {
             "Other",
             "ensured",
             "ensured",
+            "done",
             "tag",
             "bytes [35, 32, 78, 111, 116, 101, 10]",
+            "accepted",
             "accepted",
             "accepted"
         ]
@@ -690,9 +1031,7 @@ fn run_prefix(name: &str) -> String {
 /// Delete every key under `prefix`.
 #[cfg(s3_tests)]
 fn remove_prefix(bucket: &BlockingBucket<S3Bucket>, prefix: &str) {
-    for entry in bucket.list(Path::new(prefix), Depth::All).unwrap() {
-        bucket.delete(&entry.path, &Condition::None).unwrap();
-    }
+    drop(bucket.remove_folder(Path::new(prefix)));
 }
 
 /// The transcript of `sequence` on AWS under a prefix of its own, removed before this returns.
@@ -810,6 +1149,66 @@ fn children_listing_agrees_with_aws() {
 
 #[cfg(s3_tests)]
 #[test]
+fn folders_agrees_with_aws() {
+    assert_agree(
+        "folders",
+        &folders(&memory(), "/a"),
+        &aws_transcript("folders", folders),
+    );
+}
+
+#[cfg(s3_tests)]
+#[test]
+fn file_and_folder_conflict_agrees_with_aws() {
+    assert_agree(
+        "file and folder conflict",
+        &file_and_folder_conflict(&memory(), "/a"),
+        &aws_transcript("file-and-folder-conflict", file_and_folder_conflict),
+    );
+}
+
+#[cfg(s3_tests)]
+#[test]
+fn copies_agrees_with_aws() {
+    assert_agree(
+        "copies",
+        &copies(&memory(), "/a"),
+        &aws_transcript("copies", copies),
+    );
+}
+
+#[cfg(s3_tests)]
+#[test]
+fn file_renames_agrees_with_aws() {
+    assert_agree(
+        "file renames",
+        &file_renames(&memory(), "/a"),
+        &aws_transcript("file-renames", file_renames),
+    );
+}
+
+#[cfg(s3_tests)]
+#[test]
+fn folder_rename_agrees_with_aws() {
+    assert_agree(
+        "folder rename",
+        &folder_rename(&memory(), "/a"),
+        &aws_transcript("folder-rename", folder_rename),
+    );
+}
+
+#[cfg(s3_tests)]
+#[test]
+fn parent_check_agrees_with_aws() {
+    assert_agree(
+        "parent check",
+        &parent_check(&memory(), "/a"),
+        &aws_transcript("parent-check", parent_check),
+    );
+}
+
+#[cfg(s3_tests)]
+#[test]
 fn refused_paths_agree_with_aws() {
     assert_agree(
         "refused paths",
@@ -883,6 +1282,7 @@ fn observe_a_raw_delete_with_a_wrong_if_match_on_aws() {
     let bucket = aws();
     let prefix = run_prefix("observe-raw-delete");
     let path = PathBuf::from(format!("{prefix}/note.md"));
+    ensure_folder(&bucket, &prefix);
     let key = path
         .display()
         .to_string()
@@ -908,6 +1308,7 @@ fn observe_a_put_with_the_tag_stripped_of_its_quotes_on_aws() {
     let bucket = aws();
     let prefix = run_prefix("observe-unquoted-tag");
     let path = PathBuf::from(format!("{prefix}/note.md"));
+    ensure_folder(&bucket, &prefix);
     let tag = bucket.put(&path, b"first", &Condition::None).unwrap();
     let answer = bucket.put(
         &path,
