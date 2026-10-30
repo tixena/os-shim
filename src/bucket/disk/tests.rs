@@ -679,11 +679,12 @@ fn the_disk_promises_what_it_does() {
         Guarantee::FolderRenameIsAtomic,
         Guarantee::FuturesNeverWait,
         Guarantee::ParentCheckInOneStep,
+        Guarantee::RenameKeepsModificationTime,
         Guarantee::WalkHonorsGitignore,
     ];
     assert_eq!(
         kept.map(|guarantee| promised.contains(guarantee)),
-        [true; 13]
+        [true; 14]
     );
     assert!(!promised.contains(Guarantee::AppendIsAtomic));
     assert!(!promised.contains(Guarantee::ReadersNeverSeePartialWrites));

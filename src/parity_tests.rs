@@ -1369,8 +1369,10 @@ async fn rename_keeps_the_modification_time(real: &dyn System, root: &Path) {
         .unwrap();
 
     let real_after = real.metadata(&root.join("n.md")).await.unwrap().modified;
-    // A rename by copy and delete gives the file the time of the copy.
-    if real.guarantees().contains(Guarantee::FileRenameIsAtomic) {
+    if real
+        .guarantees()
+        .contains(Guarantee::RenameKeepsModificationTime)
+    {
         assert_eq!(real_after, real_before);
     } else {
         assert!(real_after.is_some());
