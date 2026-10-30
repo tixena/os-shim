@@ -46,6 +46,7 @@ aws-sdk-s3 = { version = "1.144.0", default-features = false, features = [
 ], optional = true }
 
 [dev-dependencies]
+futures-util = { version = "0.3.34", default-features = false, features = ["io", "std"] }
 tokio = { version = "1.51.6", features = ["rt", "macros", "test-util"] }
 
 [features]

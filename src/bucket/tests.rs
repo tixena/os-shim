@@ -16,9 +16,17 @@ use alloc::sync::Arc;
 #[cfg(feature = "minio")]
 use aws_sdk_s3::{error::SdkError, operation::get_object::GetObjectError};
 #[cfg(feature = "minio")]
+use core::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "minio")]
 use core::time::Duration;
 #[cfg(feature = "minio")]
 use core::{error::Error, iter};
+#[cfg(feature = "minio")]
+use futures_io::AsyncRead;
+#[cfg(feature = "minio")]
+use futures_util::{AsyncReadExt as _, AsyncWriteExt as _};
+#[cfg(feature = "minio")]
+use std::io;
 use std::path::Path;
 #[cfg(feature = "minio")]
 use std::time::UNIX_EPOCH;
@@ -28,6 +36,12 @@ use std::{
     net::{TcpListener, TcpStream},
     sync::Mutex,
     thread,
+};
+#[cfg(feature = "minio")]
+use tracing::{
+    Event, Level, Metadata, Subscriber,
+    span::{Attributes, Id, Record},
+    subscriber::with_default,
 };
 
 /// The guarantees every SDK client holds, whatever the store.
@@ -58,8 +72,45 @@ const EVERY_GUARANTEE: [Guarantee; 15] = [
     Guarantee::WalkHonorsGitignore,
 ];
 
+/// Eight MiB, the size of a part and of a range.
+#[cfg(feature = "minio")]
+const PART: usize = 8 * 1024 * 1024;
+
+/// The path of the stream tests' object.
+#[cfg(feature = "minio")]
+const BIG: &str = "/big.bin";
+
 /// A list of lines the canned server records, shared with the test.
 type Log = Arc<Mutex<Vec<String>>>;
+
+/// A subscriber that counts the events logged at error level.
+#[cfg(feature = "minio")]
+struct CountsErrors(Arc<AtomicUsize>);
+
+#[cfg(feature = "minio")]
+impl Subscriber for CountsErrors {
+    fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+        true
+    }
+
+    fn enter(&self, _span: &Id) {}
+
+    fn event(&self, event: &Event<'_>) {
+        if *event.metadata().level() == Level::ERROR {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn exit(&self, _span: &Id) {}
+
+    fn new_span(&self, _span: &Attributes<'_>) -> Id {
+        Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+}
 
 /// The paths of `entries`.
 fn paths(entries: &[WalkEntry]) -> Vec<String> {
@@ -214,7 +265,8 @@ fn serve(
 }
 
 /// The rest of the request that starts with `request_line`, read off `reader`, as its method, its
-/// conditional headers, and its canned ACL, copy source and location constraint when it carries them.
+/// conditional headers, and its canned ACL, copy source, range, part length and location constraint
+/// when it carries them.
 #[cfg(any(feature = "minio", feature = "s3"))]
 fn read_request(request_line: &str, reader: &mut BufReader<TcpStream>) -> String {
     let mut length = 0_u64;
@@ -222,6 +274,7 @@ fn read_request(request_line: &str, reader: &mut BufReader<TcpStream>) -> String
     let mut if_none_match = None;
     let mut acl = None;
     let mut copy_source = None;
+    let mut range = None;
     loop {
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
@@ -234,6 +287,7 @@ fn read_request(request_line: &str, reader: &mut BufReader<TcpStream>) -> String
             "if-none-match" => if_none_match = Some(value.trim().to_owned()),
             "x-amz-acl" => acl = Some(value.trim().to_owned()),
             "x-amz-copy-source" => copy_source = Some(value.trim().to_owned()),
+            "range" => range = Some(value.trim().to_owned()),
             _ => {}
         }
     }
@@ -245,9 +299,16 @@ fn read_request(request_line: &str, reader: &mut BufReader<TcpStream>) -> String
         .map(|(region, _)| region.to_owned());
     let method = request_line.split(' ').next().unwrap();
     let mut parts = vec![method.to_owned(), format!("if-match={if_match}")];
+    if request_line.contains("partNumber=")
+        && request_line.starts_with("PUT")
+        && copy_source.is_none()
+    {
+        parts.push(format!("len={length}"));
+    }
     parts.extend(if_none_match.map(|value| format!("if-none-match={value}")));
     parts.extend(acl.map(|value| format!("acl={value}")));
     parts.extend(copy_source.map(|value| format!("copy-source={value}")));
+    parts.extend(range.map(|value| format!("range={value}")));
     parts.extend(location.map(|region| format!("location={region}")));
     parts.join(" ")
 }
@@ -1687,4 +1748,449 @@ fn s3_guarantees_add_the_conditional_delete_to_the_minio_ones() {
             "{guarantee:?}"
         );
     }
+}
+
+/// A `CreateMultipartUpload` answer for the upload `u1`.
+#[cfg(feature = "minio")]
+fn upload_started() -> String {
+    answer(
+        "200 OK",
+        "Content-Type: application/xml\r\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><InitiateMultipartUploadResult><Bucket>archie</Bucket><Key>big.bin</Key><UploadId>u1</UploadId></InitiateMultipartUploadResult>",
+    )
+}
+
+/// An `UploadPart` answer carrying the entity tag `tag`.
+#[cfg(feature = "minio")]
+fn part_stored(tag: &str) -> String {
+    answer("200 OK", &format!("ETag: \"{tag}\"\r\n"), "")
+}
+
+/// A `CompleteMultipartUpload` answer.
+#[cfg(feature = "minio")]
+fn upload_completed() -> String {
+    answer(
+        "200 OK",
+        "Content-Type: application/xml\r\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><CompleteMultipartUploadResult><Bucket>archie</Bucket><Key>big.bin</Key><ETag>&quot;done&quot;</ETag></CompleteMultipartUploadResult>",
+    )
+}
+
+/// An `UploadPartCopy` answer carrying the entity tag `tag`.
+#[cfg(feature = "minio")]
+fn part_copied(tag: &str) -> String {
+    answer(
+        "200 OK",
+        "Content-Type: application/xml\r\n",
+        &format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><CopyPartResult><ETag>&quot;{tag}&quot;</ETag></CopyPartResult>"
+        ),
+    )
+}
+
+/// A `HEAD` answer for an object of `length` bytes with the entity tag `t`.
+#[cfg(feature = "minio")]
+fn sized(length: usize) -> String {
+    head_answer(&format!("ETag: \"t\"\r\nContent-Length: {length}\r\n"))
+}
+
+/// A ranged `GET` answer with `length` bytes.
+#[cfg(feature = "minio")]
+fn range_of(length: usize) -> String {
+    answer(
+        "206 Partial Content",
+        "ETag: \"t\"\r\n",
+        &"x".repeat(length),
+    )
+}
+
+/// Read `reader` to its end and count the bytes.
+#[cfg(feature = "minio")]
+async fn count(reader: &mut (dyn AsyncRead + Send + Unpin + '_)) -> io::Result<usize> {
+    let mut total = 0_usize;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            return Ok(total);
+        }
+        total = total.saturating_add(read);
+    }
+}
+
+#[cfg(feature = "minio")]
+#[tokio::test(flavor = "current_thread")]
+async fn minio_write_stream_closed_under_a_part_sends_one_put() {
+    let (endpoint, seen) = canned(vec![empty_page(), answer("200 OK", "ETag: \"b\"\r\n", "")]);
+    let bucket = MinioBucket::new(minio_config(endpoint));
+    let mut writer = bucket
+        .write_stream(Path::new(BIG), Condition::Absent)
+        .await
+        .unwrap();
+    writer.write_all(b"abc").await.unwrap();
+    writer.close().await.unwrap();
+    assert_eq!(
+        requests(&seen),
+        ["GET if-match=-", "PUT if-match=- if-none-match=*"]
+    );
+}
+
+#[cfg(feature = "minio")]
+#[tokio::test(flavor = "current_thread")]
+async fn minio_write_stream_of_exactly_a_part_sends_one_put() {
+    let (endpoint, seen) = canned(vec![empty_page(), answer("200 OK", "ETag: \"b\"\r\n", "")]);
+    let bucket = MinioBucket::new(minio_config(endpoint));
+    let mut writer = bucket
+        .write_stream(Path::new(BIG), Condition::None)
+        .await
+        .unwrap();
+    writer.write_all(&vec![7_u8; PART]).await.unwrap();
+    writer.close().await.unwrap();
+    assert_eq!(requests(&seen), ["GET if-match=-", "PUT if-match=-"]);
+}
+
+#[cfg(feature = "minio")]
+#[tokio::test(flavor = "current_thread")]
+async fn minio_write_stream_of_20_mib_sends_three_parts_and_completes_under_absent() {
+    let (endpoint, seen, targets) = canned_with_targets(vec![
+        empty_page(),
+        upload_started(),
+        part_stored("p1"),
+        part_stored("p2"),
+        part_stored("p3"),
+        upload_completed(),
+    ]);
+    let bucket = MinioBucket::new(minio_config(endpoint));
+    let mut writer = bucket
+        .write_stream(Path::new(BIG), Condition::Absent)
+        .await
+        .unwrap();
+    let chunk = vec![7_u8; 1024 * 1024];
+    for _ in 0_u8..20 {
+        writer.write_all(&chunk).await.unwrap();
+    }
+    writer.close().await.unwrap();
+    assert_eq!(
+        requests(&seen),
+        [
+            "GET if-match=-",
+            "POST if-match=-",
+            "PUT if-match=- len=8388608",
+            "PUT if-match=- len=8388608",
+            "PUT if-match=- len=4194304",
+            "POST if-match=- if-none-match=*"
+        ]
+    );
+    let sent = requests(&targets);
+    assert!(
+        sent.iter().any(|target| target.contains("?uploads")),
+        "{sent:?}"
+    );
+    for number in 1_u8..=3 {
+        assert!(
+            sent.iter()
+                .any(|target| target.contains(&format!("partNumber={number}"))
+                    && target.contains("uploadId=u1")),
+            "{sent:?}"
+        );
+    }
+    assert!(sent.last().unwrap().starts_with("POST"), "{sent:?}");
+    assert!(sent.last().unwrap().contains("uploadId=u1"), "{sent:?}");
+}
+
+#[cfg(feature = "minio")]
+#[tokio::test(flavor = "current_thread")]
+async fn minio_write_stream_completes_under_the_tag_of_a_matches_condition() {
+    let (endpoint, seen) = canned(vec![
+        empty_page(),
+        upload_started(),
+        part_stored("p1"),
+        part_stored("p2"),
+        upload_completed(),
+    ]);
+    let bucket = MinioBucket::new(minio_config(endpoint));
+    let mut writer = bucket
+        .write_stream(
+            Path::new(BIG),
+            Condition::Matches(RevisionToken::new("\"old\"")),
+        )
+        .await
+        .unwrap();
+    writer.write_all(&vec![7_u8; PART + 1]).await.unwrap();
+    writer.close().await.unwrap();
+    assert_eq!(requests(&seen).last().unwrap(), "POST if-match=\"old\"");
+}
+
+#[cfg(feature = "minio")]
+#[tokio::test(flavor = "current_thread")]
+async fn minio_write_stream_with_a_part_refused_aborts_the_upload_before_the_error() {
+    let (endpoint, seen, targets) = canned_with_targets(vec![
+        empty_page(),
+        upload_started(),
+        answer("503 Service Unavailable", "", ""),
+        answer("204 No Content", "", ""),
+    ]);
+    let bucket = MinioBucket::new(minio_config(endpoint));
+    let mut writer = bucket
+        .write_stream(Path::new(BIG), Condition::None)
+        .await
+        .unwrap();
+    let error = writer.write_all(&vec![7_u8; PART + 1]).await.unwrap_err();
+    assert_eq!(StorageError::from(error).kind(), ErrorKind::Unavailable);
+    assert_eq!(
+        requests(&seen),
+        [
+            "GET if-match=-",
+            "POST if-match=-",
+            "PUT if-match=- len=8388608",
+            "DELETE if-match=-"
+        ]
+    );
+    assert!(
+        requests(&targets).last().unwrap().contains("uploadId=u1"),
+        "{targets:?}"
+    );
+}
+
+#[cfg(feature = "minio")]
+#[tokio::test(flavor = "current_thread")]
+async fn minio_write_stream_under_absent_on_an_existing_key_aborts_and_is_already_exists() {
+    let (endpoint, seen) = canned(vec![
+        empty_page(),
+        upload_started(),
+        part_stored("p1"),
+        part_stored("p2"),
+        answer("412 Precondition Failed", "", ""),
+        answer("204 No Content", "", ""),
+    ]);
+    let bucket = MinioBucket::new(minio_config(endpoint));
+    let mut writer = bucket
+        .write_stream(Path::new(BIG), Condition::Absent)
+        .await
+        .unwrap();
+    writer.write_all(&vec![7_u8; PART + 1]).await.unwrap();
+    let error = writer.close().await.unwrap_err();
+    assert_eq!(StorageError::from(error).kind(), ErrorKind::AlreadyExists);
+    assert_eq!(requests(&seen).last().unwrap(), "DELETE if-match=-");
+}
+
+#[cfg(feature = "minio")]
+#[tokio::test(flavor = "current_thread")]
+async fn minio_write_stream_under_a_stale_tag_answered_412_is_precondition_failed() {
+    let (endpoint, _seen) = canned(vec![
+        empty_page(),
+        answer("412 Precondition Failed", "", ""),
+    ]);
+    let bucket = MinioBucket::new(minio_config(endpoint));
+    let mut writer = bucket
+        .write_stream(
+            Path::new(BIG),
+            Condition::Matches(RevisionToken::new("\"old\"")),
+        )
+        .await
+        .unwrap();
+    writer.write_all(b"abc").await.unwrap();
+    let error = writer.close().await.unwrap_err();
+    assert_eq!(
+        StorageError::from(error).kind(),
+        ErrorKind::PreconditionFailed
+    );
+}
+
+#[cfg(feature = "minio")]
+#[tokio::test(flavor = "current_thread")]
+async fn minio_write_stream_runs_the_parent_check_first() {
+    let (endpoint, seen) = canned(vec![
+        empty_page(),
+        empty_page(),
+        not_found_answer("NoSuchKey", "missing"),
+        empty_page(),
+    ]);
+    let bucket = MinioBucket::new(minio_config(endpoint));
+    let error = bucket
+        .write_stream(Path::new("/missing/big.bin"), Condition::None)
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.kind(), ErrorKind::NotFound);
+    assert!(
+        requests(&seen)
+            .iter()
+            .all(|line| line.starts_with("GET") || line.starts_with("HEAD")),
+        "{seen:?}"
+    );
+}
+
+#[cfg(feature = "minio")]
+#[tokio::test(flavor = "current_thread")]
+async fn minio_read_stream_of_20_mib_sends_one_head_and_three_ranges() {
+    let (endpoint, seen) = canned(vec![
+        sized(20 * 1024 * 1024),
+        range_of(PART),
+        range_of(PART),
+        range_of(4 * 1024 * 1024),
+    ]);
+    let bucket = MinioBucket::new(minio_config(endpoint));
+    let mut reader = bucket.read_stream(Path::new(BIG)).await.unwrap();
+    assert_eq!(count(&mut *reader).await.unwrap(), 20 * 1024 * 1024);
+    assert_eq!(
+        requests(&seen),
+        [
+            "HEAD if-match=-",
+            "GET if-match=\"t\" range=bytes=0-8388607",
+            "GET if-match=\"t\" range=bytes=8388608-16777215",
+            "GET if-match=\"t\" range=bytes=16777216-20971519"
+        ]
+    );
+}
+
+#[cfg(feature = "minio")]
+#[tokio::test(flavor = "current_thread")]
+async fn minio_read_stream_of_an_empty_object_sends_no_range() {
+    let (endpoint, seen) = canned(vec![sized(0)]);
+    let bucket = MinioBucket::new(minio_config(endpoint));
+    let mut reader = bucket.read_stream(Path::new(BIG)).await.unwrap();
+    assert_eq!(count(&mut *reader).await.unwrap(), 0);
+    assert_eq!(requests(&seen), ["HEAD if-match=-"]);
+}
+
+#[cfg(feature = "minio")]
+#[tokio::test(flavor = "current_thread")]
+async fn minio_read_stream_of_an_object_replaced_mid_read_is_precondition_failed() {
+    let (endpoint, _seen) = canned(vec![
+        sized(20 * 1024 * 1024),
+        range_of(PART),
+        answer("412 Precondition Failed", "", ""),
+    ]);
+    let bucket = MinioBucket::new(minio_config(endpoint));
+    let mut reader = bucket.read_stream(Path::new(BIG)).await.unwrap();
+    let error = count(&mut *reader).await.unwrap_err();
+    assert_eq!(
+        StorageError::from(error).kind(),
+        ErrorKind::PreconditionFailed
+    );
+}
+
+#[cfg(feature = "minio")]
+#[tokio::test(flavor = "current_thread")]
+async fn minio_read_stream_of_a_missing_object_is_not_found() {
+    let (endpoint, _seen) = canned(vec![
+        answer("404 Not Found", "", ""),
+        empty_page(),
+        empty_page(),
+    ]);
+    let bucket = MinioBucket::new(minio_config(endpoint));
+    let error = bucket.read_stream(Path::new(BIG)).await.err().unwrap();
+    assert_eq!(error.kind(), ErrorKind::NotFound);
+}
+
+#[cfg(feature = "minio")]
+#[tokio::test(flavor = "current_thread")]
+async fn minio_append_stream_to_a_6_mib_object_copies_it_as_the_first_part() {
+    let (endpoint, seen, targets) = canned_with_targets(vec![
+        empty_page(),
+        sized(6 * 1024 * 1024),
+        upload_started(),
+        part_copied("c1"),
+        part_stored("p2"),
+        upload_completed(),
+    ]);
+    let bucket = MinioBucket::new(minio_config(endpoint));
+    let mut writer = bucket.append_stream(Path::new(BIG)).await.unwrap();
+    writer.write_all(&vec![1_u8; 1024 * 1024]).await.unwrap();
+    writer.close().await.unwrap();
+    assert_eq!(
+        requests(&seen),
+        [
+            "GET if-match=-",
+            "HEAD if-match=-",
+            "POST if-match=-",
+            "PUT if-match=- copy-source=archie/big.bin",
+            "PUT if-match=- len=1048576",
+            "POST if-match=\"t\""
+        ]
+    );
+    let sent = requests(&targets);
+    for number in 1_u8..=2 {
+        assert!(
+            sent.iter()
+                .any(|target| target.contains(&format!("partNumber={number}"))),
+            "{sent:?}"
+        );
+    }
+}
+
+#[cfg(feature = "minio")]
+#[tokio::test(flavor = "current_thread")]
+async fn minio_append_stream_to_a_small_object_reads_it_and_puts_under_its_tag() {
+    let (endpoint, seen) = canned(vec![
+        empty_page(),
+        sized(3),
+        range_of(3),
+        answer("200 OK", "ETag: \"n\"\r\n", ""),
+    ]);
+    let bucket = MinioBucket::new(minio_config(endpoint));
+    let mut writer = bucket.append_stream(Path::new(BIG)).await.unwrap();
+    writer.write_all(b"def").await.unwrap();
+    writer.close().await.unwrap();
+    assert_eq!(
+        requests(&seen),
+        [
+            "GET if-match=-",
+            "HEAD if-match=-",
+            "GET if-match=\"t\" range=bytes=0-2",
+            "PUT if-match=\"t\""
+        ]
+    );
+}
+
+#[cfg(feature = "minio")]
+#[tokio::test(flavor = "current_thread")]
+async fn minio_append_stream_to_a_missing_object_puts_under_absent() {
+    let (endpoint, seen) = canned(vec![
+        empty_page(),
+        answer("404 Not Found", "", ""),
+        empty_page(),
+        empty_page(),
+        answer("200 OK", "ETag: \"n\"\r\n", ""),
+    ]);
+    let bucket = MinioBucket::new(minio_config(endpoint));
+    let mut writer = bucket.append_stream(Path::new(BIG)).await.unwrap();
+    writer.write_all(b"def").await.unwrap();
+    writer.close().await.unwrap();
+    assert_eq!(
+        requests(&seen).last().unwrap(),
+        "PUT if-match=- if-none-match=*"
+    );
+}
+
+#[cfg(feature = "minio")]
+#[tokio::test(flavor = "current_thread")]
+async fn minio_write_stream_dropped_without_close_logs_one_error_and_sends_nothing() {
+    let (endpoint, seen) = canned(vec![empty_page()]);
+    let bucket = MinioBucket::new(minio_config(endpoint));
+    let mut writer = bucket
+        .write_stream(Path::new(BIG), Condition::None)
+        .await
+        .unwrap();
+    writer.write_all(b"abc").await.unwrap();
+    let logged = Arc::new(AtomicUsize::new(0));
+    with_default(CountsErrors(Arc::clone(&logged)), || drop(writer));
+    assert_eq!(logged.load(Ordering::SeqCst), 1);
+    assert_eq!(requests(&seen), ["GET if-match=-"]);
+}
+
+#[cfg(feature = "minio")]
+#[tokio::test(flavor = "current_thread")]
+async fn minio_write_stream_closed_logs_no_error() {
+    let (endpoint, _seen) = canned(vec![empty_page(), answer("200 OK", "ETag: \"b\"\r\n", "")]);
+    let bucket = MinioBucket::new(minio_config(endpoint));
+    let mut writer = bucket
+        .write_stream(Path::new(BIG), Condition::None)
+        .await
+        .unwrap();
+    writer.close().await.unwrap();
+    let logged = Arc::new(AtomicUsize::new(0));
+    with_default(CountsErrors(Arc::clone(&logged)), || drop(writer));
+    assert_eq!(logged.load(Ordering::SeqCst), 0);
 }
