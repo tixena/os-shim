@@ -364,7 +364,7 @@ impl Bucket for MemoryBucket {
     #[inline]
     fn append_stream<'bucket>(
         &'bucket self,
-        path: &'bucket Path,
+        path: &Path,
     ) -> impl Future<Output = Result<Box<dyn AsyncWrite + Send + Unpin + 'bucket>>> + Send {
         ready(self.writer(path, None))
     }
@@ -445,7 +445,7 @@ impl Bucket for MemoryBucket {
     #[inline]
     fn read_stream<'bucket>(
         &'bucket self,
-        path: &'bucket Path,
+        path: &Path,
     ) -> impl Future<Output = Result<Box<dyn AsyncRead + Send + Unpin + 'bucket>>> + Send {
         let outcome = lexical(path)
             .and_then(|resolved| self.get_now(&resolved))
@@ -486,7 +486,7 @@ impl Bucket for MemoryBucket {
     #[inline]
     fn write_stream<'bucket>(
         &'bucket self,
-        path: &'bucket Path,
+        path: &Path,
         condition: Condition,
     ) -> impl Future<Output = Result<Box<dyn AsyncWrite + Send + Unpin + 'bucket>>> + Send {
         ready(self.writer(path, Some(condition)))
