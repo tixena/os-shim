@@ -87,8 +87,9 @@ test-slow:
 # recipe sets.
 minio_tests := "--features minio --config 'build.rustflags=[\"--cfg\", \"minio_tests\"]'"
 
-# Lint, then run, the `minio` client's tests against a RustFS server in a
-# container of their own on port 9100, removed afterwards. Needs docker.
+# Lint, then run, the bucket and system parity tests on the `minio` client against
+# a RustFS server in a container of their own on port 9100, removed afterwards.
+# Needs docker.
 test-minio:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -106,14 +107,15 @@ test-minio:
     OS_SHIM_MINIO_ENDPOINT=http://127.0.0.1:9100 \
     OS_SHIM_MINIO_ACCESS_KEY=os-shim \
     OS_SHIM_MINIO_SECRET_KEY=os-shim-secret \
-        cargo test {{minio_tests}} bucket::parity_tests -- --nocapture
+        cargo test {{minio_tests}} parity_tests -- --nocapture
 
 # The `s3` client's tests compile only under `cfg(s3_tests)`, which no other
 # recipe sets.
 s3_tests := "--features s3 --config 'build.rustflags=[\"--cfg\", \"s3_tests\"]'"
 
-# Lint, then run, the `s3` client's tests against the AWS bucket the environment
-# names. Writes under a prefix of its own and removes what it wrote. One test
+# Lint, then run, the bucket and system parity tests on the `s3` client against the
+# AWS bucket the environment names. Writes under a prefix of its own and removes
+# what it wrote. One test
 # creates a bucket in OS_SHIM_S3_ENSURE_REGION, encrypted with the KMS key
 # OS_SHIM_S3_KMS_KEY_ARN, and deletes it.
 test-s3:
@@ -130,7 +132,7 @@ test-s3:
     echo "Linting S3 tests..."
     cargo clippy --all-targets {{s3_tests}} -- -D warnings
     echo "Running S3 tests against AWS..."
-    cargo test {{s3_tests}} bucket::parity_tests -- --nocapture
+    cargo test {{s3_tests}} parity_tests -- --nocapture
 
 # Run tests with output
 test-verbose:
