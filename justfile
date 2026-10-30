@@ -145,12 +145,14 @@ test-minio:
 s3_tests := "--features s3 --config 'build.rustflags=[\"--cfg\", \"s3_tests\"]'"
 
 # Lint, then run, the `s3` client's tests against the AWS bucket the environment
-# names. Writes under a prefix of its own and removes what it wrote.
+# names. Writes under a prefix of its own and removes what it wrote. One test
+# creates a bucket in OS_SHIM_S3_ENSURE_REGION, encrypted with the KMS key
+# OS_SHIM_S3_KMS_KEY_ARN, and deletes it.
 test-s3:
     #!/usr/bin/env bash
     set -euo pipefail
     missing=()
-    for name in OS_SHIM_S3_REGION OS_SHIM_S3_BUCKET AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+    for name in OS_SHIM_S3_REGION OS_SHIM_S3_BUCKET OS_SHIM_S3_ENSURE_REGION OS_SHIM_S3_KMS_KEY_ARN AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
         [ -n "${!name:-}" ] || missing+=("$name")
     done
     if [ "${#missing[@]}" -gt 0 ]; then

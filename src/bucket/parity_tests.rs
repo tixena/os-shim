@@ -9,6 +9,8 @@ use super::{
 use super::{MinioBucket, MinioConfig};
 #[cfg(s3_tests)]
 use super::{S3Bucket, S3Config};
+#[cfg(s3_tests)]
+use aws_sdk_s3::types::BucketLocationConstraint;
 use aws_sdk_s3::{
     Client, Config,
     config::{BehaviorVersion, Credentials, Region, retry::RetryConfig},
@@ -493,6 +495,12 @@ fn aws() -> BlockingBucket<S3Bucket> {
 /// An SDK client for the AWS bucket the environment names.
 #[cfg(s3_tests)]
 fn aws_client() -> Client {
+    aws_client_in(&aws_variable("OS_SHIM_S3_REGION"))
+}
+
+/// An SDK client for AWS in `region`, with the keys the environment names.
+#[cfg(s3_tests)]
+fn aws_client_in(region: &str) -> Client {
     let credentials = Credentials::new(
         aws_variable("AWS_ACCESS_KEY_ID"),
         aws_variable("AWS_SECRET_ACCESS_KEY"),
@@ -502,7 +510,7 @@ fn aws_client() -> Client {
     );
     let sdk = Config::builder()
         .behavior_version(BehaviorVersion::latest())
-        .region(Region::new(aws_variable("OS_SHIM_S3_REGION")))
+        .region(Region::new(region.to_owned()))
         .credentials_provider(credentials)
         .retry_config(RetryConfig::disabled())
         .build();
@@ -622,6 +630,57 @@ fn empty_listing_agrees_with_aws() {
 fn ensure_leaves_an_existing_bucket_on_aws() {
     let bucket = aws();
     bucket.runtime.block_on(bucket.bucket.ensure(None)).unwrap();
+}
+
+/// Not a parity sequence, since `MemoryBucket` has no bucket to create: `ensure` on a bucket that
+/// does not exist creates it in the client's region, private, with the key as its default
+/// encryption. Every call runs before the first `unwrap`, so a failure leaves no bucket behind.
+#[cfg(s3_tests)]
+#[test]
+fn ensure_creates_a_private_encrypted_bucket_on_aws() {
+    let region = aws_variable("OS_SHIM_S3_ENSURE_REGION");
+    let key_arn = aws_variable("OS_SHIM_S3_KMS_KEY_ARN");
+    let name = format!("os-shim-ensure-{}", process::id());
+    let bucket = S3Bucket::new(S3Config::new(
+        region.clone(),
+        name.clone(),
+        aws_variable("AWS_ACCESS_KEY_ID"),
+        aws_variable("AWS_SECRET_ACCESS_KEY"),
+    ));
+    let client = aws_client_in(&region);
+    let runtime = runtime();
+    let created = runtime.block_on(bucket.ensure(Some(&key_arn)));
+    let again = runtime.block_on(bucket.ensure(Some(&key_arn)));
+    let located = runtime.block_on(client.get_bucket_location().bucket(&name).send());
+    let encrypted = runtime.block_on(client.get_bucket_encryption().bucket(&name).send());
+    let deleted = runtime.block_on(client.delete_bucket().bucket(&name).send());
+
+    created.unwrap();
+    again.unwrap();
+    let location = located.unwrap();
+    let encryption = encrypted.unwrap();
+    deleted.unwrap();
+
+    let rule = encryption
+        .server_side_encryption_configuration()
+        .unwrap()
+        .rules()
+        .first()
+        .unwrap();
+    let by_default = rule.apply_server_side_encryption_by_default().unwrap();
+    let constraint = location
+        .location_constraint()
+        .map(BucketLocationConstraint::as_str);
+    eprintln!(
+        "location: {}\nalgorithm: {}\nbucket key: {}",
+        constraint.unwrap_or("none"),
+        by_default.sse_algorithm().as_str(),
+        rule.bucket_key_enabled() == Some(true)
+    );
+    assert_eq!(constraint, Some(region.as_str()));
+    assert_eq!(by_default.sse_algorithm().as_str(), "aws:kms");
+    assert_eq!(by_default.kms_master_key_id(), Some(key_arn.as_str()));
+    assert_eq!(rule.bucket_key_enabled(), Some(true));
 }
 
 #[cfg(s3_tests)]
