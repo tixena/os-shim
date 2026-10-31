@@ -3,7 +3,7 @@
 //! Available with the `zip` feature, which is off by default:
 //!
 //! ```toml
-//! os-shim = { version = "0.1", features = ["zip"] }
+//! os-shim = { version = "0.3", features = ["zip"] }
 //! ```
 //!
 //! Every read and write goes through [`System`], and the functions are async.
