@@ -7,11 +7,11 @@ use super::{
     RevisionToken,
 };
 use crate::error::{ErrorKind, Result, StorageError};
-use crate::{FileMetadata, WalkEntry};
+use crate::{BoxFuture, FileMetadata, WalkEntry};
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use core::fmt;
-use core::future::{Future, ready};
+use core::future::ready;
 use core::mem;
 use core::pin::Pin;
 use core::task::{Context, Poll};
@@ -353,49 +353,69 @@ impl MemoryBucket {
 
 impl Bucket for MemoryBucket {
     #[inline]
-    fn append(
-        &self,
-        path: &Path,
-        more: &[u8],
-    ) -> impl Future<Output = Result<RevisionToken>> + Send {
-        ready(lexical(path).and_then(|resolved| self.append_now(&resolved, more)))
+    fn append<'call>(
+        &'call self,
+        path: &'call Path,
+        more: &'call [u8],
+    ) -> BoxFuture<'call, Result<RevisionToken>> {
+        Box::pin(ready(
+            lexical(path).and_then(|resolved| self.append_now(&resolved, more)),
+        ))
     }
 
     #[inline]
-    fn append_stream<'bucket>(
+    fn append_stream<'bucket, 'call>(
         &'bucket self,
-        path: &Path,
-    ) -> impl Future<Output = Result<Box<dyn AsyncWrite + Send + Unpin + 'bucket>>> + Send {
-        ready(self.writer(path, None))
+        path: &'call Path,
+    ) -> BoxFuture<'call, Result<Box<dyn AsyncWrite + Send + Unpin + 'bucket>>>
+    where
+        'bucket: 'call,
+    {
+        Box::pin(ready(self.writer(path, None)))
     }
 
     #[inline]
-    fn canonicalize(&self, path: &Path) -> impl Future<Output = Result<PathBuf>> + Send {
-        ready(lexical(path))
+    fn canonicalize<'call>(&'call self, path: &'call Path) -> BoxFuture<'call, Result<PathBuf>> {
+        Box::pin(ready(lexical(path)))
     }
 
     #[inline]
-    fn copy(&self, from: &Path, to: &Path) -> impl Future<Output = Result<u64>> + Send {
-        ready(both(from, to).and_then(|(source, target)| self.copy_now(&source, &target)))
+    fn copy<'call>(
+        &'call self,
+        from: &'call Path,
+        to: &'call Path,
+    ) -> BoxFuture<'call, Result<u64>> {
+        Box::pin(ready(
+            both(from, to).and_then(|(source, target)| self.copy_now(&source, &target)),
+        ))
     }
 
     #[inline]
-    fn create_folder(&self, path: &Path) -> impl Future<Output = Result<()>> + Send {
-        ready(lexical(path).and_then(|resolved| self.create_folder_now(&resolved)))
+    fn create_folder<'call>(&'call self, path: &'call Path) -> BoxFuture<'call, Result<()>> {
+        Box::pin(ready(
+            lexical(path).and_then(|resolved| self.create_folder_now(&resolved)),
+        ))
     }
 
     #[inline]
-    fn delete(
-        &self,
-        path: &Path,
-        condition: &Condition,
-    ) -> impl Future<Output = Result<()>> + Send {
-        ready(lexical(path).and_then(|resolved| self.delete_now(&resolved, condition)))
+    fn delete<'call>(
+        &'call self,
+        path: &'call Path,
+        condition: &'call Condition,
+    ) -> BoxFuture<'call, Result<()>> {
+        Box::pin(ready(
+            lexical(path).and_then(|resolved| self.delete_now(&resolved, condition)),
+        ))
     }
 
     #[inline]
-    fn get(&self, path: &Path) -> impl Future<Output = Result<(Vec<u8>, RevisionToken)>> + Send {
-        ready(lexical(path).and_then(|resolved| self.get_now(&resolved)))
+    fn get<'call>(
+        &'call self,
+        path: &'call Path,
+    ) -> BoxFuture<'call, Result<(Vec<u8>, RevisionToken)>> {
+        Box::pin(ready(
+            lexical(path).and_then(|resolved| self.get_now(&resolved)),
+        ))
     }
 
     #[inline]
@@ -420,34 +440,43 @@ impl Bucket for MemoryBucket {
     }
 
     #[inline]
-    fn head(&self, path: &Path) -> impl Future<Output = Result<FileMetadata>> + Send {
-        ready(lexical(path).and_then(|resolved| self.head_now(&resolved)))
+    fn head<'call>(&'call self, path: &'call Path) -> BoxFuture<'call, Result<FileMetadata>> {
+        Box::pin(ready(
+            lexical(path).and_then(|resolved| self.head_now(&resolved)),
+        ))
     }
 
     #[inline]
-    fn list(
-        &self,
-        folder: &Path,
+    fn list<'call>(
+        &'call self,
+        folder: &'call Path,
         depth: Depth,
-    ) -> impl Future<Output = Result<Vec<WalkEntry>>> + Send {
-        ready(lexical(folder).and_then(|resolved| self.list_now(&resolved, depth)))
+    ) -> BoxFuture<'call, Result<Vec<WalkEntry>>> {
+        Box::pin(ready(
+            lexical(folder).and_then(|resolved| self.list_now(&resolved, depth)),
+        ))
     }
 
     #[inline]
-    fn put(
-        &self,
-        path: &Path,
-        bytes: &[u8],
-        condition: &Condition,
-    ) -> impl Future<Output = Result<RevisionToken>> + Send {
-        ready(lexical(path).and_then(|resolved| self.put_now(&resolved, bytes, condition)))
+    fn put<'call>(
+        &'call self,
+        path: &'call Path,
+        bytes: &'call [u8],
+        condition: &'call Condition,
+    ) -> BoxFuture<'call, Result<RevisionToken>> {
+        Box::pin(ready(
+            lexical(path).and_then(|resolved| self.put_now(&resolved, bytes, condition)),
+        ))
     }
 
     #[inline]
-    fn read_stream<'bucket>(
+    fn read_stream<'bucket, 'call>(
         &'bucket self,
-        path: &Path,
-    ) -> impl Future<Output = Result<Box<dyn AsyncRead + Send + Unpin + 'bucket>>> + Send {
+        path: &'call Path,
+    ) -> BoxFuture<'call, Result<Box<dyn AsyncRead + Send + Unpin + 'bucket>>>
+    where
+        'bucket: 'call,
+    {
         let outcome = lexical(path)
             .and_then(|resolved| self.get_now(&resolved))
             .map(|(bytes, _token)| {
@@ -455,42 +484,53 @@ impl Bucket for MemoryBucket {
                     Box::new(BytesReader::new(bytes));
                 reader
             });
-        ready(outcome)
+        Box::pin(ready(outcome))
     }
 
     #[inline]
-    fn remove_folder(&self, path: &Path) -> impl Future<Output = Result<()>> + Send {
-        ready(lexical(path).and_then(|resolved| self.remove_folder_now(&resolved)))
+    fn remove_folder<'call>(&'call self, path: &'call Path) -> BoxFuture<'call, Result<()>> {
+        Box::pin(ready(
+            lexical(path).and_then(|resolved| self.remove_folder_now(&resolved)),
+        ))
     }
 
     #[inline]
-    fn rename(&self, from: &Path, to: &Path) -> impl Future<Output = Result<()>> + Send {
-        ready(both(from, to).and_then(|(source, target)| self.rename_now(&source, &target)))
+    fn rename<'call>(
+        &'call self,
+        from: &'call Path,
+        to: &'call Path,
+    ) -> BoxFuture<'call, Result<()>> {
+        Box::pin(ready(
+            both(from, to).and_then(|(source, target)| self.rename_now(&source, &target)),
+        ))
     }
 
     #[inline]
-    fn walk(
-        &self,
-        folder: &Path,
+    fn walk<'call>(
+        &'call self,
+        folder: &'call Path,
         _follow_links: bool,
         hidden: bool,
-    ) -> impl Future<Output = Result<Vec<WalkEntry>>> + Send {
-        ready(lexical(folder).and_then(|base| {
+    ) -> BoxFuture<'call, Result<Vec<WalkEntry>>> {
+        Box::pin(ready(lexical(folder).and_then(|base| {
             let mut entries = self.list_now(&base, Depth::All)?;
             if !hidden {
                 entries.retain(|entry| !is_hidden(&base, &entry.path));
             }
             Ok(entries)
-        }))
+        })))
     }
 
     #[inline]
-    fn write_stream<'bucket>(
+    fn write_stream<'bucket, 'call>(
         &'bucket self,
-        path: &Path,
+        path: &'call Path,
         condition: Condition,
-    ) -> impl Future<Output = Result<Box<dyn AsyncWrite + Send + Unpin + 'bucket>>> + Send {
-        ready(self.writer(path, Some(condition)))
+    ) -> BoxFuture<'call, Result<Box<dyn AsyncWrite + Send + Unpin + 'bucket>>>
+    where
+        'bucket: 'call,
+    {
+        Box::pin(ready(self.writer(path, Some(condition))))
     }
 }
 

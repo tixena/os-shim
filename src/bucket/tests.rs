@@ -2387,3 +2387,30 @@ async fn minio_write_stream_closed_logs_no_error() {
     with_default(CountsErrors(Arc::clone(&logged)), || drop(writer));
     assert_eq!(logged.load(Ordering::SeqCst), 0);
 }
+
+#[cfg(any(feature = "minio", feature = "s3"))]
+#[test]
+fn a_blocking_bucket_holds_a_dyn_bucket() {
+    let store: Arc<dyn super::Bucket> = Arc::new(MemoryBucket::default());
+    let blocking = BlockingBucket::new(store).unwrap();
+    let file = Path::new("/licencia.pdf");
+    blocking.put(file, b"%PDF-1.7", &Condition::Absent).unwrap();
+    assert_eq!(blocking.get(file).unwrap().0, b"%PDF-1.7");
+}
+
+#[cfg(feature = "s3")]
+#[test]
+fn an_s3_bucket_fits_a_dyn_field() {
+    let config = S3Config::new(
+        "us-east-1".to_owned(),
+        "documentos".to_owned(),
+        "access".to_owned(),
+        "secret".to_owned(),
+    );
+    let store: Arc<dyn super::Bucket> = Arc::new(S3Bucket::new(config));
+    assert!(
+        store
+            .guarantees()
+            .contains(super::Guarantee::ConditionalDeleteInOneStep)
+    );
+}

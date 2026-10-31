@@ -3,7 +3,7 @@
 
 use super::{Bucket, Clock, Condition, Depth, Guarantee, Guarantees, MemoryBucket, RevisionToken};
 use crate::error::{Result, StorageError};
-use crate::{FileMetadata, WalkEntry};
+use crate::{BoxFuture, FileMetadata, WalkEntry};
 use alloc::sync::Arc;
 use core::error::Error;
 use core::future::poll_fn;
@@ -21,45 +21,29 @@ macro_rules! forward_required {
         impl Bucket for $name {
             $($early)*
 
-            fn delete(
-                &self,
-                path: &Path,
-                condition: &Condition,
-            ) -> impl Future<Output = Result<()>> + Send {
-                self.0.delete(path, condition)
-            }
+            fn delete<'call>(&'call self, path: &'call Path, condition: &'call Condition) -> BoxFuture<'call, Result<()>> {
+Box::pin(self.0.delete(path, condition))
+}
 
-            fn get(
-                &self,
-                path: &Path,
-            ) -> impl Future<Output = Result<(Vec<u8>, RevisionToken)>> + Send {
-                self.0.get(path)
-            }
+            fn get<'call>(&'call self, path: &'call Path) -> BoxFuture<'call, Result<(Vec<u8>, RevisionToken)>> {
+Box::pin(self.0.get(path))
+}
 
             fn guarantees(&self) -> Guarantees {
                 self.0.guarantees()
             }
 
-            fn head(&self, path: &Path) -> impl Future<Output = Result<FileMetadata>> + Send {
-                self.0.head(path)
-            }
+            fn head<'call>(&'call self, path: &'call Path) -> BoxFuture<'call, Result<FileMetadata>> {
+Box::pin(self.0.head(path))
+}
 
-            fn list(
-                &self,
-                folder: &Path,
-                depth: Depth,
-            ) -> impl Future<Output = Result<Vec<WalkEntry>>> + Send {
-                self.0.list(folder, depth)
-            }
+            fn list<'call>(&'call self, folder: &'call Path, depth: Depth) -> BoxFuture<'call, Result<Vec<WalkEntry>>> {
+Box::pin(self.0.list(folder, depth))
+}
 
-            fn put(
-                &self,
-                path: &Path,
-                bytes: &[u8],
-                condition: &Condition,
-            ) -> impl Future<Output = Result<RevisionToken>> + Send {
-                self.0.put(path, bytes, condition)
-            }
+            fn put<'call>(&'call self, path: &'call Path, bytes: &'call [u8], condition: &'call Condition) -> BoxFuture<'call, Result<RevisionToken>> {
+Box::pin(self.0.put(path, bytes, condition))
+}
 
             $($late)*
         }
@@ -78,53 +62,62 @@ forward_required!(RequiredOnly {} {});
 struct WithFolders(MemoryBucket);
 
 forward_required!(WithFolders {
-    fn create_folder(&self, path: &Path) -> impl Future<Output = Result<()>> + Send {
-        self.0.create_folder(path)
-    }
+    fn create_folder<'call>(&'call self, path: &'call Path) -> BoxFuture<'call, Result<()>> {
+Box::pin(self.0.create_folder(path))
+}
 } {
-    fn remove_folder(&self, path: &Path) -> impl Future<Output = Result<()>> + Send {
-        self.0.remove_folder(path)
-    }
+    fn remove_folder<'call>(&'call self, path: &'call Path) -> BoxFuture<'call, Result<()>> {
+Box::pin(self.0.remove_folder(path))
+}
 });
 
 /// A bucket whose file changes just before a delete under a token, so the token is stale.
 struct ChangesBeforeDelete(MemoryBucket);
 
 impl Bucket for ChangesBeforeDelete {
-    async fn delete(&self, path: &Path, condition: &Condition) -> Result<()> {
-        if matches!(*condition, Condition::Matches(_)) {
-            self.0.put(path, b"changed", &Condition::None).await?;
-        }
-        self.0.delete(path, condition).await
+    fn delete<'call>(
+        &'call self,
+        path: &'call Path,
+        condition: &'call Condition,
+    ) -> BoxFuture<'call, Result<()>> {
+        Box::pin(async move {
+            if matches!(*condition, Condition::Matches(_)) {
+                self.0.put(path, b"changed", &Condition::None).await?;
+            }
+            self.0.delete(path, condition).await
+        })
     }
 
-    fn get(&self, path: &Path) -> impl Future<Output = Result<(Vec<u8>, RevisionToken)>> + Send {
-        self.0.get(path)
+    fn get<'call>(
+        &'call self,
+        path: &'call Path,
+    ) -> BoxFuture<'call, Result<(Vec<u8>, RevisionToken)>> {
+        Box::pin(self.0.get(path))
     }
 
     fn guarantees(&self) -> Guarantees {
         self.0.guarantees()
     }
 
-    fn head(&self, path: &Path) -> impl Future<Output = Result<FileMetadata>> + Send {
-        self.0.head(path)
+    fn head<'call>(&'call self, path: &'call Path) -> BoxFuture<'call, Result<FileMetadata>> {
+        Box::pin(self.0.head(path))
     }
 
-    fn list(
-        &self,
-        folder: &Path,
+    fn list<'call>(
+        &'call self,
+        folder: &'call Path,
         depth: Depth,
-    ) -> impl Future<Output = Result<Vec<WalkEntry>>> + Send {
-        self.0.list(folder, depth)
+    ) -> BoxFuture<'call, Result<Vec<WalkEntry>>> {
+        Box::pin(self.0.list(folder, depth))
     }
 
-    fn put(
-        &self,
-        path: &Path,
-        bytes: &[u8],
-        condition: &Condition,
-    ) -> impl Future<Output = Result<RevisionToken>> + Send {
-        self.0.put(path, bytes, condition)
+    fn put<'call>(
+        &'call self,
+        path: &'call Path,
+        bytes: &'call [u8],
+        condition: &'call Condition,
+    ) -> BoxFuture<'call, Result<RevisionToken>> {
+        Box::pin(self.0.put(path, bytes, condition))
     }
 }
 
