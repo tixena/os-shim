@@ -608,6 +608,17 @@ async fn dyn_bucket_answers_on_the_server() {
 }
 
 #[cfg(minio_tests)]
+#[tokio::test(flavor = "current_thread")]
+async fn reachable_on_the_server_answers_for_the_bucket() {
+    let config = ready_config();
+    MinioBucket::new(config.clone()).reachable().await.unwrap();
+    let mut missing = config;
+    "os-shim-no-such-bucket".clone_into(&mut missing.bucket);
+    let answer = MinioBucket::new(missing).reachable().await;
+    assert_eq!(answer.unwrap_err().kind(), ErrorKind::NotFound);
+}
+
+#[cfg(minio_tests)]
 #[test]
 fn put_and_get_agrees_with_the_server() {
     assert_agree(

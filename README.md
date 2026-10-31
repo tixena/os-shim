@@ -82,7 +82,7 @@ bucket.delete(task, &Condition::Matches(second))?;
 assert_eq!(bucket.get(task).unwrap_err().kind(), ErrorKind::NotFound);
 ```
 
-The clients reach a server through AWS's SDK, `aws-sdk-s3`, and never retry a request:
+The clients reach a server through AWS's SDK, `aws-sdk-s3`, and send each request once unless `with_max_attempts` on the configuration allows more. A write or a delete repeated after the store applied it, with its answer lost, refuses itself: `Condition::Absent` ends in `AlreadyExists` and `Condition::Matches` in `PreconditionFailed`. A stream's `close` that repeats its completion can answer `NotFound` when the store no longer knows the upload, or `PreconditionFailed` under `Condition::Matches`.
 
 - `MinioBucket` (`minio`) talks to a server that speaks MinIO's API, such as MinIO or RustFS, with path-style addressing. Some of these servers ignore `If-Match` on a delete, so a conditional delete reads the object's tag first and sends `If-Match` as well.
 - `S3Bucket` (`s3`) talks to AWS S3, which checks `If-Match` on a delete itself.
@@ -104,7 +104,7 @@ let config = MinioConfig::new(
 let bucket = BlockingBucket::new(MinioBucket::new(config))?;
 ```
 
-`S3Config::new(region, bucket, access_key, secret_key)` builds an `S3Bucket` the same way. `with_prefix` on either configuration puts every key under a prefix. Both configurations print the secret key as `<redacted>` in `Debug`. `ensure` on either client creates the bucket when it does not exist; `S3Bucket::ensure` makes it private and takes an optional KMS key to encrypt it with.
+`S3Config::new(region, bucket, access_key, secret_key)` builds an `S3Bucket` the same way. `with_prefix` on either configuration puts every key under a prefix. Both configurations print the secret key as `<redacted>` in `Debug`. `ensure` on either client creates the bucket when it does not exist; `S3Bucket::ensure` makes it private and takes an optional KMS key to encrypt it with. `reachable` on either client sends one `HEAD` on the bucket: it answers `Ok` when the bucket answers, `NotFound` when the bucket does not exist and `Unavailable` when the server cannot be reached. `head` on `/` sends no request.
 
 `BlockingBucket` runs each call on a tokio runtime of its own, so synchronous code needs no runtime; calling it from inside a tokio runtime panics. The `Bucket` trait itself is public and asynchronous code awaits the clients directly. A bucket example:
 

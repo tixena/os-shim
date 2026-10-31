@@ -70,6 +70,7 @@ async fn streams_and_removals(store: &dyn Bucket, folder: &Path) -> Result<()> {
 
 /// Every method but `guarantees`, through `dyn`, in `folder`.
 pub(super) async fn every_method(store: &dyn Bucket, folder: &Path) -> Result<()> {
+    store.reachable().await?;
     writes_and_reads(store, folder).await?;
     moves_and_lists(store, folder).await?;
     streams_and_removals(store, folder).await

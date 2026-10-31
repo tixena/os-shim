@@ -188,6 +188,20 @@ macro_rules! declare_bucket {
                 condition: &'call Condition,
             ) -> BoxFuture<'call, Result<RevisionToken>>;
 
+            /// Ask the store whether it answers.
+            ///
+            /// Default: `list` on `/`, with the entries dropped.
+            ///
+            /// # Errors
+            ///
+            /// `Unavailable` when the store cannot be reached, `PermissionDenied` when
+            /// it refuses the request, `NotFound` when its bucket does not exist. The
+            /// errors of `list` by default.
+            #[inline]
+            fn reachable(&self) -> BoxFuture<'_, Result<()>> {
+                Box::pin(async move { self.list(Path::new("/"), Depth::Children).await.map(drop) })
+            }
+
             /// A reader over the file at `path`.
             ///
             /// Default: `get`, then a reader over the bytes.
