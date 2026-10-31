@@ -2,6 +2,8 @@
 
 #![cfg(any(feature = "minio", feature = "s3"))]
 
+#[cfg(feature = "minio")]
+use super::SdkBucket;
 use super::paths::key_of;
 use super::streams::{COPY_MAX_BYTES, COPY_MIN_BYTES, copy_ranges};
 use super::{
@@ -15,10 +17,22 @@ use crate::WalkEntry;
 use crate::error::{ErrorKind, StorageError};
 use alloc::sync::Arc;
 #[cfg(feature = "minio")]
+use aws_sdk_s3::Client;
+#[cfg(any(feature = "minio", feature = "s3"))]
+use aws_sdk_s3::{
+    Config,
+    config::{
+        AsyncSleep, Builder as ConfigBuilder, Sleep, StalledStreamProtectionConfig,
+        timeout::TimeoutConfig,
+    },
+};
+#[cfg(feature = "minio")]
 use aws_sdk_s3::{error::SdkError, operation::get_object::GetObjectError};
+#[cfg(any(feature = "minio", feature = "s3"))]
+use core::future::ready;
 #[cfg(feature = "minio")]
 use core::sync::atomic::{AtomicUsize, Ordering};
-#[cfg(feature = "minio")]
+#[cfg(any(feature = "minio", feature = "s3"))]
 use core::time::Duration;
 #[cfg(feature = "minio")]
 use core::{error::Error, iter};
@@ -112,6 +126,18 @@ impl Subscriber for CountsErrors {
     fn record(&self, _span: &Id, _values: &Record<'_>) {}
 
     fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+}
+
+/// A sleep that ends at once, so a test of retries waits on no clock.
+#[cfg(any(feature = "minio", feature = "s3"))]
+#[derive(Debug)]
+struct NoWait;
+
+#[cfg(any(feature = "minio", feature = "s3"))]
+impl AsyncSleep for NoWait {
+    fn sleep(&self, _duration: Duration) -> Sleep {
+        Sleep::new(ready(()))
+    }
 }
 
 /// The paths of `entries`.
@@ -2413,4 +2439,276 @@ fn an_s3_bucket_fits_a_dyn_field() {
             .guarantees()
             .contains(super::Guarantee::ConditionalDeleteInOneStep)
     );
+}
+
+/// `builder` with every timer off but the wait between attempts, which `NoWait` ends at once.
+#[cfg(any(feature = "minio", feature = "s3"))]
+fn without_waits(builder: ConfigBuilder) -> Config {
+    builder
+        .timeout_config(TimeoutConfig::disabled())
+        .stalled_stream_protection(StalledStreamProtectionConfig::disabled())
+        .sleep_impl(NoWait)
+        .build()
+}
+
+/// A `MinIO` client for `endpoint` that sends each request up to `attempts` times, with no wait.
+#[cfg(feature = "minio")]
+fn minio_repeating_async(endpoint: String, attempts: u32) -> MinioBucket {
+    let bucket = MinioBucket::new(minio_config(endpoint).with_max_attempts(attempts));
+    let client = Client::from_conf(without_waits(bucket.0.client.config().to_builder()));
+    MinioBucket(SdkBucket { client, ..bucket.0 })
+}
+
+/// The blocking form of `minio_repeating_async`.
+#[cfg(feature = "minio")]
+fn minio_repeating(endpoint: String, attempts: u32) -> BlockingBucket<MinioBucket> {
+    BlockingBucket::new(minio_repeating_async(endpoint, attempts)).unwrap()
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_get_repeats_a_503_up_to_max_attempts_and_gives_the_bytes() {
+    let unavailable = answer("503 Service Unavailable", "", "");
+    let (endpoint, seen) = canned(vec![
+        unavailable.clone(),
+        unavailable,
+        answer("200 OK", "ETag: \"b\"\r\n", "x"),
+    ]);
+    let (bytes, tag) = minio_repeating(endpoint, 3)
+        .get(Path::new("/task.md"))
+        .unwrap();
+    assert_eq!((bytes, tag), (b"x".to_vec(), RevisionToken::new("\"b\"")));
+    assert_eq!(
+        requests(&seen),
+        ["GET if-match=-", "GET if-match=-", "GET if-match=-"]
+    );
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_get_stops_at_max_attempts_and_is_unavailable() {
+    let unavailable = answer("503 Service Unavailable", "", "");
+    let (endpoint, seen) = canned(vec![unavailable; 4]);
+    let error = minio_repeating(endpoint, 3)
+        .get(Path::new("/task.md"))
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Unavailable);
+    assert_eq!(
+        requests(&seen),
+        ["GET if-match=-", "GET if-match=-", "GET if-match=-"]
+    );
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_zero_attempts_sends_one_request() {
+    let unavailable = answer("503 Service Unavailable", "", "");
+    let (endpoint, seen) = canned(vec![unavailable.clone(), unavailable]);
+    let error = minio_repeating(endpoint, 0)
+        .get(Path::new("/task.md"))
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Unavailable);
+    assert_eq!(requests(&seen), ["GET if-match=-"]);
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_get_answered_403_is_not_repeated() {
+    let forbidden = answer("403 Forbidden", "", "");
+    let (endpoint, seen) = canned(vec![forbidden.clone(), forbidden]);
+    let error = minio_repeating(endpoint, 3)
+        .get(Path::new("/task.md"))
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+    assert_eq!(requests(&seen), ["GET if-match=-"]);
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_put_with_absent_repeated_after_a_503_and_answered_412_is_already_exists() {
+    let (endpoint, seen) = canned(vec![
+        empty_page(),
+        answer("503 Service Unavailable", "", ""),
+        answer("412 Precondition Failed", "", ""),
+    ]);
+    let error = minio_repeating(endpoint, 3)
+        .put(Path::new("/task.md"), b"x", &Condition::Absent)
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::AlreadyExists);
+    assert_eq!(
+        requests(&seen),
+        [
+            "GET if-match=-",
+            "PUT if-match=- if-none-match=*",
+            "PUT if-match=- if-none-match=*"
+        ]
+    );
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_put_with_matches_repeated_after_a_503_and_answered_412_is_precondition_failed() {
+    let (endpoint, seen) = canned(vec![
+        empty_page(),
+        answer("503 Service Unavailable", "", ""),
+        answer("412 Precondition Failed", "", ""),
+    ]);
+    let token = RevisionToken::new("\"a\"");
+    let error = minio_repeating(endpoint, 3)
+        .put(Path::new("/task.md"), b"x", &Condition::Matches(token))
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::PreconditionFailed);
+    assert_eq!(
+        requests(&seen),
+        ["GET if-match=-", "PUT if-match=\"a\"", "PUT if-match=\"a\""]
+    );
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_delete_with_matches_repeated_after_a_503_and_answered_404_is_precondition_failed() {
+    let (endpoint, seen) = canned(vec![
+        answer("200 OK", "ETag: \"a\"\r\n", ""),
+        answer("503 Service Unavailable", "", ""),
+        answer("404 Not Found", "", ""),
+        answer("404 Not Found", "", ""),
+        answer("200 OK", "", ""),
+        empty_page(),
+    ]);
+    let token = RevisionToken::new("\"a\"");
+    let error = minio_repeating(endpoint, 3)
+        .delete(Path::new("/task.md"), &Condition::Matches(token))
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::PreconditionFailed);
+    assert_eq!(
+        requests(&seen),
+        [
+            "HEAD if-match=-",
+            "DELETE if-match=\"a\"",
+            "DELETE if-match=\"a\"",
+            "HEAD if-match=-",
+            "HEAD if-match=-",
+            "GET if-match=-"
+        ]
+    );
+}
+
+#[cfg(feature = "minio")]
+#[tokio::test(flavor = "current_thread")]
+async fn minio_write_stream_completion_repeated_after_a_503_and_answered_404_aborts_the_upload() {
+    for (condition, kind) in [
+        (Condition::None, ErrorKind::NotFound),
+        (Condition::Absent, ErrorKind::NotFound),
+        (
+            Condition::Matches(RevisionToken::new("\"old\"")),
+            ErrorKind::PreconditionFailed,
+        ),
+    ] {
+        let (endpoint, seen) = canned(vec![
+            empty_page(),
+            upload_started(),
+            part_stored("p1"),
+            part_stored("p2"),
+            answer("503 Service Unavailable", "", ""),
+            answer("404 Not Found", "", ""),
+            answer("204 No Content", "", ""),
+        ]);
+        let bucket = minio_repeating_async(endpoint, 3);
+        let mut writer = bucket
+            .write_stream(Path::new(BIG), condition)
+            .await
+            .unwrap();
+        writer.write_all(&vec![7_u8; PART + 1]).await.unwrap();
+        let error = writer.close().await.unwrap_err();
+        assert_eq!(StorageError::from(error).kind(), kind);
+        let sent = requests(&seen);
+        assert_eq!(
+            sent.iter().filter(|line| line.starts_with("POST")).count(),
+            3,
+            "{sent:?}"
+        );
+        assert_eq!(sent.last().unwrap(), "DELETE if-match=-");
+    }
+}
+
+#[cfg(feature = "s3")]
+#[test]
+fn s3_get_repeats_a_503_up_to_max_attempts_and_gives_the_bytes() {
+    let unavailable = answer("503 Service Unavailable", "", "");
+    let (endpoint, seen) = canned(vec![
+        unavailable.clone(),
+        unavailable,
+        answer("200 OK", "ETag: \"b\"\r\n", "x"),
+    ]);
+    let sdk = without_waits(
+        S3Bucket::sdk_config(s3_config().with_max_attempts(3))
+            .endpoint_url(endpoint)
+            .force_path_style(true),
+    );
+    let bucket = BlockingBucket::new(S3Bucket::with_sdk_config(
+        "archie".to_owned(),
+        String::new(),
+        sdk,
+    ))
+    .unwrap();
+    let (bytes, _tag) = bucket.get(Path::new("/task.md")).unwrap();
+    assert_eq!(bytes, b"x");
+    assert_eq!(
+        requests(&seen),
+        ["GET if-match=-", "GET if-match=-", "GET if-match=-"]
+    );
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_config_debug_prints_max_attempts() {
+    let config = minio_config("http://127.0.0.1:9000".to_owned()).with_max_attempts(3);
+    assert!(format!("{config:?}").contains("max_attempts: 3"));
+}
+
+#[cfg(feature = "s3")]
+#[test]
+fn s3_config_debug_prints_max_attempts() {
+    let config = s3_config().with_max_attempts(3);
+    assert!(format!("{config:?}").contains("max_attempts: 3"));
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_reachable_sends_one_head_on_the_bucket() {
+    let (endpoint, _seen, targets) = canned_with_targets(vec![answer("200 OK", "", "")]);
+    minio(endpoint).reachable().unwrap();
+    assert_eq!(requests(&targets), ["HEAD /archie/"]);
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_reachable_with_nothing_listening_is_unavailable() {
+    let error = minio("http://127.0.0.1:9".to_owned())
+        .reachable()
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Unavailable);
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_reachable_answers_with_the_kind_of_each_refusal() {
+    for (status, kind) in [
+        ("404 Not Found", ErrorKind::NotFound),
+        ("403 Forbidden", ErrorKind::PermissionDenied),
+        ("503 Service Unavailable", ErrorKind::Unavailable),
+    ] {
+        let (endpoint, seen) = canned(vec![answer(status, "", "")]);
+        let error = minio(endpoint).reachable().unwrap_err();
+        assert_eq!(error.kind(), kind, "{status}");
+        assert_eq!(requests(&seen), ["HEAD if-match=-"], "{status}");
+    }
+}
+
+#[cfg(feature = "s3")]
+#[test]
+fn s3_reachable_sends_one_head_on_the_bucket() {
+    let (endpoint, _seen, targets) = canned_with_targets(vec![answer("200 OK", "", "")]);
+    s3(&endpoint).reachable().unwrap();
+    assert_eq!(requests(&targets), ["HEAD /archie/"]);
 }

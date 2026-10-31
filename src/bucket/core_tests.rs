@@ -2,11 +2,11 @@
 //! bodies on a bucket that implements only what the trait requires.
 
 use super::{Bucket, Clock, Condition, Depth, Guarantee, Guarantees, MemoryBucket, RevisionToken};
-use crate::error::{Result, StorageError};
+use crate::error::{ErrorKind, Result, StorageError};
 use crate::{BoxFuture, FileMetadata, WalkEntry};
 use alloc::sync::Arc;
 use core::error::Error;
-use core::future::poll_fn;
+use core::future::{poll_fn, ready};
 use core::pin::Pin;
 use core::result;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -52,6 +52,51 @@ Box::pin(self.0.put(path, bytes, condition))
 
 /// What a scenario saw, line by line, or why it could not go on.
 pub(super) type Observed = result::Result<Vec<String>, Box<dyn Error>>;
+
+/// A bucket whose `list` is refused, so the default `reachable` has an error to give.
+struct ListRefused(MemoryBucket);
+
+impl Bucket for ListRefused {
+    fn delete<'call>(
+        &'call self,
+        path: &'call Path,
+        condition: &'call Condition,
+    ) -> BoxFuture<'call, Result<()>> {
+        Box::pin(self.0.delete(path, condition))
+    }
+
+    fn get<'call>(
+        &'call self,
+        path: &'call Path,
+    ) -> BoxFuture<'call, Result<(Vec<u8>, RevisionToken)>> {
+        Box::pin(self.0.get(path))
+    }
+
+    fn guarantees(&self) -> Guarantees {
+        self.0.guarantees()
+    }
+
+    fn head<'call>(&'call self, path: &'call Path) -> BoxFuture<'call, Result<FileMetadata>> {
+        Box::pin(self.0.head(path))
+    }
+
+    fn list<'call>(
+        &'call self,
+        _folder: &'call Path,
+        _depth: Depth,
+    ) -> BoxFuture<'call, Result<Vec<WalkEntry>>> {
+        Box::pin(ready(Err(StorageError::from_kind(ErrorKind::Unavailable))))
+    }
+
+    fn put<'call>(
+        &'call self,
+        path: &'call Path,
+        bytes: &'call [u8],
+        condition: &'call Condition,
+    ) -> BoxFuture<'call, Result<RevisionToken>> {
+        Box::pin(self.0.put(path, bytes, condition))
+    }
+}
 
 /// A bucket that implements only the required methods, so every other method is the trait's default.
 struct RequiredOnly(MemoryBucket);
@@ -750,4 +795,18 @@ fn a_set_holds_each_of_the_sixteen_guarantees_and_only_those_it_was_given() {
             every.map(|guarantee| guarantee == alone)
         );
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn reachable_by_default_answers_ok_when_list_answers() -> Result<()> {
+    RequiredOnly(MemoryBucket::default()).reachable().await
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn reachable_by_default_gives_the_error_of_list() {
+    let answer = ListRefused(MemoryBucket::default()).reachable().await;
+    assert_eq!(
+        answer.map_err(|error| error.kind()),
+        Err(ErrorKind::Unavailable)
+    );
 }

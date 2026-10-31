@@ -90,9 +90,12 @@
 //!
 //! # Things that bite
 //!
-//! - The clients never retry. A network failure, a timeout or a 5xx is an
-//!   [`ErrorKind::Unavailable`] error, a refused request is
+//! - The clients send each request once unless `with_max_attempts` on their
+//!   configuration allows more. A network failure, a timeout or a 5xx that is
+//!   left is an [`ErrorKind::Unavailable`] error, a refused request is
 //!   [`ErrorKind::PermissionDenied`], and the caller decides what to do.
+//! - `head` on `/` sends no request and answers a folder, even with the store
+//!   down. `reachable` sends one.
 //! - On `MinioBucket` and `S3Bucket` a folder is an empty object whose key ends
 //!   in `/`. `create_folder` writes one per level, and a put needs its parent
 //!   folder, so every put also lists. A folder another program made only by
@@ -245,6 +248,11 @@ where
         condition: &'call Condition,
     ) -> BoxFuture<'call, Result<RevisionToken>> {
         (**self).put(path, bytes, condition)
+    }
+
+    #[inline]
+    fn reachable(&self) -> BoxFuture<'_, Result<()>> {
+        (**self).reachable()
     }
 
     #[inline]
@@ -692,6 +700,20 @@ impl<B: Bucket> BlockingBucket<B> {
     pub fn put(&self, path: &Path, bytes: &[u8], condition: &Condition) -> Result<RevisionToken> {
         self.runtime
             .block_on(self.bucket.put(path, bytes, condition))
+    }
+
+    /// Ask the store whether it answers.
+    ///
+    /// # Errors
+    ///
+    /// The errors of `Bucket::reachable`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from inside a tokio runtime.
+    #[inline]
+    pub fn reachable(&self) -> Result<()> {
+        self.runtime.block_on(self.bucket.reachable())
     }
 
     /// Remove `path` and everything below it.
@@ -1265,6 +1287,14 @@ impl SdkBucket {
             .ok_or_else(missing_etag)
     }
 
+    /// One `HEAD` on the bucket: `NotFound` when the bucket does not exist.
+    async fn reachable(&self) -> Result<()> {
+        if self.bucket_exists().await? {
+            return Ok(());
+        }
+        Err(StorageError::from_kind(ErrorKind::NotFound))
+    }
+
     /// `Ok` unless a folder is at `path` or a file above it, which a delete refuses.
     async fn refuse_folder(&self, path: &Path) -> Result<()> {
         let absence = self.absence(path).await?;
@@ -1373,6 +1403,8 @@ pub struct MinioConfig {
     pub access_key: String,
     pub bucket: String,
     pub endpoint: String,
+    /// How many times a client sends a request, at least once.
+    pub max_attempts: u32,
     /// What every key starts with, before its first `/`.
     pub prefix: Option<String>,
     pub region: String,
@@ -1395,10 +1427,26 @@ impl MinioConfig {
             access_key,
             bucket,
             endpoint,
+            max_attempts: 1,
             prefix: None,
             region,
             secret_key,
         }
+    }
+
+    /// The same configuration with each request sent up to `attempts` times, with the SDK's
+    /// standard wait between them. A network failure, a timeout, a throttling answer and a 5xx
+    /// repeat; `0` and `1` send each request once.
+    ///
+    /// A write or a delete repeated after the store applied it, with its answer lost, refuses
+    /// itself: `Condition::Absent` ends in `AlreadyExists` and `Condition::Matches` in
+    /// `PreconditionFailed`. A stream's `close` that repeats its completion can answer `NotFound`
+    /// when the store no longer knows the upload, or `PreconditionFailed` under `Condition::Matches`.
+    #[inline]
+    #[must_use]
+    pub const fn with_max_attempts(mut self, attempts: u32) -> Self {
+        self.max_attempts = attempts;
+        self
     }
 
     /// The same configuration with every key under `prefix`; a trailing `/` is dropped.
@@ -1421,6 +1469,7 @@ impl fmt::Debug for MinioConfig {
             .field("access_key", &self.access_key)
             .field("bucket", &self.bucket)
             .field("endpoint", &self.endpoint)
+            .field("max_attempts", &self.max_attempts)
             .field("prefix", &self.prefix)
             .field("region", &self.region)
             .field("secret_key", &"<redacted>")
@@ -1472,7 +1521,7 @@ impl MinioBucket {
             .map_err(classify)
     }
 
-    /// A client for `config.bucket` on `config.endpoint`, with path-style addressing and no retries.
+    /// A client for `config.bucket` on `config.endpoint`, with path-style addressing and the attempts `config` allows.
     #[inline]
     #[must_use]
     pub fn new(config: MinioConfig) -> Self {
@@ -1482,7 +1531,7 @@ impl MinioBucket {
             .behavior_version(BehaviorVersion::latest())
             .region(Region::new(config.region))
             .credentials_provider(credentials)
-            .retry_config(RetryConfig::disabled())
+            .retry_config(retry_config(config.max_attempts))
             .endpoint_url(config.endpoint)
             .force_path_style(true)
             .build();
@@ -1576,6 +1625,11 @@ impl Bucket for MinioBucket {
     }
 
     #[inline]
+    fn reachable(&self) -> BoxFuture<'_, Result<()>> {
+        Box::pin(self.0.reachable())
+    }
+
+    #[inline]
     fn read_stream<'bucket, 'call>(
         &'bucket self,
         path: &'call Path,
@@ -1624,6 +1678,8 @@ impl Bucket for MinioBucket {
 pub struct S3Config {
     pub access_key: String,
     pub bucket: String,
+    /// How many times a client sends a request, at least once.
+    pub max_attempts: u32,
     /// What every key starts with, before its first `/`.
     pub prefix: Option<String>,
     pub region: String,
@@ -1644,10 +1700,26 @@ impl S3Config {
         Self {
             access_key,
             bucket,
+            max_attempts: 1,
             prefix: None,
             region,
             secret_key,
         }
+    }
+
+    /// The same configuration with each request sent up to `attempts` times, with the SDK's
+    /// standard wait between them. A network failure, a timeout, a throttling answer and a 5xx
+    /// repeat; `0` and `1` send each request once.
+    ///
+    /// A write or a delete repeated after the store applied it, with its answer lost, refuses
+    /// itself: `Condition::Absent` ends in `AlreadyExists` and `Condition::Matches` in
+    /// `PreconditionFailed`. A stream's `close` that repeats its completion can answer `NotFound`
+    /// when the store no longer knows the upload, or `PreconditionFailed` under `Condition::Matches`.
+    #[inline]
+    #[must_use]
+    pub const fn with_max_attempts(mut self, attempts: u32) -> Self {
+        self.max_attempts = attempts;
+        self
     }
 
     /// The same configuration with every key under `prefix`; a trailing `/` is dropped.
@@ -1669,6 +1741,7 @@ impl fmt::Debug for S3Config {
         f.debug_struct("S3Config")
             .field("access_key", &self.access_key)
             .field("bucket", &self.bucket)
+            .field("max_attempts", &self.max_attempts)
             .field("prefix", &self.prefix)
             .field("region", &self.region)
             .field("secret_key", &"<redacted>")
@@ -1685,7 +1758,7 @@ impl fmt::Debug for S3Config {
 /// program made only by writing keys below it disappears with its last key.
 ///
 /// Available with the `s3` feature. It uses a fixed access key and secret key
-/// and never retries. It implements `Bucket`; wrap it in [`BlockingBucket`] for
+/// and sends the attempts its configuration allows. It implements `Bucket`; wrap it in [`BlockingBucket`] for
 /// synchronous code.
 #[cfg(feature = "s3")]
 #[derive(Debug)]
@@ -1754,7 +1827,7 @@ impl S3Bucket {
             .map_err(classify)
     }
 
-    /// A client for `config.bucket` in `config.region`, with no retries.
+    /// A client for `config.bucket` in `config.region`, with the attempts `config` allows.
     #[inline]
     #[must_use]
     pub fn new(config: S3Config) -> Self {
@@ -1774,7 +1847,7 @@ impl S3Bucket {
             .behavior_version(BehaviorVersion::latest())
             .region(Region::new(config.region))
             .credentials_provider(credentials)
-            .retry_config(RetryConfig::disabled())
+            .retry_config(retry_config(config.max_attempts))
     }
 
     /// A client for `bucket`, with every key under `prefix`, over the SDK configuration `sdk`.
@@ -1868,6 +1941,11 @@ impl Bucket for S3Bucket {
         condition: &'call Condition,
     ) -> BoxFuture<'call, Result<RevisionToken>> {
         Box::pin(self.0.put(path, bytes, condition))
+    }
+
+    #[inline]
+    fn reachable(&self) -> BoxFuture<'_, Result<()>> {
+        Box::pin(self.0.reachable())
     }
 
     #[inline]
@@ -1985,6 +2063,12 @@ fn for_condition(error: StorageError, condition: &Condition) -> StorageError {
         }
         _ => error,
     }
+}
+
+/// The SDK's standard retries, up to `max_attempts` sends of a request. One send is no retry.
+#[cfg(any(feature = "minio", feature = "s3"))]
+fn retry_config(max_attempts: u32) -> RetryConfig {
+    RetryConfig::standard().with_max_attempts(max_attempts.max(1))
 }
 
 /// `text` with every byte outside `A-Z a-z 0-9 - _ . ~ /` written as `%` and two hex digits.
