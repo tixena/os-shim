@@ -2,7 +2,7 @@
 
 use super::{Bucket, Condition, Depth, Guarantee, Guarantees, RevisionToken};
 use crate::error::{ErrorKind, Result, StorageError};
-use crate::{FileMetadata, WalkEntry};
+use crate::{BoxFuture, FileMetadata, WalkEntry};
 use core::future::poll_fn;
 use core::pin::Pin;
 use core::task::{Context, Poll};
@@ -67,48 +67,55 @@ impl AsyncWrite for DiskWriter {
 
 impl Bucket for DiskBucket {
     #[inline]
-    fn append(
-        &self,
-        path: &Path,
-        more: &[u8],
-    ) -> impl Future<Output = Result<RevisionToken>> + Send {
-        on_first_poll(move || append_now(path, more))
+    fn append<'call>(
+        &'call self,
+        path: &'call Path,
+        more: &'call [u8],
+    ) -> BoxFuture<'call, Result<RevisionToken>> {
+        Box::pin(on_first_poll(move || append_now(path, more)))
     }
 
     #[inline]
-    fn append_stream<'bucket>(
+    fn append_stream<'bucket, 'call>(
         &'bucket self,
-        path: &Path,
-    ) -> impl Future<Output = Result<Box<dyn AsyncWrite + Send + Unpin + 'bucket>>> + Send {
-        on_first_poll(move || {
+        path: &'call Path,
+    ) -> BoxFuture<'call, Result<Box<dyn AsyncWrite + Send + Unpin + 'bucket>>>
+    where
+        'bucket: 'call,
+    {
+        Box::pin(on_first_poll(move || {
             let file = OpenOptions::new().create(true).append(true).open(path)?;
             let writer: Box<dyn AsyncWrite + Send + Unpin + 'bucket> = Box::new(DiskWriter(file));
             Ok(writer)
-        })
+        }))
     }
 
     #[inline]
-    fn canonicalize(&self, path: &Path) -> impl Future<Output = Result<PathBuf>> + Send {
-        on_first_poll(move || Ok(fs::canonicalize(path)?))
+    fn canonicalize<'call>(&'call self, path: &'call Path) -> BoxFuture<'call, Result<PathBuf>> {
+        Box::pin(on_first_poll(move || Ok(fs::canonicalize(path)?)))
     }
 
     #[inline]
-    fn copy(&self, from: &Path, to: &Path) -> impl Future<Output = Result<u64>> + Send {
-        on_first_poll(move || Ok(fs::copy(from, to)?))
+    fn copy<'call>(
+        &'call self,
+        from: &'call Path,
+        to: &'call Path,
+    ) -> BoxFuture<'call, Result<u64>> {
+        Box::pin(on_first_poll(move || Ok(fs::copy(from, to)?)))
     }
 
     #[inline]
-    fn create_folder(&self, path: &Path) -> impl Future<Output = Result<()>> + Send {
-        on_first_poll(move || Ok(fs::create_dir_all(path)?))
+    fn create_folder<'call>(&'call self, path: &'call Path) -> BoxFuture<'call, Result<()>> {
+        Box::pin(on_first_poll(move || Ok(fs::create_dir_all(path)?)))
     }
 
     #[inline]
-    fn delete(
-        &self,
-        path: &Path,
-        condition: &Condition,
-    ) -> impl Future<Output = Result<()>> + Send {
-        on_first_poll(move || {
+    fn delete<'call>(
+        &'call self,
+        path: &'call Path,
+        condition: &'call Condition,
+    ) -> BoxFuture<'call, Result<()>> {
+        Box::pin(on_first_poll(move || {
             refuse_folder(path)?;
             match condition.clone() {
                 Condition::Absent => match fs::symlink_metadata(path) {
@@ -122,16 +129,19 @@ impl Bucket for DiskBucket {
                     _ => Ok(()),
                 },
             }
-        })
+        }))
     }
 
     #[inline]
-    fn get(&self, path: &Path) -> impl Future<Output = Result<(Vec<u8>, RevisionToken)>> + Send {
-        on_first_poll(move || {
+    fn get<'call>(
+        &'call self,
+        path: &'call Path,
+    ) -> BoxFuture<'call, Result<(Vec<u8>, RevisionToken)>> {
+        Box::pin(on_first_poll(move || {
             let bytes = fs::read(path)?;
             let token = token_of(&bytes);
             Ok((bytes, token))
-        })
+        }))
     }
 
     /// What the disk promises, with two limits.
@@ -160,8 +170,8 @@ impl Bucket for DiskBucket {
     }
 
     #[inline]
-    fn head(&self, path: &Path) -> impl Future<Output = Result<FileMetadata>> + Send {
-        on_first_poll(move || {
+    fn head<'call>(&'call self, path: &'call Path) -> BoxFuture<'call, Result<FileMetadata>> {
+        Box::pin(on_first_poll(move || {
             let metadata = fs::metadata(path)?;
             Ok(FileMetadata::new(
                 metadata.is_dir(),
@@ -170,26 +180,26 @@ impl Bucket for DiskBucket {
                 Some(metadata.modified()?),
                 None,
             ))
-        })
+        }))
     }
 
     #[inline]
-    fn list(
-        &self,
-        folder: &Path,
+    fn list<'call>(
+        &'call self,
+        folder: &'call Path,
         depth: Depth,
-    ) -> impl Future<Output = Result<Vec<WalkEntry>>> + Send {
-        on_first_poll(move || list_now(folder, depth))
+    ) -> BoxFuture<'call, Result<Vec<WalkEntry>>> {
+        Box::pin(on_first_poll(move || list_now(folder, depth)))
     }
 
     #[inline]
-    fn put(
-        &self,
-        path: &Path,
-        bytes: &[u8],
-        condition: &Condition,
-    ) -> impl Future<Output = Result<RevisionToken>> + Send {
-        on_first_poll(move || {
+    fn put<'call>(
+        &'call self,
+        path: &'call Path,
+        bytes: &'call [u8],
+        condition: &'call Condition,
+    ) -> BoxFuture<'call, Result<RevisionToken>> {
+        Box::pin(on_first_poll(move || {
             refuse_folder(path)?;
             match condition.clone() {
                 Condition::Absent => create_new_with(path, bytes),
@@ -202,53 +212,65 @@ impl Bucket for DiskBucket {
                     Ok(token_of(bytes))
                 }
             }
-        })
+        }))
     }
 
     #[inline]
-    fn read_stream<'bucket>(
+    fn read_stream<'bucket, 'call>(
         &'bucket self,
-        path: &Path,
-    ) -> impl Future<Output = Result<Box<dyn AsyncRead + Send + Unpin + 'bucket>>> + Send {
-        on_first_poll(move || {
+        path: &'call Path,
+    ) -> BoxFuture<'call, Result<Box<dyn AsyncRead + Send + Unpin + 'bucket>>>
+    where
+        'bucket: 'call,
+    {
+        Box::pin(on_first_poll(move || {
             let reader: Box<dyn AsyncRead + Send + Unpin + 'bucket> =
                 Box::new(DiskReader(File::open(path)?));
             Ok(reader)
-        })
+        }))
     }
 
     #[inline]
-    fn remove_folder(&self, path: &Path) -> impl Future<Output = Result<()>> + Send {
-        on_first_poll(move || Ok(fs::remove_dir_all(path)?))
+    fn remove_folder<'call>(&'call self, path: &'call Path) -> BoxFuture<'call, Result<()>> {
+        Box::pin(on_first_poll(move || Ok(fs::remove_dir_all(path)?)))
     }
 
     #[inline]
-    fn rename(&self, from: &Path, to: &Path) -> impl Future<Output = Result<()>> + Send {
-        on_first_poll(move || match fs::rename(from, to) {
+    fn rename<'call>(
+        &'call self,
+        from: &'call Path,
+        to: &'call Path,
+    ) -> BoxFuture<'call, Result<()>> {
+        Box::pin(on_first_poll(move || match fs::rename(from, to) {
             Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => {
                 Err(StorageError::new(ErrorKind::AlreadyExists, error))
             }
             other => Ok(other?),
-        })
+        }))
     }
 
     #[inline]
-    fn walk(
-        &self,
-        folder: &Path,
+    fn walk<'call>(
+        &'call self,
+        folder: &'call Path,
         follow_links: bool,
         hidden: bool,
-    ) -> impl Future<Output = Result<Vec<WalkEntry>>> + Send {
-        on_first_poll(move || walk_now(folder, follow_links, hidden))
+    ) -> BoxFuture<'call, Result<Vec<WalkEntry>>> {
+        Box::pin(on_first_poll(move || {
+            walk_now(folder, follow_links, hidden)
+        }))
     }
 
     #[inline]
-    fn write_stream<'bucket>(
+    fn write_stream<'bucket, 'call>(
         &'bucket self,
-        path: &Path,
+        path: &'call Path,
         condition: Condition,
-    ) -> impl Future<Output = Result<Box<dyn AsyncWrite + Send + Unpin + 'bucket>>> + Send {
-        on_first_poll(move || {
+    ) -> BoxFuture<'call, Result<Box<dyn AsyncWrite + Send + Unpin + 'bucket>>>
+    where
+        'bucket: 'call,
+    {
+        Box::pin(on_first_poll(move || {
             refuse_folder(path)?;
             let file = match condition.clone() {
                 Condition::Absent => OpenOptions::new().write(true).create_new(true).open(path)?,
@@ -257,7 +279,7 @@ impl Bucket for DiskBucket {
             };
             let writer: Box<dyn AsyncWrite + Send + Unpin + 'bucket> = Box::new(DiskWriter(file));
             Ok(writer)
-        })
+        }))
     }
 }
 

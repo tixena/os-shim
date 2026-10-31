@@ -118,7 +118,7 @@ let token = bucket.put(Path::new("/notes/a.md"), b"a", &Condition::None).await?;
 assert_eq!(bucket.get(Path::new("/notes/a.md")).await?.1, token);
 ```
 
-`Bucket` is not `dyn`-compatible: a program that picks its backend at run time builds the concrete client in each branch.
+A program that picks its backend at run time holds an `Arc<dyn Bucket>`.
 
 ### What each backend promises
 

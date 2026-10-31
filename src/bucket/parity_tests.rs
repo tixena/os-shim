@@ -598,6 +598,16 @@ fn status<T, E>(answer: &result::Result<T, SdkError<E>>) -> String {
 }
 
 #[cfg(minio_tests)]
+#[tokio::test(flavor = "current_thread")]
+async fn dyn_bucket_answers_on_the_server() {
+    let store = MinioBucket::new(ready_config());
+    let as_dyn: &dyn Bucket = &store;
+    super::dyn_tests::every_method(as_dyn, Path::new("/dyn-bucket"))
+        .await
+        .unwrap();
+}
+
+#[cfg(minio_tests)]
 #[test]
 fn put_and_get_agrees_with_the_server() {
     assert_agree(

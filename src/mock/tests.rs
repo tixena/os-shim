@@ -1,4 +1,5 @@
 use super::*;
+use crate::BoxFuture;
 use crate::bucket::{Condition, Depth, MemoryBucket};
 use crate::error::ErrorKind;
 use crate::streams::{close, read_to_end, write_all};
@@ -16,50 +17,56 @@ struct CountingBucket {
 }
 
 impl Bucket for CountingBucket {
-    fn delete(
-        &self,
-        path: &Path,
-        condition: &Condition,
-    ) -> impl Future<Output = Result<()>> + Send {
-        self.inner.delete(path, condition)
+    fn delete<'call>(
+        &'call self,
+        path: &'call Path,
+        condition: &'call Condition,
+    ) -> BoxFuture<'call, Result<()>> {
+        Box::pin(self.inner.delete(path, condition))
     }
 
-    fn get(&self, path: &Path) -> impl Future<Output = Result<(Vec<u8>, RevisionToken)>> + Send {
+    fn get<'call>(
+        &'call self,
+        path: &'call Path,
+    ) -> BoxFuture<'call, Result<(Vec<u8>, RevisionToken)>> {
         self.gets.fetch_add(1, Ordering::SeqCst);
-        self.inner.get(path)
+        Box::pin(self.inner.get(path))
     }
 
     fn guarantees(&self) -> Guarantees {
         self.inner.guarantees()
     }
 
-    fn head(&self, path: &Path) -> impl Future<Output = Result<FileMetadata>> + Send {
-        self.inner.head(path)
+    fn head<'call>(&'call self, path: &'call Path) -> BoxFuture<'call, Result<FileMetadata>> {
+        Box::pin(self.inner.head(path))
     }
 
-    fn list(
-        &self,
-        folder: &Path,
+    fn list<'call>(
+        &'call self,
+        folder: &'call Path,
         depth: Depth,
-    ) -> impl Future<Output = Result<Vec<WalkEntry>>> + Send {
-        self.inner.list(folder, depth)
+    ) -> BoxFuture<'call, Result<Vec<WalkEntry>>> {
+        Box::pin(self.inner.list(folder, depth))
     }
 
-    fn put(
-        &self,
-        path: &Path,
-        bytes: &[u8],
-        condition: &Condition,
-    ) -> impl Future<Output = Result<RevisionToken>> + Send {
-        self.inner.put(path, bytes, condition)
+    fn put<'call>(
+        &'call self,
+        path: &'call Path,
+        bytes: &'call [u8],
+        condition: &'call Condition,
+    ) -> BoxFuture<'call, Result<RevisionToken>> {
+        Box::pin(self.inner.put(path, bytes, condition))
     }
 
-    fn read_stream<'bucket>(
+    fn read_stream<'bucket, 'call>(
         &'bucket self,
-        path: &Path,
-    ) -> impl Future<Output = Result<Box<dyn AsyncRead + Send + Unpin + 'bucket>>> + Send {
+        path: &'call Path,
+    ) -> BoxFuture<'call, Result<Box<dyn AsyncRead + Send + Unpin + 'bucket>>>
+    where
+        'bucket: 'call,
+    {
         self.streams.fetch_add(1, Ordering::SeqCst);
-        self.inner.read_stream(path)
+        Box::pin(self.inner.read_stream(path))
     }
 }
 

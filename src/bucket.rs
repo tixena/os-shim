@@ -23,9 +23,9 @@
 //!
 //! # The pieces
 //!
-//! - `Bucket`: the asynchronous trait. Its methods return
-//!   `impl Future + Send`, so it cannot be a trait object; take a generic
-//!   `B: Bucket`. Only `delete`, `get`, `guarantees`, `head`, `list` and `put`
+//! - `Bucket`: the asynchronous trait. Its methods return a boxed future, so
+//!   take a generic `B: Bucket`, or hold an `Arc<dyn Bucket>` to choose the
+//!   backend at run time. Only `delete`, `get`, `guarantees`, `head`, `list` and `put`
 //!   are required; the other methods have bodies a backend overrides when its
 //!   storage has a native form.
 //! - `MinioBucket` and `MinioConfig` (feature `minio`): a client for `MinIO`,
@@ -122,7 +122,7 @@ use self::defaults::{
 use self::paths::key_of;
 use self::paths::lexical;
 use crate::error::{ErrorKind, Result, StorageError};
-use crate::{FileMetadata, WalkEntry};
+use crate::{BoxFuture, FileMetadata, WalkEntry};
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 #[cfg(feature = "s3")]
@@ -157,6 +157,143 @@ use std::time::SystemTime;
 use tokio::runtime::{Builder, Runtime};
 
 declare_bucket!();
+
+impl<B> Bucket for Arc<B>
+where
+    B: Bucket + ?Sized,
+{
+    #[inline]
+    fn append<'call>(
+        &'call self,
+        path: &'call Path,
+        more: &'call [u8],
+    ) -> BoxFuture<'call, Result<RevisionToken>> {
+        (**self).append(path, more)
+    }
+
+    #[inline]
+    fn append_stream<'bucket, 'call>(
+        &'bucket self,
+        path: &'call Path,
+    ) -> BoxFuture<'call, Result<Box<dyn AsyncWrite + Send + Unpin + 'bucket>>>
+    where
+        'bucket: 'call,
+    {
+        (**self).append_stream(path)
+    }
+
+    #[inline]
+    fn canonicalize<'call>(&'call self, path: &'call Path) -> BoxFuture<'call, Result<PathBuf>> {
+        (**self).canonicalize(path)
+    }
+
+    #[inline]
+    fn copy<'call>(
+        &'call self,
+        from: &'call Path,
+        to: &'call Path,
+    ) -> BoxFuture<'call, Result<u64>> {
+        (**self).copy(from, to)
+    }
+
+    #[inline]
+    fn create_folder<'call>(&'call self, path: &'call Path) -> BoxFuture<'call, Result<()>> {
+        (**self).create_folder(path)
+    }
+
+    #[inline]
+    fn delete<'call>(
+        &'call self,
+        path: &'call Path,
+        condition: &'call Condition,
+    ) -> BoxFuture<'call, Result<()>> {
+        (**self).delete(path, condition)
+    }
+
+    #[inline]
+    fn get<'call>(
+        &'call self,
+        path: &'call Path,
+    ) -> BoxFuture<'call, Result<(Vec<u8>, RevisionToken)>> {
+        (**self).get(path)
+    }
+
+    #[inline]
+    fn guarantees(&self) -> Guarantees {
+        (**self).guarantees()
+    }
+
+    #[inline]
+    fn head<'call>(&'call self, path: &'call Path) -> BoxFuture<'call, Result<FileMetadata>> {
+        (**self).head(path)
+    }
+
+    #[inline]
+    fn list<'call>(
+        &'call self,
+        folder: &'call Path,
+        depth: Depth,
+    ) -> BoxFuture<'call, Result<Vec<WalkEntry>>> {
+        (**self).list(folder, depth)
+    }
+
+    #[inline]
+    fn put<'call>(
+        &'call self,
+        path: &'call Path,
+        bytes: &'call [u8],
+        condition: &'call Condition,
+    ) -> BoxFuture<'call, Result<RevisionToken>> {
+        (**self).put(path, bytes, condition)
+    }
+
+    #[inline]
+    fn read_stream<'bucket, 'call>(
+        &'bucket self,
+        path: &'call Path,
+    ) -> BoxFuture<'call, Result<Box<dyn AsyncRead + Send + Unpin + 'bucket>>>
+    where
+        'bucket: 'call,
+    {
+        (**self).read_stream(path)
+    }
+
+    #[inline]
+    fn remove_folder<'call>(&'call self, path: &'call Path) -> BoxFuture<'call, Result<()>> {
+        (**self).remove_folder(path)
+    }
+
+    #[inline]
+    fn rename<'call>(
+        &'call self,
+        from: &'call Path,
+        to: &'call Path,
+    ) -> BoxFuture<'call, Result<()>> {
+        (**self).rename(from, to)
+    }
+
+    #[inline]
+    fn walk<'call>(
+        &'call self,
+        folder: &'call Path,
+        follow_links: bool,
+        hidden: bool,
+    ) -> BoxFuture<'call, Result<Vec<WalkEntry>>> {
+        (**self).walk(folder, follow_links, hidden)
+    }
+
+    #[inline]
+    fn write_stream<'bucket, 'call>(
+        &'bucket self,
+        path: &'call Path,
+        condition: Condition,
+    ) -> BoxFuture<'call, Result<Box<dyn AsyncWrite + Send + Unpin + 'bucket>>>
+    where
+        'bucket: 'call,
+    {
+        (**self).write_stream(path, condition)
+    }
+}
 
 /// A value a backend changes every time a file's bytes change: an entity tag on `MinIO` and S3,
 /// a counter in memory, a SHA-256 hash of the bytes on disk.
@@ -1361,35 +1498,45 @@ impl MinioBucket {
 #[cfg(feature = "minio")]
 impl Bucket for MinioBucket {
     #[inline]
-    fn append_stream<'bucket>(
+    fn append_stream<'bucket, 'call>(
         &'bucket self,
-        path: &Path,
-    ) -> impl Future<Output = Result<Box<dyn AsyncWrite + Send + Unpin + 'bucket>>> + Send {
-        streams::append_stream(&self.0, path)
+        path: &'call Path,
+    ) -> BoxFuture<'call, Result<Box<dyn AsyncWrite + Send + Unpin + 'bucket>>>
+    where
+        'bucket: 'call,
+    {
+        Box::pin(streams::append_stream(&self.0, path))
     }
 
     #[inline]
-    fn copy(&self, from: &Path, to: &Path) -> impl Future<Output = Result<u64>> + Send {
-        self.0.copy(from, to)
+    fn copy<'call>(
+        &'call self,
+        from: &'call Path,
+        to: &'call Path,
+    ) -> BoxFuture<'call, Result<u64>> {
+        Box::pin(self.0.copy(from, to))
     }
 
     #[inline]
-    fn create_folder(&self, path: &Path) -> impl Future<Output = Result<()>> + Send {
-        self.0.create_folder(path)
+    fn create_folder<'call>(&'call self, path: &'call Path) -> BoxFuture<'call, Result<()>> {
+        Box::pin(self.0.create_folder(path))
     }
 
     #[inline]
-    fn delete(
-        &self,
-        path: &Path,
-        condition: &Condition,
-    ) -> impl Future<Output = Result<()>> + Send {
-        self.0.delete(path, condition)
+    fn delete<'call>(
+        &'call self,
+        path: &'call Path,
+        condition: &'call Condition,
+    ) -> BoxFuture<'call, Result<()>> {
+        Box::pin(self.0.delete(path, condition))
     }
 
     #[inline]
-    fn get(&self, path: &Path) -> impl Future<Output = Result<(Vec<u8>, RevisionToken)>> + Send {
-        self.0.get(path)
+    fn get<'call>(
+        &'call self,
+        path: &'call Path,
+    ) -> BoxFuture<'call, Result<(Vec<u8>, RevisionToken)>> {
+        Box::pin(self.0.get(path))
     }
 
     #[inline]
@@ -1405,54 +1552,64 @@ impl Bucket for MinioBucket {
     }
 
     #[inline]
-    fn head(&self, path: &Path) -> impl Future<Output = Result<FileMetadata>> + Send {
-        self.0.head(path)
+    fn head<'call>(&'call self, path: &'call Path) -> BoxFuture<'call, Result<FileMetadata>> {
+        Box::pin(self.0.head(path))
     }
 
     #[inline]
-    fn list(
-        &self,
-        folder: &Path,
+    fn list<'call>(
+        &'call self,
+        folder: &'call Path,
         depth: Depth,
-    ) -> impl Future<Output = Result<Vec<WalkEntry>>> + Send {
-        self.0.list(folder, depth)
+    ) -> BoxFuture<'call, Result<Vec<WalkEntry>>> {
+        Box::pin(self.0.list(folder, depth))
     }
 
     #[inline]
-    fn put(
-        &self,
-        path: &Path,
-        bytes: &[u8],
-        condition: &Condition,
-    ) -> impl Future<Output = Result<RevisionToken>> + Send {
-        self.0.put(path, bytes, condition)
+    fn put<'call>(
+        &'call self,
+        path: &'call Path,
+        bytes: &'call [u8],
+        condition: &'call Condition,
+    ) -> BoxFuture<'call, Result<RevisionToken>> {
+        Box::pin(self.0.put(path, bytes, condition))
     }
 
     #[inline]
-    fn read_stream<'bucket>(
+    fn read_stream<'bucket, 'call>(
         &'bucket self,
-        path: &Path,
-    ) -> impl Future<Output = Result<Box<dyn AsyncRead + Send + Unpin + 'bucket>>> + Send {
-        streams::read_stream(&self.0, path)
+        path: &'call Path,
+    ) -> BoxFuture<'call, Result<Box<dyn AsyncRead + Send + Unpin + 'bucket>>>
+    where
+        'bucket: 'call,
+    {
+        Box::pin(streams::read_stream(&self.0, path))
     }
 
     #[inline]
-    fn remove_folder(&self, path: &Path) -> impl Future<Output = Result<()>> + Send {
-        self.0.remove_folder(path)
+    fn remove_folder<'call>(&'call self, path: &'call Path) -> BoxFuture<'call, Result<()>> {
+        Box::pin(self.0.remove_folder(path))
     }
 
     #[inline]
-    fn rename(&self, from: &Path, to: &Path) -> impl Future<Output = Result<()>> + Send {
-        self.0.rename(from, to)
+    fn rename<'call>(
+        &'call self,
+        from: &'call Path,
+        to: &'call Path,
+    ) -> BoxFuture<'call, Result<()>> {
+        Box::pin(self.0.rename(from, to))
     }
 
     #[inline]
-    fn write_stream<'bucket>(
+    fn write_stream<'bucket, 'call>(
         &'bucket self,
-        path: &Path,
+        path: &'call Path,
         condition: Condition,
-    ) -> impl Future<Output = Result<Box<dyn AsyncWrite + Send + Unpin + 'bucket>>> + Send {
-        streams::write_stream(&self.0, path, condition)
+    ) -> BoxFuture<'call, Result<Box<dyn AsyncWrite + Send + Unpin + 'bucket>>>
+    where
+        'bucket: 'call,
+    {
+        Box::pin(streams::write_stream(&self.0, path, condition))
     }
 }
 
@@ -1634,35 +1791,45 @@ impl S3Bucket {
 #[cfg(feature = "s3")]
 impl Bucket for S3Bucket {
     #[inline]
-    fn append_stream<'bucket>(
+    fn append_stream<'bucket, 'call>(
         &'bucket self,
-        path: &Path,
-    ) -> impl Future<Output = Result<Box<dyn AsyncWrite + Send + Unpin + 'bucket>>> + Send {
-        streams::append_stream(&self.0, path)
+        path: &'call Path,
+    ) -> BoxFuture<'call, Result<Box<dyn AsyncWrite + Send + Unpin + 'bucket>>>
+    where
+        'bucket: 'call,
+    {
+        Box::pin(streams::append_stream(&self.0, path))
     }
 
     #[inline]
-    fn copy(&self, from: &Path, to: &Path) -> impl Future<Output = Result<u64>> + Send {
-        self.0.copy(from, to)
+    fn copy<'call>(
+        &'call self,
+        from: &'call Path,
+        to: &'call Path,
+    ) -> BoxFuture<'call, Result<u64>> {
+        Box::pin(self.0.copy(from, to))
     }
 
     #[inline]
-    fn create_folder(&self, path: &Path) -> impl Future<Output = Result<()>> + Send {
-        self.0.create_folder(path)
+    fn create_folder<'call>(&'call self, path: &'call Path) -> BoxFuture<'call, Result<()>> {
+        Box::pin(self.0.create_folder(path))
     }
 
     #[inline]
-    fn delete(
-        &self,
-        path: &Path,
-        condition: &Condition,
-    ) -> impl Future<Output = Result<()>> + Send {
-        self.0.delete(path, condition)
+    fn delete<'call>(
+        &'call self,
+        path: &'call Path,
+        condition: &'call Condition,
+    ) -> BoxFuture<'call, Result<()>> {
+        Box::pin(self.0.delete(path, condition))
     }
 
     #[inline]
-    fn get(&self, path: &Path) -> impl Future<Output = Result<(Vec<u8>, RevisionToken)>> + Send {
-        self.0.get(path)
+    fn get<'call>(
+        &'call self,
+        path: &'call Path,
+    ) -> BoxFuture<'call, Result<(Vec<u8>, RevisionToken)>> {
+        Box::pin(self.0.get(path))
     }
 
     #[inline]
@@ -1680,54 +1847,64 @@ impl Bucket for S3Bucket {
     }
 
     #[inline]
-    fn head(&self, path: &Path) -> impl Future<Output = Result<FileMetadata>> + Send {
-        self.0.head(path)
+    fn head<'call>(&'call self, path: &'call Path) -> BoxFuture<'call, Result<FileMetadata>> {
+        Box::pin(self.0.head(path))
     }
 
     #[inline]
-    fn list(
-        &self,
-        folder: &Path,
+    fn list<'call>(
+        &'call self,
+        folder: &'call Path,
         depth: Depth,
-    ) -> impl Future<Output = Result<Vec<WalkEntry>>> + Send {
-        self.0.list(folder, depth)
+    ) -> BoxFuture<'call, Result<Vec<WalkEntry>>> {
+        Box::pin(self.0.list(folder, depth))
     }
 
     #[inline]
-    fn put(
-        &self,
-        path: &Path,
-        bytes: &[u8],
-        condition: &Condition,
-    ) -> impl Future<Output = Result<RevisionToken>> + Send {
-        self.0.put(path, bytes, condition)
+    fn put<'call>(
+        &'call self,
+        path: &'call Path,
+        bytes: &'call [u8],
+        condition: &'call Condition,
+    ) -> BoxFuture<'call, Result<RevisionToken>> {
+        Box::pin(self.0.put(path, bytes, condition))
     }
 
     #[inline]
-    fn read_stream<'bucket>(
+    fn read_stream<'bucket, 'call>(
         &'bucket self,
-        path: &Path,
-    ) -> impl Future<Output = Result<Box<dyn AsyncRead + Send + Unpin + 'bucket>>> + Send {
-        streams::read_stream(&self.0, path)
+        path: &'call Path,
+    ) -> BoxFuture<'call, Result<Box<dyn AsyncRead + Send + Unpin + 'bucket>>>
+    where
+        'bucket: 'call,
+    {
+        Box::pin(streams::read_stream(&self.0, path))
     }
 
     #[inline]
-    fn remove_folder(&self, path: &Path) -> impl Future<Output = Result<()>> + Send {
-        self.0.remove_folder(path)
+    fn remove_folder<'call>(&'call self, path: &'call Path) -> BoxFuture<'call, Result<()>> {
+        Box::pin(self.0.remove_folder(path))
     }
 
     #[inline]
-    fn rename(&self, from: &Path, to: &Path) -> impl Future<Output = Result<()>> + Send {
-        self.0.rename(from, to)
+    fn rename<'call>(
+        &'call self,
+        from: &'call Path,
+        to: &'call Path,
+    ) -> BoxFuture<'call, Result<()>> {
+        Box::pin(self.0.rename(from, to))
     }
 
     #[inline]
-    fn write_stream<'bucket>(
+    fn write_stream<'bucket, 'call>(
         &'bucket self,
-        path: &Path,
+        path: &'call Path,
         condition: Condition,
-    ) -> impl Future<Output = Result<Box<dyn AsyncWrite + Send + Unpin + 'bucket>>> + Send {
-        streams::write_stream(&self.0, path, condition)
+    ) -> BoxFuture<'call, Result<Box<dyn AsyncWrite + Send + Unpin + 'bucket>>>
+    where
+        'bucket: 'call,
+    {
+        Box::pin(streams::write_stream(&self.0, path, condition))
     }
 }
 
@@ -1855,6 +2032,9 @@ fn missing_etag() -> StorageError {
 
 #[cfg(test)]
 mod core_tests;
+
+#[cfg(test)]
+mod dyn_tests;
 
 #[cfg(test)]
 #[expect(

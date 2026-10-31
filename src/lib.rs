@@ -523,7 +523,8 @@ use std::time::SystemTime;
 use crate::bucket::{Condition, Guarantees, RevisionToken};
 use crate::error::Result;
 
-/// A boxed future: what keeps [`System`] usable as `&dyn System`.
+/// A boxed future: what keeps [`System`] usable as `&dyn System`, and
+/// [`Bucket`](bucket::Bucket) as `&dyn Bucket`.
 pub type BoxFuture<'system, T> = Pin<Box<dyn Future<Output = T> + Send + 'system>>;
 
 /// One entry found by [`System::walk_dir`].
