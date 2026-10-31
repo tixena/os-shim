@@ -1,5 +1,6 @@
 use super::{ErrorKind, StorageError};
 use core::error::Error as _;
+use core::iter;
 use std::io;
 
 const ALL: [ErrorKind; 11] = [
@@ -80,7 +81,7 @@ fn error_to_io_uses_the_mapped_io_kind() {
 fn display_shows_the_source_else_a_phrase() {
     let with_source = StorageError::new(ErrorKind::Other, "disk on fire");
     assert_eq!(with_source.to_string(), "disk on fire");
-    assert!(with_source.source().is_some());
+    assert!(with_source.source().is_none());
 
     let bare = StorageError::from_kind(ErrorKind::NotFound);
     assert_eq!(bare.to_string(), "nothing is at the path");
@@ -96,4 +97,34 @@ fn precondition_failed_through_io_keeps_its_kind() {
         StorageError::from(through_io).kind(),
         ErrorKind::PreconditionFailed
     );
+}
+
+#[test]
+fn a_source_chain_never_repeats_the_message() {
+    let cases = [
+        StorageError::from(io::Error::from(io::ErrorKind::NotFound)),
+        StorageError::new(ErrorKind::Other, "disk on fire"),
+        StorageError::from(io::Error::from(StorageError::new(
+            ErrorKind::Other,
+            "disk on fire",
+        ))),
+    ];
+    for error in cases {
+        let shown = error.to_string();
+        let repeated = iter::successors(error.source(), |&cause| cause.source())
+            .any(|cause| cause.to_string() == shown);
+        assert!(!repeated, "{shown}");
+    }
+}
+
+#[test]
+fn io_error_returns_the_operating_system_error() {
+    let carried = StorageError::from(io::Error::from_raw_os_error(18_i32));
+    assert_eq!(
+        carried.io_error().and_then(io::Error::raw_os_error),
+        Some(18_i32)
+    );
+
+    let bare = StorageError::from_kind(ErrorKind::NotFound);
+    assert!(bare.io_error().is_none());
 }

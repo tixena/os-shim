@@ -15,7 +15,7 @@ use core::pin::{Pin, pin};
 use core::task::{Context, Poll, Waker};
 use futures_io::{AsyncRead, AsyncWrite};
 use std::fs::{self, File};
-use std::io::{self, Write as _};
+use std::io::Write as _;
 use std::path::Path;
 use std::thread;
 use tempfile::TempDir;
@@ -304,8 +304,7 @@ async fn a_folder_renamed_onto_a_non_empty_folder_is_already_exists() {
             .err()
             .ok_or("the rename was not refused")?;
         let source = refused
-            .source()
-            .and_then(|inner| inner.downcast_ref::<io::Error>())
+            .io_error()
             .ok_or("the refusal has no io error as its source")?;
         Ok(vec![
             format!("{:?}", refused.kind()),
