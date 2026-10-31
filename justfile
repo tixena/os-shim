@@ -88,23 +88,24 @@ test-slow:
 minio_tests := "--features minio --config 'build.rustflags=[\"--cfg\", \"minio_tests\"]'"
 
 # Lint, then run, the bucket and system parity tests on the `minio` client against
-# a RustFS server in a container of their own on port 9100, removed afterwards.
+# a RustFS server in a container of their own on a free port, removed afterwards.
 # Needs docker.
 test-minio:
     #!/usr/bin/env bash
     set -euo pipefail
     echo "Linting MinIO tests..."
     cargo clippy --all-targets {{minio_tests}} -- -D warnings
-    docker run -d --rm --name os-shim-rustfs -p 9100:9000 \
+    docker run -d --rm --name os-shim-rustfs -p 127.0.0.1::9000 \
         -e RUSTFS_ACCESS_KEY=os-shim -e RUSTFS_SECRET_KEY=os-shim-secret \
         rustfs/rustfs:1.0.0-beta.8 > /dev/null
     trap 'docker stop os-shim-rustfs > /dev/null' EXIT
+    endpoint="http://$(docker port os-shim-rustfs 9000/tcp)"
     for _ in $(seq 1 50); do
-        curl -s -o /dev/null http://127.0.0.1:9100/ && break
+        curl -s -o /dev/null "$endpoint/" && break
         sleep 0.2
     done
     echo "Running MinIO tests against RustFS..."
-    OS_SHIM_MINIO_ENDPOINT=http://127.0.0.1:9100 \
+    OS_SHIM_MINIO_ENDPOINT="$endpoint" \
     OS_SHIM_MINIO_ACCESS_KEY=os-shim \
     OS_SHIM_MINIO_SECRET_KEY=os-shim-secret \
         cargo test {{minio_tests}} parity_tests -- --nocapture
