@@ -1731,11 +1731,11 @@ impl Bucket for S3Bucket {
     }
 }
 
-/// An SDK failure that reads as what the answer or the transport said.
+/// A service's answer that reads as what the answer said.
 #[cfg(any(feature = "minio", feature = "s3"))]
 #[derive(Debug)]
 struct SdkFailure {
-    /// The status, S3 code and message of the answer, or the transport's causes.
+    /// The status, S3 code and message of the answer.
     message: String,
     /// The SDK's own error.
     source: Box<dyn Error + Send + Sync>,
@@ -1781,10 +1781,15 @@ where
         | (&SdkError::DispatchFailure(_) | &SdkError::TimeoutError(_), _) => ErrorKind::Unavailable,
         _ => ErrorKind::Other,
     };
+    let message = describe(&error);
+    // With no answer the message already holds every cause, so a source would repeat them.
+    if error.as_service_error().is_none() {
+        return StorageError::new(kind, message);
+    }
     StorageError::new(
         kind,
         SdkFailure {
-            message: describe(&error),
+            message,
             source: Box::new(error),
         },
     )

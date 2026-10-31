@@ -696,6 +696,18 @@ fn minio_get_with_nothing_listening_is_unavailable_naming_the_dispatch_failure_a
 
 #[cfg(feature = "minio")]
 #[test]
+fn minio_get_with_nothing_listening_never_repeats_a_cause_in_its_source_chain() {
+    let error = minio("http://127.0.0.1:9".to_owned())
+        .get(Path::new("/task.md"))
+        .unwrap_err();
+    let message = error.to_string();
+    let repeated = iter::successors(error.source(), |&cause| cause.source())
+        .find(|cause| message.contains(&cause.to_string()));
+    assert!(repeated.is_none(), "{message}: {repeated:?}");
+}
+
+#[cfg(feature = "minio")]
+#[test]
 fn minio_get_answered_403_is_permission_denied_naming_the_status_the_code_and_the_message() {
     let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>SignatureDoesNotMatch</Code><Message>The request signature we calculated does not match the signature you provided.</Message></Error>";
     let (endpoint, _seen) = canned(vec![answer(

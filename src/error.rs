@@ -104,6 +104,14 @@ impl StorageError {
         Self { kind, source: None }
     }
 
+    /// The `io::Error` this error wraps, when there is one. It holds the operating system's error
+    /// number.
+    #[inline]
+    #[must_use]
+    pub fn io_error(&self) -> Option<&io::Error> {
+        self.source.as_ref()?.downcast_ref::<io::Error>()
+    }
+
     /// Which way the operation failed.
     #[inline]
     #[must_use]
@@ -135,12 +143,10 @@ impl fmt::Display for StorageError {
 }
 
 impl StdError for StorageError {
+    /// `Display` already shows the wrapped error, so the chain goes on from that error's source.
     #[inline]
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        self.source.as_ref().map(|boxed| {
-            let inner: &(dyn StdError + 'static) = boxed.as_ref();
-            inner
-        })
+        self.source.as_ref()?.source()
     }
 }
 
