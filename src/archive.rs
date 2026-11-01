@@ -78,11 +78,52 @@
 //! # }
 //! ```
 //!
+//! # Example: an archive for a format that reads its own layout
+//!
+//! Some formats are zip archives whose readers look at the bytes themselves, such
+//! as an Office file, whose type is told from its first entries. [`ZipOptions`]
+//! leaves out the directory entries, keeps zip64 to the files that need it, names
+//! the entries that come first and fixes the time, so that the same tree gives the
+//! same bytes.
+//!
+//! ```
+//! use os_shim::archive::{Zip64, ZipOptions, to_zip_writer};
+//! use os_shim::mock::MemorySystem;
+//! use std::path::Path;
+//! use std::time::SystemTime;
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! # tokio::runtime::Builder::new_current_thread().build()?.block_on(async {
+//! let package = MemorySystem::new()
+//!     .with_file("/[Content_Types].xml", b"<Types/>")?
+//!     .with_file("/_rels/.rels", b"<Relationships/>")?
+//!     .with_file("/docProps/app.xml", b"<Properties/>")?
+//!     .with_file("/word/document.xml", b"<w:document/>")?;
+//! let options = || {
+//!     ZipOptions::default()
+//!         .with_directories(false)
+//!         .with_first_entries(&["[Content_Types].xml", "_rels/.rels", "word/document.xml"])
+//!         .with_fixed_time(SystemTime::UNIX_EPOCH)
+//!         .with_zip64(Zip64::WhenNeeded)
+//! };
+//!
+//! let mut first = Vec::new();
+//! to_zip_writer(&package, Path::new("/"), &mut first, options()).await?;
+//! let mut second = Vec::new();
+//! to_zip_writer(&package, Path::new("/"), &mut second, options()).await?;
+//! assert_eq!(first, second);
+//! # Ok(())
+//! # })
+//! # }
+//! ```
+//!
 //! # Ignore rules
 //!
-//! The only filter is [`ZipOptions::include_hidden`]: an entry whose final name
-//! starts with `.` is skipped when it is `false`. There is no `.gitignore`
+//! [`ZipOptions::include_hidden`] is the only filter on names: an entry whose final
+//! name starts with `.` is skipped when it is `false`. There is no `.gitignore`
 //! support, no glob patterns and no custom filter.
+//! [`ZipOptions::include_directories`] leaves out every directory entry when it is
+//! `false`, whatever its name.
 //!
 //! # Limits and memory
 //!
@@ -102,11 +143,13 @@
 //!
 //! # What the archive looks like
 //!
+//! With [`ZipOptions::default`]:
+//!
 //! - Entry names use `/` and are relative to the source.
 //! - Directories come first, then files, each sorted by path.
-//! - Files are deflated and carry the source's modification time, clamped to the
-//!   zip range of 1980-01-01 to 2107-12-31. The in-memory tree stamps directories
-//!   with the Unix epoch, so those entries read 1980-01-01.
+//! - Files are deflated, carry zip64 fields and carry the source's modification
+//!   time, clamped to the zip range of 1980-01-01 to 2107-12-31. The in-memory tree
+//!   stamps directories with the Unix epoch, so those entries read 1980-01-01.
 //! - A symlink that points back into the tree is listed but not entered again, so
 //!   a cycle cannot loop forever.
 
@@ -114,13 +157,14 @@ use crate::System;
 use crate::error::{ErrorKind, Result, StorageError};
 use crate::streams::{close, read_chunk, write_all};
 use alloc::collections::BTreeSet;
+use core::time::Duration;
 use std::io::{self, Cursor, Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 use time::{OffsetDateTime, PrimitiveDateTime};
 use zip::read::{ZipFile, read_zipfile_from_stream};
 use zip::write::{SimpleFileOptions, StreamWriter, ZipWriter};
-use zip::{CompressionMethod, DateTime, ZipArchive};
+use zip::{CompressionMethod, DateTime, System as ZipHost, ZipArchive};
 
 /// Bytes held by the copy buffer (64 KiB), heap-allocated because a stack array
 /// this size trips `clippy::large_stack_arrays`.
@@ -128,6 +172,30 @@ const COPY_BUFFER_BYTES: usize = 0x1_0000;
 
 /// First year a ZIP timestamp can express.
 const ZIP_EPOCH_YEAR: i32 = 1980;
+
+/// Seconds from the Unix epoch to 2108-01-01, the first instant past the ZIP range.
+const ZIP_END_SECS: u64 = 4_354_819_200;
+
+/// Source length at which [`Zip64::WhenNeeded`] turns zip64 on for a file: two gibibytes.
+///
+/// Deflate can make incompressible data larger than its source, and the zip crate
+/// refuses a compressed length past 32 bits on a file without zip64. This line
+/// leaves two gibibytes for that growth.
+const ZIP64_FROM_BYTES: u64 = 0x8000_0000;
+
+/// When a file entry carries zip64 fields.
+///
+/// A file with zip64 has `0xFFFFFFFF` in the size fields of its headers, a 20-byte
+/// extra field and version needed 4.5. `EveryFile` gives that to every file.
+/// `WhenNeeded` gives it to a file whose source is two gibibytes or larger; any other
+/// file has its real sizes in its headers and, deflated, version needed 2.0.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum Zip64 {
+    #[default]
+    EveryFile,
+    WhenNeeded,
+}
 
 /// Options for [`to_zip_writer`].
 ///
@@ -142,13 +210,58 @@ const ZIP_EPOCH_YEAR: i32 = 1980;
 /// assert!(!options.include_hidden);
 /// assert!(ZipOptions::default().include_hidden);
 /// ```
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ZipOptions {
+    pub first_entries: Vec<String>,
+    pub fixed_time: Option<SystemTime>,
+    pub include_directories: bool,
     pub include_hidden: bool,
+    pub zip64: Zip64,
 }
 
 impl ZipOptions {
+    /// Set whether a directory gets an entry of its own (builder pattern).
+    ///
+    /// With `false`, a directory appears only in the names of the files below it,
+    /// so an empty directory is not in the archive and does not come back when the
+    /// archive is loaded.
+    #[must_use]
+    #[inline]
+    pub const fn with_directories(mut self, include_directories: bool) -> Self {
+        self.include_directories = include_directories;
+        self
+    }
+
+    /// Name the files that come first in the archive, in this order (builder pattern).
+    ///
+    /// Each name is an entry name: relative to the source, with `/` between parts
+    /// and no leading `/`, compared exactly. The named files come ahead of the
+    /// directory entries and every other file. [`to_zip_writer`] answers
+    /// `NotFound` for a name that is not a file in the archive, which includes a
+    /// name given twice and a file `with_hidden(false)` leaves out.
+    #[must_use]
+    #[inline]
+    pub fn with_first_entries(mut self, names: &[&str]) -> Self {
+        self.first_entries = names.iter().map(|name| (*name).to_owned()).collect();
+        self
+    }
+
+    /// Stamp every entry with `time` in place of its source's modification time
+    /// (builder pattern).
+    ///
+    /// `time` is clamped to the zip range of 1980-01-01 to 2107-12-31, so
+    /// `SystemTime::UNIX_EPOCH` reads 1980-01-01. Each entry also records the MS-DOS
+    /// host in place of the platform that builds the archive. Two archives of the
+    /// same tree with the same options and the same build of this crate are then
+    /// the same bytes.
+    #[must_use]
+    #[inline]
+    pub const fn with_fixed_time(mut self, time: SystemTime) -> Self {
+        self.fixed_time = Some(time);
+        self
+    }
+
     /// Set whether dot-prefixed entries are archived (builder pattern).
     ///
     /// `false` also skips everything below a hidden directory.
@@ -158,13 +271,25 @@ impl ZipOptions {
         self.include_hidden = include_hidden;
         self
     }
+
+    /// Set when a file carries zip64 fields (builder pattern).
+    #[must_use]
+    #[inline]
+    pub const fn with_zip64(mut self, zip64: Zip64) -> Self {
+        self.zip64 = zip64;
+        self
+    }
 }
 
 impl Default for ZipOptions {
     #[inline]
     fn default() -> Self {
         Self {
+            first_entries: Vec::new(),
+            fixed_time: None,
+            include_directories: true,
             include_hidden: true,
+            zip64: Zip64::EveryFile,
         }
     }
 }
@@ -265,6 +390,24 @@ impl<W: Write> Write for ZipStreamWriter<W> {
     }
 }
 
+/// Write the file at `path` as the next entry of `writer`, named `name`.
+async fn add_file<S, W>(
+    system: &S,
+    writer: &mut ZipWriter<W>,
+    name: String,
+    path: &Path,
+    options: &ZipOptions,
+) -> Result<()>
+where
+    S: System + ?Sized,
+    W: Write + Seek + Send,
+{
+    writer
+        .start_file(name, file_options(system, path, options).await?)
+        .map_err(io::Error::other)?;
+    copy_into(system, path, writer).await
+}
+
 /// Stream the file at `path` into `sink` through a heap-allocated buffer.
 async fn copy_into<S, W>(system: &S, path: &Path, sink: &mut W) -> Result<()>
 where
@@ -317,16 +460,31 @@ fn entry_name(source: &Path, path: &Path) -> Result<String> {
 /// resolution. Anything outside that clamps to the nearest end rather than
 /// failing the archive -- the in-memory filesystem stamps un-written directories
 /// with the Unix epoch, which predates the format's floor by a decade.
-async fn entry_options<S>(system: &S, path: &Path) -> Result<SimpleFileOptions>
+///
+/// A fixed time replaces the source's and pins the host, which the zip crate would
+/// otherwise take from the platform: MS-DOS on Windows, Unix anywhere else.
+async fn entry_options<S>(
+    system: &S,
+    path: &Path,
+    fixed_time: Option<SystemTime>,
+) -> Result<SimpleFileOptions>
 where
     S: System + ?Sized,
 {
-    let modified = system
-        .metadata(path)
-        .await?
-        .modified
-        .unwrap_or(SystemTime::UNIX_EPOCH);
-    let offset = OffsetDateTime::from(modified);
+    let modified = match fixed_time {
+        Some(time) => time,
+        None => system
+            .metadata(path)
+            .await?
+            .modified
+            .unwrap_or(SystemTime::UNIX_EPOCH),
+    };
+    // `OffsetDateTime::from` panics past year 9999, so the time is bounded first.
+    let latest = SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(ZIP_END_SECS));
+    let bounded = latest
+        .map_or(modified, |last| modified.min(last))
+        .max(SystemTime::UNIX_EPOCH);
+    let offset = OffsetDateTime::from(bounded);
     let civil = PrimitiveDateTime::new(offset.date(), offset.time());
     let stamp = DateTime::try_from(civil).unwrap_or_else(|_ignored| {
         if civil.year() < ZIP_EPOCH_YEAR {
@@ -335,7 +493,19 @@ where
             zip_ceiling()
         }
     });
-    Ok(SimpleFileOptions::default().last_modified_time(stamp))
+    let entry = SimpleFileOptions::default().last_modified_time(stamp);
+    Ok(match fixed_time {
+        Some(_) => entry.system(ZipHost::Dos),
+        None => entry,
+    })
+}
+
+/// The error for a first entry the archive does not hold as a file.
+fn first_entry_missing(name: &str) -> StorageError {
+    StorageError::new(
+        ErrorKind::NotFound,
+        format!("First entry is not a file in the archive, or is named twice: {name}"),
+    )
 }
 
 /// Archive entry name for a lone file: its final component and nothing else.
@@ -349,25 +519,32 @@ fn file_name_of(path: &Path) -> Result<String> {
         .ok_or_else(|| io::Error::other(format!("Non-UTF-8 file name in {}", path.display())))?)
 }
 
-/// Per-entry zip options for a file, pinned to zip64.
+/// Per-entry zip options for a file, with zip64 as [`ZipOptions::zip64`] asks.
 ///
-/// `large_file(true)` goes on every file, not on files a size check picks out.
-/// Deflate can make incompressible data larger than its source and the zip crate
-/// rejects an oversized compressed length separately from an oversized
-/// uncompressed one, so any threshold needs a margin, and a wrong margin fails
-/// only on multi-gigabyte inputs nobody exercises routinely. The cost is a
-/// 20-byte zip64 extra field per file and a version-needed-to-extract of 4.5.
+/// [`Zip64::EveryFile`], the default, sets `large_file(true)` on every file, not on
+/// files a size check picks out. Deflate can make incompressible data larger than
+/// its source and the zip crate rejects an oversized compressed length separately
+/// from an oversized uncompressed one, so any threshold needs a margin, and a wrong
+/// margin fails only on multi-gigabyte inputs nobody exercises routinely. The cost
+/// is a 20-byte zip64 extra field per file and a version-needed-to-extract of 4.5.
+/// [`Zip64::WhenNeeded`] takes that risk behind [`ZIP64_FROM_BYTES`].
 ///
 /// Directory entries keep the plain options. `ZipWriter::add_directory` marks
 /// the entry finished the moment it is opened, so the writer never revisits the
 /// local header to replace the zip64 placeholder sizes it stamped there --
 /// `u64::MAX` for both -- and a streaming reader then waits for that many bytes
 /// of entry data and hits end of file. A directory carries no data anyway.
-async fn file_options<S>(system: &S, path: &Path) -> Result<SimpleFileOptions>
+async fn file_options<S>(system: &S, path: &Path, options: &ZipOptions) -> Result<SimpleFileOptions>
 where
     S: System + ?Sized,
 {
-    Ok(entry_options(system, path).await?.large_file(true))
+    let large_file = match options.zip64 {
+        Zip64::EveryFile => true,
+        Zip64::WhenNeeded => system.metadata(path).await?.len >= ZIP64_FROM_BYTES,
+    };
+    Ok(entry_options(system, path, options.fixed_time)
+        .await?
+        .large_file(large_file))
 }
 
 /// Whether `path`'s final component is dot-prefixed.
@@ -521,6 +698,28 @@ where
     Ok(close(&mut *sink).await?)
 }
 
+/// `files` split into those `names` asks for, in the order of `names`, and the rest
+/// in their own order.
+fn split_first_entries(
+    source: &Path,
+    mut files: Vec<PathBuf>,
+    names: &[String],
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let mut first = Vec::with_capacity(names.len());
+    for name in names {
+        let entries = files
+            .iter()
+            .map(|file| entry_name(source, file))
+            .collect::<Result<Vec<_>>>()?;
+        let found = entries
+            .iter()
+            .position(|entry| entry == name)
+            .ok_or_else(|| first_entry_missing(name))?;
+        first.push(files.remove(found));
+    }
+    Ok((first, files))
+}
+
 /// Write `source` into `sink` as a zip archive.
 ///
 /// A directory contributes its *contents*: archiving `A/` yields `file.txt`, not
@@ -530,9 +729,9 @@ where
 /// methods call it with the defaults. The archive is built in memory and written
 /// to `sink` in one `write_all` call. Keep archives under about 1 GiB.
 ///
-/// Directory entries come first, then files, each sorted by path. Files are
-/// deflated and written with zip64 fields. Modification times are clamped to the
-/// zip range of 1980-01-01 to 2107-12-31.
+/// By default, directory entries come first, then files, each sorted by path.
+/// Files are deflated and written with zip64 fields. Modification times are clamped
+/// to the zip range of 1980-01-01 to 2107-12-31. [`ZipOptions`] changes each of these.
 ///
 /// ```
 /// use os_shim::mock::MemorySystem;
@@ -558,6 +757,8 @@ where
 ///
 /// Returns an error if:
 /// - `source` is neither a file nor a directory: kind `NotFound`.
+/// - A name in [`ZipOptions::first_entries`] is not a file in the archive, or is
+///   named twice: kind `NotFound`, and nothing is written to `sink`.
 /// - The source tree cannot be read, or holds a name that is not UTF-8 and so has
 ///   no zip representation.
 /// - The sink cannot be written.
@@ -577,23 +778,46 @@ where
     let mut writer = ZipWriter::new(&mut buffer);
 
     if system.is_dir(source).await? {
-        let (dirs, files) = walk(system, source, options).await?;
-        for dir in &dirs {
-            writer
-                .add_directory(entry_name(source, dir)?, entry_options(system, dir).await?)
-                .map_err(io::Error::other)?;
+        let (dirs, files) = walk(system, source, &options).await?;
+        let (first, rest) = split_first_entries(source, files, &options.first_entries)?;
+        for file in &first {
+            add_file(
+                system,
+                &mut writer,
+                entry_name(source, file)?,
+                file,
+                &options,
+            )
+            .await?;
         }
-        for file in &files {
-            writer
-                .start_file(entry_name(source, file)?, file_options(system, file).await?)
-                .map_err(io::Error::other)?;
-            copy_into(system, file, &mut writer).await?;
+        if options.include_directories {
+            for dir in &dirs {
+                writer
+                    .add_directory(
+                        entry_name(source, dir)?,
+                        entry_options(system, dir, options.fixed_time).await?,
+                    )
+                    .map_err(io::Error::other)?;
+            }
+        }
+        for file in &rest {
+            add_file(
+                system,
+                &mut writer,
+                entry_name(source, file)?,
+                file,
+                &options,
+            )
+            .await?;
         }
     } else if system.is_file(source).await? {
-        writer
-            .start_file(file_name_of(source)?, file_options(system, source).await?)
-            .map_err(io::Error::other)?;
-        copy_into(system, source, &mut writer).await?;
+        let name = file_name_of(source)?;
+        let (_first, _rest) = split_first_entries(
+            Path::new(""),
+            vec![PathBuf::from(&name)],
+            &options.first_entries,
+        )?;
+        add_file(system, &mut writer, name, source, &options).await?;
     } else {
         return Err(StorageError::new(
             ErrorKind::NotFound,
@@ -610,7 +834,7 @@ where
 async fn walk<S>(
     system: &S,
     source: &Path,
-    options: ZipOptions,
+    options: &ZipOptions,
 ) -> Result<(Vec<PathBuf>, Vec<PathBuf>)>
 where
     S: System + ?Sized,

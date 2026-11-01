@@ -50,6 +50,8 @@ assert_eq!(loaded.read_to_string(Path::new("/src/main.rs")).await?, "fn main() {
 
 `System::to_zip_stream`, `to_zip_vec` and `to_zip_writer` archive a tree. `archive::load_zip` loads an archive from a stream, `archive::load_zip_seekable` from a seekable reader, including archives whose entries carry data descriptors. `archive::ZipStreamWriter` writes an archive one entry at a time into a sink that cannot seek. The `System` methods and the two `load_zip` functions are async and stream through a fixed buffer; `MemorySystem::from_zip_reader` and `from_zip_stream` are synchronous.
 
+`archive::to_zip_writer` takes a `ZipOptions`, for a format whose readers look at the archive's bytes, such as an Office file. `with_directories(false)` leaves out directory entries, `with_zip64(Zip64::WhenNeeded)` keeps zip64 to files of two gibibytes or more, `with_first_entries` names the files that come first, and `with_fixed_time` gives every entry one time and one host, so the same tree gives the same bytes. The defaults are the archive the `System` methods write.
+
 ## Buckets
 
 A `Bucket` holds files and folders, each put and delete under an optional condition. `Bucket`, `DiskBucket` and `MemoryBucket` are in every build. `MinioBucket` needs the `minio` feature, `S3Bucket` needs `s3`, and `BlockingBucket` needs either.

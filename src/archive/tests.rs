@@ -1,6 +1,6 @@
 //! Tests for zip archive production and loading.
 
-use super::{ZipOptions, ZipStreamWriter, to_zip_writer};
+use super::{ZIP64_FROM_BYTES, Zip64, ZipOptions, ZipStreamWriter, to_zip_writer};
 use crate::bucket::{Condition, Guarantees, RevisionToken};
 use crate::error::{ErrorKind, Result};
 use crate::mock::MemorySystem;
@@ -13,9 +13,13 @@ use core::result;
 use core::time::Duration;
 use futures_io::{AsyncRead, AsyncWrite};
 use std::env::VarError;
+#[cfg(unix)]
+use std::ffi::OsStr;
 #[cfg(slow_tests)]
 use std::fs::File;
 use std::io::{self, Cursor, Read as _, Write, pipe};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(slow_tests)]
@@ -54,6 +58,8 @@ struct CountingSink {
 struct MinimalSystem {
     /// The filesystem every required method delegates to.
     inner: MemorySystem,
+    /// The length `metadata` reports for every path in place of the real one.
+    reported_len: Option<u64>,
 }
 
 /// A `TempDirHandle` implementor writing only `path`, so it keeps the default
@@ -136,7 +142,16 @@ impl System for MinimalSystem {
         &'system self,
         path: &'system Path,
     ) -> BoxFuture<'system, Result<FileMetadata>> {
-        self.inner.metadata(path)
+        Box::pin(async move {
+            let found = self.inner.metadata(path).await?;
+            Ok(FileMetadata::new(
+                found.is_dir,
+                found.is_file,
+                self.reported_len.unwrap_or(found.len),
+                found.modified,
+                found.revision,
+            ))
+        })
     }
 
     fn now(&self) -> SystemTime {
@@ -644,6 +659,7 @@ async fn zip_methods_are_reachable_through_trait_objects() {
 async fn a_type_with_only_the_required_methods_gains_the_zip_methods() {
     let system = MinimalSystem {
         inner: memory_project(),
+        reported_len: None,
     };
 
     let archive = system.to_zip_vec(Path::new("/proj")).await.unwrap();
@@ -1228,7 +1244,10 @@ async fn an_entry_above_four_gibibytes_archives_and_extracts() {
 #[tokio::test(flavor = "current_thread")]
 async fn minimal_system_passes_sleep_to_its_inner_system() {
     let inner = MemorySystem::new();
-    let system = MinimalSystem { inner };
+    let system = MinimalSystem {
+        inner,
+        reported_len: None,
+    };
 
     system.sleep(Duration::from_secs(2)).await.unwrap();
 
@@ -1238,4 +1257,623 @@ async fn minimal_system_passes_sleep_to_its_inner_system() {
             .checked_add(Duration::from_secs(2))
             .unwrap()
     );
+}
+
+/// The archive of `source` under `options`.
+async fn archive_with<S>(system: &S, source: &str, options: ZipOptions) -> Vec<u8>
+where
+    S: System + ?Sized,
+{
+    let mut archive = Vec::new();
+    to_zip_writer(system, Path::new(source), &mut archive, options)
+        .await
+        .unwrap();
+    archive
+}
+
+/// The two bytes at `offset` in the central directory header of every entry.
+fn central_header_bytes(archive: &[u8], offset: usize) -> Vec<Vec<u8>> {
+    let mut reader = ZipArchive::new(Cursor::new(archive.to_vec())).unwrap();
+    (0..reader.len())
+        .map(|index| {
+            let start = usize::try_from(reader.by_index(index).unwrap().central_header_start())
+                .unwrap()
+                .checked_add(offset)
+                .unwrap();
+            archive
+                .get(start..start.checked_add(2).unwrap())
+                .map(<[u8]>::to_vec)
+                .unwrap()
+        })
+        .collect()
+}
+
+/// Assert every entry has its real sizes in both headers: `0xFFFFFFFF`, the zip64
+/// mark, would show in the high half of each size field, which is zero for a small file.
+fn assert_real_sizes(archive: &[u8]) {
+    let zero = vec![vec![0_u8, 0]; entry_names(archive).len()];
+    assert_eq!(local_header_bytes(archive, 20), zero);
+    assert_eq!(local_header_bytes(archive, 24), zero);
+    assert_eq!(central_header_bytes(archive, 22), zero);
+    assert_eq!(central_header_bytes(archive, 26), zero);
+}
+
+/// A tree shaped like a Word package, written while the clock reads `now`.
+/// `docProps/` sorts ahead of the main part, as it does in a real package.
+fn memory_package(now: SystemTime) -> MemorySystem {
+    MemorySystem::new()
+        .with_now(now)
+        .unwrap()
+        .with_file("/pkg/[Content_Types].xml", b"<Types/>")
+        .unwrap()
+        .with_file("/pkg/_rels/.rels", b"<Relationships/>")
+        .unwrap()
+        .with_file("/pkg/docProps/app.xml", b"<Properties/>")
+        .unwrap()
+        .with_file("/pkg/word/document.xml", b"<w:document/>")
+        .unwrap()
+        .with_file("/pkg/word/styles.xml", b"<w:styles/>")
+        .unwrap()
+}
+
+/// All four options together, as an Office package needs them.
+fn package_options() -> ZipOptions {
+    ZipOptions::default()
+        .with_directories(false)
+        .with_first_entries(&["[Content_Types].xml", "_rels/.rels", "word/document.xml"])
+        .with_fixed_time(SystemTime::UNIX_EPOCH)
+        .with_zip64(Zip64::WhenNeeded)
+}
+
+/// 2001-09-09, as a clock reading.
+fn september_2001() -> SystemTime {
+    SystemTime::UNIX_EPOCH
+        .checked_add(Duration::from_secs(1_000_000_000))
+        .unwrap()
+}
+
+#[test]
+fn default_options_keep_every_recorded_form() {
+    let options = ZipOptions::default();
+
+    assert_eq!(options.first_entries, Vec::<String>::new());
+    assert_eq!(options.fixed_time, None);
+    assert!(options.include_directories);
+    assert_eq!(options.zip64, Zip64::EveryFile);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn without_directories_no_entry_is_a_directory() {
+    let archive = archive_with(
+        &memory_project(),
+        "/proj",
+        ZipOptions::default().with_directories(false),
+    )
+    .await;
+
+    assert_eq!(
+        entry_names(&archive),
+        vec![
+            ".gitignore".to_owned(),
+            "README.md".to_owned(),
+            "src/main.rs".to_owned(),
+            "target/artifact.bin".to_owned(),
+        ]
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn without_directories_a_loaded_tree_keeps_its_files_and_loses_empty_directories() {
+    let archive = archive_with(
+        &memory_project(),
+        "/proj",
+        ZipOptions::default().with_directories(false),
+    )
+    .await;
+
+    let loaded = MemorySystem::from_zip_stream(&mut Cursor::new(archive)).unwrap();
+
+    assert_eq!(
+        loaded
+            .read_to_string(Path::new("/src/main.rs"))
+            .await
+            .unwrap(),
+        "fn main() {}\n"
+    );
+    assert!(!loaded.exists(Path::new("/empty")).await.unwrap());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn without_directories_a_tree_with_no_files_gives_an_empty_archive() {
+    let system = MemorySystem::new().with_dir("/proj/empty").unwrap();
+
+    let archive = archive_with(
+        &system,
+        "/proj",
+        ZipOptions::default().with_directories(false),
+    )
+    .await;
+
+    assert_eq!(entry_names(&archive), Vec::<String>::new());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn zip64_when_needed_leaves_a_small_file_with_real_sizes_and_version_two() {
+    let archive = archive_with(
+        &memory_project(),
+        "/proj",
+        ZipOptions::default()
+            .with_directories(false)
+            .with_zip64(Zip64::WhenNeeded),
+    )
+    .await;
+
+    let names = entry_names(&archive);
+    for name in &names {
+        assert_eq!(local_extra_field(&archive, name), Vec::new());
+    }
+    assert_real_sizes(&archive);
+    let version_two = vec![vec![20_u8, 0]; names.len()];
+    assert_eq!(local_header_bytes(&archive, 4), version_two);
+    assert_eq!(central_header_bytes(&archive, 6), version_two);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn zip64_when_needed_turns_on_at_two_gibibytes_and_not_a_byte_below() {
+    let below = MinimalSystem {
+        inner: memory_project(),
+        reported_len: Some(ZIP64_FROM_BYTES.checked_sub(1).unwrap()),
+    };
+    let at = MinimalSystem {
+        inner: memory_project(),
+        reported_len: Some(ZIP64_FROM_BYTES),
+    };
+    let options = || ZipOptions::default().with_zip64(Zip64::WhenNeeded);
+
+    let without = archive_with(&below, "/proj", options()).await;
+    let with = archive_with(&at, "/proj", options()).await;
+
+    assert_eq!(local_extra_field(&without, "README.md"), Vec::new());
+    assert!(local_extra_field(&with, "README.md").starts_with(&ZIP64_EXTRA_FIELD_HEADER));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn first_entries_come_ahead_of_directories_and_every_other_file() {
+    let options =
+        ZipOptions::default().with_first_entries(&["word/document.xml", "[Content_Types].xml"]);
+
+    let archive = archive_with(&memory_package(SystemTime::UNIX_EPOCH), "/pkg", options).await;
+
+    assert_eq!(
+        entry_names(&archive),
+        vec![
+            "word/document.xml".to_owned(),
+            "[Content_Types].xml".to_owned(),
+            "_rels/".to_owned(),
+            "docProps/".to_owned(),
+            "word/".to_owned(),
+            "_rels/.rels".to_owned(),
+            "docProps/app.xml".to_owned(),
+            "word/styles.xml".to_owned(),
+        ]
+    );
+    assert_eq!(entry_bytes(&archive, "word/document.xml"), b"<w:document/>");
+
+    let streamed = MemorySystem::from_zip_stream(&mut Cursor::new(archive.clone())).unwrap();
+    let seekable = MemorySystem::from_zip_reader(Cursor::new(archive)).unwrap();
+    for loaded in [&streamed, &seekable] {
+        assert_eq!(
+            loaded
+                .read_to_string(Path::new("/word/document.xml"))
+                .await
+                .unwrap(),
+            "<w:document/>"
+        );
+        assert!(loaded.is_dir(Path::new("/word")).await.unwrap());
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_first_entry_the_archive_does_not_hold_is_not_found_and_named() {
+    let system = memory_package(SystemTime::UNIX_EPOCH);
+    for missing in [
+        "word/absent.xml",
+        "/word/document.xml",
+        "WORD/DOCUMENT.XML",
+        "word",
+        "word/",
+    ] {
+        let mut archive = Vec::new();
+        let error = to_zip_writer(
+            &system,
+            Path::new("/pkg"),
+            &mut archive,
+            ZipOptions::default().with_first_entries(&[missing]),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::NotFound, "{missing}");
+        assert!(error.to_string().contains(missing), "{error}");
+        assert_eq!(archive, Vec::<u8>::new());
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_first_entry_named_twice_is_not_found() {
+    let mut archive = Vec::new();
+    let error = to_zip_writer(
+        &memory_package(SystemTime::UNIX_EPOCH),
+        Path::new("/pkg"),
+        &mut archive,
+        ZipOptions::default().with_first_entries(&["_rels/.rels", "_rels/.rels"]),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.kind(), ErrorKind::NotFound);
+    assert!(error.to_string().contains("_rels/.rels"), "{error}");
+    assert_eq!(archive, Vec::<u8>::new());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_first_entry_left_out_as_hidden_is_not_found() {
+    let mut archive = Vec::new();
+    let error = to_zip_writer(
+        &memory_package(SystemTime::UNIX_EPOCH),
+        Path::new("/pkg"),
+        &mut archive,
+        ZipOptions::default()
+            .with_hidden(false)
+            .with_first_entries(&["_rels/.rels"]),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.kind(), ErrorKind::NotFound);
+    assert!(error.to_string().contains("_rels/.rels"), "{error}");
+    assert_eq!(archive, Vec::<u8>::new());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn a_name_with_no_zip_form_is_reported_ahead_of_a_missing_first_entry() {
+    let system = MemorySystem::new()
+        .with_file(Path::new(OsStr::from_bytes(b"/pkg/\xFF")), b"x")
+        .unwrap();
+
+    let error = to_zip_writer(
+        &system,
+        Path::new("/pkg"),
+        &mut Vec::new(),
+        ZipOptions::default().with_first_entries(&["absent.xml"]),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("Non-UTF-8"), "{error}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_lone_file_source_answers_first_entries_by_its_own_name() {
+    let system = MemorySystem::new()
+        .with_file("/notes/notes.txt", b"jotted")
+        .unwrap();
+
+    let named = archive_with(
+        &system,
+        "/notes/notes.txt",
+        ZipOptions::default().with_first_entries(&["notes.txt"]),
+    )
+    .await;
+    let error = to_zip_writer(
+        &system,
+        Path::new("/notes/notes.txt"),
+        &mut Vec::new(),
+        ZipOptions::default().with_first_entries(&["other.txt"]),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(entry_names(&named), vec!["notes.txt".to_owned()]);
+    assert_eq!(error.kind(), ErrorKind::NotFound);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_fixed_time_gives_the_same_bytes_for_trees_written_at_different_times() {
+    let early = memory_package(SystemTime::UNIX_EPOCH);
+    let late = memory_package(september_2001());
+
+    let unfixed_early = archive_with(&early, "/pkg", ZipOptions::default()).await;
+    let unfixed_late = archive_with(&late, "/pkg", ZipOptions::default()).await;
+    assert_ne!(unfixed_early, unfixed_late);
+
+    let fixed = || ZipOptions::default().with_fixed_time(september_2001());
+    let fixed_early = archive_with(&early, "/pkg", fixed()).await;
+    let fixed_late = archive_with(&late, "/pkg", fixed()).await;
+    assert_eq!(fixed_early, fixed_late);
+    assert_eq!(entry_year(&fixed_early, "word/document.xml"), 2001);
+    assert_eq!(entry_year(&fixed_early, "word/"), 2001);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_fixed_time_outside_the_zip_range_is_clamped() {
+    let system = memory_package(SystemTime::UNIX_EPOCH);
+    let after_the_range = SystemTime::UNIX_EPOCH
+        .checked_add(Duration::from_secs(5_000_000_000))
+        .unwrap();
+
+    let floor = archive_with(
+        &system,
+        "/pkg",
+        ZipOptions::default().with_fixed_time(SystemTime::UNIX_EPOCH),
+    )
+    .await;
+    let ceiling = archive_with(
+        &system,
+        "/pkg",
+        ZipOptions::default().with_fixed_time(after_the_range),
+    )
+    .await;
+
+    assert_eq!(entry_year(&floor, "word/document.xml"), 1980);
+    assert_eq!(entry_year(&ceiling, "word/document.xml"), 2107);
+
+    let far = Duration::from_secs(0x0100_0000_0000);
+    for (time, year) in [
+        (SystemTime::UNIX_EPOCH.checked_add(far).unwrap(), 2107),
+        (SystemTime::UNIX_EPOCH.checked_sub(far).unwrap(), 1980),
+    ] {
+        let options = ZipOptions::default().with_fixed_time(time);
+        let archive = archive_with(&system, "/pkg", options).await;
+        assert_eq!(entry_year(&archive, "word/document.xml"), year);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_fixed_time_records_the_ms_dos_host_on_every_entry() {
+    let fixed = archive_with(
+        &memory_package(SystemTime::UNIX_EPOCH),
+        "/pkg",
+        ZipOptions::default()
+            .with_fixed_time(SystemTime::UNIX_EPOCH)
+            .with_zip64(Zip64::WhenNeeded),
+    )
+    .await;
+
+    // Version 2.0, then host 0: MS-DOS.
+    assert_eq!(
+        central_header_bytes(&fixed, 4),
+        vec![vec![20_u8, 0]; entry_names(&fixed).len()]
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn without_a_fixed_time_the_host_stays_the_platform() {
+    let archive = archive_with(
+        &MemorySystem::new().with_file("/one/a.txt", b"a").unwrap(),
+        "/one",
+        ZipOptions::default(),
+    )
+    .await;
+
+    // Version 4.5, then host 3: Unix.
+    assert_eq!(central_header_bytes(&archive, 4), vec![vec![45_u8, 3]]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn the_four_options_give_the_form_type_detection_reads() {
+    let archive = archive_with(&memory_package(september_2001()), "/pkg", package_options()).await;
+
+    assert_eq!(
+        entry_names(&archive),
+        vec![
+            "[Content_Types].xml".to_owned(),
+            "_rels/.rels".to_owned(),
+            "word/document.xml".to_owned(),
+            "docProps/app.xml".to_owned(),
+            "word/styles.xml".to_owned(),
+        ]
+    );
+    let version_two = vec![vec![20_u8, 0]; 5];
+    assert_eq!(local_header_bytes(&archive, 4), version_two);
+    assert_eq!(central_header_bytes(&archive, 4), version_two);
+    assert_eq!(central_header_bytes(&archive, 6), version_two);
+    assert_real_sizes(&archive);
+    assert_eq!(entry_year(&archive, "[Content_Types].xml"), 1980);
+    assert_eq!(
+        archive,
+        archive_with(
+            &memory_package(SystemTime::UNIX_EPOCH),
+            "/pkg",
+            package_options()
+        )
+        .await
+    );
+
+    let streamed = MemorySystem::from_zip_stream(&mut Cursor::new(archive.clone())).unwrap();
+    let seekable = MemorySystem::from_zip_reader(Cursor::new(archive)).unwrap();
+    for loaded in [&streamed, &seekable] {
+        assert_eq!(
+            loaded
+                .read_to_string(Path::new("/word/document.xml"))
+                .await
+                .unwrap(),
+            "<w:document/>"
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn real_and_memory_give_the_same_bytes_under_the_four_options() {
+    let real = RealSystem::new();
+    let temp = real.create_temp_dir().await.unwrap();
+    let root = temp.path().join("pkg");
+    let memory = memory_package(SystemTime::UNIX_EPOCH);
+    for (name, contents) in [
+        ("[Content_Types].xml", &b"<Types/>"[..]),
+        ("_rels/.rels", b"<Relationships/>"),
+        ("docProps/app.xml", b"<Properties/>"),
+        ("word/document.xml", b"<w:document/>"),
+        ("word/styles.xml", b"<w:styles/>"),
+    ] {
+        let path = root.join(name);
+        real.create_dir_all(path.parent().unwrap()).await.unwrap();
+        real.write(&path, contents, Condition::None).await.unwrap();
+    }
+
+    let mut from_real = Vec::new();
+    to_zip_writer(&real, &root, &mut from_real, package_options())
+        .await
+        .unwrap();
+    let from_memory = archive_with(&memory, "/pkg", package_options()).await;
+
+    assert_eq!(from_real, from_memory);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn info_zip_reports_a_clean_archive_under_the_four_options() {
+    let system = RealSystem::new();
+    let temp = system.create_temp_dir().await.unwrap();
+    let bundle = temp.path().join("pkg.docx");
+    let archive = archive_with(
+        &memory_package(SystemTime::UNIX_EPOCH),
+        "/pkg",
+        package_options(),
+    )
+    .await;
+    system
+        .write(&bundle, &archive, Condition::None)
+        .await
+        .unwrap();
+
+    // `unzip` may not be installed; the reader-based tests cover the archive then.
+    let Ok(output) = Command::new("unzip").arg("-t").arg(&bundle).output() else {
+        return;
+    };
+    assert!(output.status.success());
+}
+
+/// An incompressible entry just under the zip64 line stays inside 32 bits after deflate.
+#[cfg(slow_tests)]
+#[tokio::test(flavor = "current_thread")]
+async fn an_incompressible_entry_just_under_the_zip64_line_archives_without_zip64() {
+    let real = RealSystem::new();
+    let temp = real.create_temp_dir().await.unwrap();
+    let source = temp.path().join("big.bin");
+    write_incompressible_file(&real, &source, ZIP64_FROM_BYTES.checked_sub(1).unwrap()).await;
+
+    let destination = temp.path().join("big.zip");
+    let mut sink = File::create(&destination).unwrap();
+    to_zip_writer(
+        &real,
+        &source,
+        &mut sink,
+        ZipOptions::default().with_zip64(Zip64::WhenNeeded),
+    )
+    .await
+    .unwrap();
+    drop(sink);
+
+    let tested = Command::new("unzip")
+        .arg("-t")
+        .arg(&destination)
+        .output()
+        .unwrap();
+    assert!(tested.status.success());
+    assert_eq!(
+        sha256_of_extracted_entry(&destination, "big.bin"),
+        sha256_of_file(&source)
+    );
+    let mut header = [0_u8; 6];
+    File::open(&destination)
+        .unwrap()
+        .read_exact(&mut header)
+        .unwrap();
+    assert_eq!(header.get(4..), Some(&[20_u8, 0][..]));
+}
+
+/// An entry past 32 bits still archives under `Zip64::WhenNeeded`.
+#[cfg(slow_tests)]
+#[tokio::test(flavor = "current_thread")]
+async fn an_entry_above_four_gibibytes_archives_and_extracts_when_zip64_is_on_demand() {
+    let real = RealSystem::new();
+    let temp = real.create_temp_dir().await.unwrap();
+    let source = temp.path().join("big.bin");
+    write_incompressible_file(&real, &source, LARGE_ENTRY_BYTES).await;
+
+    let destination = temp.path().join("big.zip");
+    let mut sink = File::create(&destination).unwrap();
+    to_zip_writer(
+        &real,
+        &source,
+        &mut sink,
+        ZipOptions::default().with_zip64(Zip64::WhenNeeded),
+    )
+    .await
+    .unwrap();
+    drop(sink);
+
+    let tested = Command::new("unzip")
+        .arg("-t")
+        .arg(&destination)
+        .output()
+        .unwrap();
+    assert!(tested.status.success());
+    assert_eq!(
+        sha256_of_extracted_entry(&destination, "big.bin"),
+        sha256_of_file(&source)
+    );
+}
+
+/// Files under the zip64 line whose offsets pass 32 bits still extract.
+#[cfg(slow_tests)]
+#[tokio::test(flavor = "current_thread")]
+async fn an_archive_past_four_gibibytes_of_files_under_the_line_extracts() {
+    let real = RealSystem::new();
+    let temp = real.create_temp_dir().await.unwrap();
+    let root = temp.path().join("tree");
+    real.create_dir_all(&root).await.unwrap();
+    let names = ["one.bin", "two.bin", "three.bin"];
+    for name in names {
+        write_incompressible_file(
+            &real,
+            &root.join(name),
+            ZIP64_FROM_BYTES.checked_sub(1).unwrap(),
+        )
+        .await;
+    }
+
+    let destination = temp.path().join("big.zip");
+    let mut sink = File::create(&destination).unwrap();
+    to_zip_writer(
+        &real,
+        &root,
+        &mut sink,
+        ZipOptions::default()
+            .with_directories(false)
+            .with_zip64(Zip64::WhenNeeded),
+    )
+    .await
+    .unwrap();
+    drop(sink);
+
+    let tested = Command::new("unzip")
+        .arg("-t")
+        .arg(&destination)
+        .output()
+        .unwrap();
+    assert!(
+        tested.status.success(),
+        "unzip -t rejected the archive: {}{}",
+        String::from_utf8_lossy(&tested.stdout),
+        String::from_utf8_lossy(&tested.stderr)
+    );
+    for name in names {
+        assert_eq!(
+            sha256_of_extracted_entry(&destination, name),
+            sha256_of_file(&root.join(name))
+        );
+    }
 }
