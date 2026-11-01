@@ -66,10 +66,10 @@
 //!
 //! ```toml
 //! [dependencies]
-//! os-shim = "0.3"
+//! os-shim = "0.4"
 //!
 //! # With the optional parts:
-//! # os-shim = { version = "0.3", features = ["zip", "minio"] }
+//! # os-shim = { version = "0.4", features = ["zip", "minio"] }
 //! ```
 //!
 //! Write the code against [`System`]. Pass [`RealSystem`](real::RealSystem) in
