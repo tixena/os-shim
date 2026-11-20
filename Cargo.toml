@@ -46,6 +46,10 @@ aws-sdk-s3 = { version = "1.144.0", default-features = false, features = [
     "rt-tokio",
 ], optional = true }
 
+[target.'cfg(any(unix, target_os = "wasi"))'.dependencies]
+# Raises tempfile's rustix floor to the release that fixes its unsound xattr functions
+rustix = { version = "1.1.6", default-features = false }
+
 [dev-dependencies]
 futures-util = { version = "0.3.34", default-features = false, features = ["io", "std"] }
 tokio = { version = "1.51.6", features = ["rt", "macros", "test-util"] }
