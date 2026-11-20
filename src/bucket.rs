@@ -98,9 +98,13 @@
 //!   down. `reachable` sends one.
 //! - On `MinioBucket` and `S3Bucket` a folder is an empty object whose key ends
 //!   in `/`. `create_folder` writes one per level, and a put needs its parent
-//!   folder, so every put also lists. A folder another program made only by
-//!   writing keys below it disappears with its last key. When a file and a
-//!   folder share a path, the file wins: listings leave the folder out.
+//!   folder, so every put also lists. `put_with_folders` puts a file under
+//!   folders that do not exist; when the parent is missing it costs the first
+//!   put's listing, `create_folder`'s listing of each level and one marker per
+//!   missing level, then the second put's listing. A folder another program
+//!   made only by writing keys below it disappears with its last key. When a
+//!   file and a folder share a path, the file wins: listings leave the folder
+//!   out.
 //! - Credentials are a fixed access key and secret key. There is no session
 //!   token and no environment or profile lookup.
 //! - Revision tokens differ between implementations. A token from
@@ -118,8 +122,8 @@ mod paths;
 mod streams;
 
 use self::defaults::{
-    BufferedWriter, BytesReader, Target, append_by_rewrite, copy_by_rewrite, rename_by_copy,
-    walk_by_list,
+    BufferedWriter, BytesReader, Target, append_by_rewrite, copy_by_rewrite, put_creating_folders,
+    rename_by_copy, walk_by_list,
 };
 #[cfg(any(feature = "minio", feature = "s3"))]
 use self::paths::key_of;
@@ -248,6 +252,16 @@ where
         condition: &'call Condition,
     ) -> BoxFuture<'call, Result<RevisionToken>> {
         (**self).put(path, bytes, condition)
+    }
+
+    #[inline]
+    fn put_with_folders<'call>(
+        &'call self,
+        path: &'call Path,
+        bytes: &'call [u8],
+        condition: &'call Condition,
+    ) -> BoxFuture<'call, Result<RevisionToken>> {
+        (**self).put_with_folders(path, bytes, condition)
     }
 
     #[inline]
@@ -700,6 +714,26 @@ impl<B: Bucket> BlockingBucket<B> {
     pub fn put(&self, path: &Path, bytes: &[u8], condition: &Condition) -> Result<RevisionToken> {
         self.runtime
             .block_on(self.bucket.put(path, bytes, condition))
+    }
+
+    /// Write `bytes` at `path` when `condition` holds, creating every missing folder above it, and give the new token.
+    ///
+    /// # Errors
+    ///
+    /// The errors of `Bucket::put_with_folders`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from inside a tokio runtime.
+    #[inline]
+    pub fn put_with_folders(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        condition: &Condition,
+    ) -> Result<RevisionToken> {
+        self.runtime
+            .block_on(self.bucket.put_with_folders(path, bytes, condition))
     }
 
     /// Ask the store whether it answers.

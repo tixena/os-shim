@@ -6,7 +6,7 @@ use crate::WalkEntry;
 use crate::bucket::core_tests::{
     Observed, assert_observed, conditions_on_a_missing_file, dropped_writers, every_operation,
     file_operations, folder_operations, folder_rename, listings, lock_taken_twice, parent_rules,
-    shape, stale_release, stream_operations,
+    put_with_folders_rules, shape, stale_release, stream_operations,
 };
 use crate::bucket::{Bucket as _, Condition, Depth, Guarantee, MemoryBucket, RevisionToken};
 use core::error::Error;
@@ -189,6 +189,15 @@ async fn the_parent_rules_give_the_memory_buckets_results() {
         on_disk(parent_rules).await,
         in_memory(parent_rules).await,
         &[(7, "NotFound"), (8, "NotFound")],
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_put_with_folders_gives_the_memory_buckets_results() {
+    assert_same_as_memory(
+        on_disk(put_with_folders_rules).await,
+        in_memory(put_with_folders_rules).await,
+        &[],
     );
 }
 

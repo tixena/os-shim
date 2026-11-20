@@ -188,6 +188,28 @@ macro_rules! declare_bucket {
                 condition: &'call Condition,
             ) -> BoxFuture<'call, Result<RevisionToken>>;
 
+            /// Put `bytes` at `path` when `condition` holds, creating every missing folder above it first.
+            ///
+            /// Default: `put`; when it answers `NotFound` and `condition` is not `Matches`,
+            /// `create_folder` on the parent and `put` again, with no further retry.
+            ///
+            /// # Errors
+            ///
+            /// The errors of `put`, except `NotFound` for a missing parent folder. Under
+            /// `Matches` the errors of `put` unchanged, `NotFound` included. The errors of
+            /// `create_folder`, which include `Unsupported` on a bucket that has no folders
+            /// to create. `NotFound` when the folder is removed between `create_folder` and
+            /// the second `put`.
+            #[inline]
+            fn put_with_folders<'call>(
+                &'call self,
+                path: &'call Path,
+                bytes: &'call [u8],
+                condition: &'call Condition,
+            ) -> BoxFuture<'call, Result<RevisionToken>> {
+                Box::pin(put_creating_folders(self, path, bytes, condition))
+            }
+
             /// Ask the store whether it answers.
             ///
             /// Default: `list` on `/`, with the entries dropped.

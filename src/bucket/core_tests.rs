@@ -116,6 +116,16 @@ Box::pin(self.0.remove_folder(path))
 }
 });
 
+/// The required methods and a `create_folder` that counts its calls.
+struct CountsFolders(MemoryBucket, AtomicU64);
+
+forward_required!(CountsFolders {
+    fn create_folder<'call>(&'call self, path: &'call Path) -> BoxFuture<'call, Result<()>> {
+self.1.fetch_add(1, Ordering::SeqCst);
+Box::pin(self.0.create_folder(path))
+}
+} {});
+
 /// A bucket whose file changes just before a delete under a token, so the token is stale.
 struct ChangesBeforeDelete(MemoryBucket);
 
@@ -463,6 +473,38 @@ where
     Ok(lines)
 }
 
+/// A put with folders under two missing folders, under a file, over a file and under a missing parent with a token.
+pub(super) async fn put_with_folders_rules<B>(bucket: &B, root: &Path) -> Observed
+where
+    B: Bucket,
+{
+    let deep = root.join("a/b/f.md");
+    let token = bucket
+        .put_with_folders(&deep, b"x", &Condition::None)
+        .await?;
+    let mut lines = vec![format!("{:?}", bucket.get(&deep).await?.0)];
+    bucket
+        .put(&root.join("file"), b"x", &Condition::None)
+        .await?;
+    lines.push(shape(
+        &bucket
+            .put_with_folders(&root.join("file/g.md"), b"y", &Condition::None)
+            .await,
+    ));
+    lines.push(shape(
+        &bucket
+            .put_with_folders(&deep, b"y", &Condition::Absent)
+            .await,
+    ));
+    lines.push(shape(
+        &bucket
+            .put_with_folders(&root.join("m/n/g.md"), b"y", &Condition::Matches(token))
+            .await,
+    ));
+    lines.push(shape(&bucket.head(&root.join("m")).await));
+    Ok(lines)
+}
+
 /// Two writes with the clock moved by 60 seconds between them.
 async fn clock_stamps() -> Observed {
     let (clock, seconds) = moving_clock();
@@ -741,6 +783,70 @@ async fn a_failed_delete_in_the_default_rename_removes_the_copy() {
             "NotFound",
         ],
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_put_with_folders_creates_the_folders_and_keeps_the_put_rules() {
+    assert_observed(
+        put_with_folders_rules(&MemoryBucket::default(), Path::new("/")).await,
+        &[
+            "[120]",
+            "NotADirectory",
+            "AlreadyExists",
+            "NotFound",
+            "NotFound",
+        ],
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_put_with_folders_under_an_existing_parent_creates_no_folder() {
+    let bucket = CountsFolders(MemoryBucket::default(), AtomicU64::new(0));
+    let made = bucket.create_folder(Path::new("/a")).await;
+    bucket.1.store(0, Ordering::SeqCst);
+    let put = bucket
+        .put_with_folders(Path::new("/a/f.md"), b"x", &Condition::None)
+        .await;
+    assert_eq!(
+        (shape(&made), shape(&put), bucket.1.load(Ordering::SeqCst)),
+        ("ok".to_owned(), "ok".to_owned(), 0)
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_put_with_folders_under_one_missing_folder_creates_it_once() {
+    let bucket = CountsFolders(MemoryBucket::default(), AtomicU64::new(0));
+    let put = bucket
+        .put_with_folders(Path::new("/a/f.md"), b"x", &Condition::None)
+        .await;
+    assert_eq!(
+        (shape(&put), bucket.1.load(Ordering::SeqCst)),
+        ("ok".to_owned(), 1)
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_arc_forwards_a_put_with_folders() {
+    let bucket = Arc::new(CountsFolders(MemoryBucket::default(), AtomicU64::new(0)));
+    let put = bucket
+        .put_with_folders(Path::new("/a/f.md"), b"x", &Condition::None)
+        .await;
+    assert_eq!(
+        (shape(&put), bucket.1.load(Ordering::SeqCst)),
+        ("ok".to_owned(), 1)
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_put_with_folders_by_default_needs_create_folder_only_for_a_missing_parent() {
+    let bucket = RequiredOnly(MemoryBucket::default());
+    let missing = bucket
+        .put_with_folders(Path::new("/a/f.md"), b"x", &Condition::None)
+        .await;
+    let present = bucket
+        .put_with_folders(Path::new("/f.md"), b"x", &Condition::None)
+        .await;
+    assert_eq!([shape(&missing), shape(&present)], ["Unsupported", "ok"]);
 }
 
 #[tokio::test(flavor = "current_thread")]
