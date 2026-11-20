@@ -11,7 +11,7 @@ use ignore::WalkBuilder;
 use same_file::Handle;
 use sha2::{Digest as _, Sha256};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read as _, Seek as _, Write as _};
+use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 
 /// The local disk as a bucket: every path is handed to the operating system as it is.
@@ -141,6 +141,26 @@ impl Bucket for DiskBucket {
             let bytes = fs::read(path)?;
             let token = token_of(&bytes);
             Ok((bytes, token))
+        }))
+    }
+
+    #[inline]
+    fn get_range<'call>(
+        &'call self,
+        path: &'call Path,
+        offset: u64,
+        length: u64,
+    ) -> BoxFuture<'call, Result<Vec<u8>>> {
+        Box::pin(on_first_poll(move || {
+            let mut file = File::open(path)?;
+            let metadata = file.metadata()?;
+            if metadata.is_dir() {
+                return Err(StorageError::from_kind(ErrorKind::IsADirectory));
+            }
+            file.seek(SeekFrom::Start(offset.min(metadata.len())))?;
+            let mut bytes = Vec::new();
+            file.take(length).read_to_end(&mut bytes)?;
+            Ok(bytes)
         }))
     }
 

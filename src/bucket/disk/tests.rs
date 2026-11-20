@@ -5,8 +5,8 @@ use super::{DiskBucket, delete_opened, token_of};
 use crate::WalkEntry;
 use crate::bucket::core_tests::{
     Observed, assert_observed, conditions_on_a_missing_file, dropped_writers, every_operation,
-    file_operations, folder_operations, folder_rename, listings, lock_taken_twice, parent_rules,
-    put_with_folders_rules, shape, stale_release, stream_operations,
+    file_operations, folder_operations, folder_rename, get_range_rules, listings, lock_taken_twice,
+    parent_rules, put_with_folders_rules, shape, stale_release, stream_operations,
 };
 use crate::bucket::{Bucket as _, Condition, Depth, Guarantee, MemoryBucket, RevisionToken};
 use core::error::Error;
@@ -198,6 +198,33 @@ async fn a_put_with_folders_gives_the_memory_buckets_results() {
         on_disk(put_with_folders_rules).await,
         in_memory(put_with_folders_rules).await,
         &[],
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_range_gives_the_memory_buckets_results() {
+    assert_same_as_memory(
+        on_disk(get_range_rules).await,
+        in_memory(get_range_rules).await,
+        &[],
+    );
+}
+
+/// The last 10 bytes of a 100000-byte file, asked for as everything from byte 99990 on.
+async fn range_of_a_long_file() -> Result<Vec<u8>, Box<dyn Error>> {
+    let folder = TempDir::new()?;
+    let file = folder.path().join("long");
+    fs::write(&file, vec![7_u8; 100_000])?;
+    Ok(DiskBucket::new().get_range(&file, 99_990, u64::MAX).await?)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_range_of_a_long_file_reads_only_what_was_asked() {
+    assert_eq!(
+        range_of_a_long_file()
+            .await
+            .map_err(|error| error.to_string()),
+        Ok(vec![7_u8; 10])
     );
 }
 

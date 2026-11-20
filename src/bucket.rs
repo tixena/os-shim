@@ -101,7 +101,11 @@
 //!   folder, so every put also lists. `put_with_folders` puts a file under
 //!   folders that do not exist; when the parent is missing it costs the first
 //!   put's listing, `create_folder`'s listing of each level and one marker per
-//!   missing level, then the second put's listing. A folder another program
+//!   missing level, then the second put's listing. `get_range` reads part of a
+//!   file: one `GetObject` with a `Range` header and no `HEAD` for a file that
+//!   exists, an empty answer for a range that starts at or past the end, and
+//!   for a `length` of 0 one `HEAD` on a file; a missing path or a folder costs
+//!   the requests `get` sends to tell them apart. A folder another program
 //!   made only by writing keys below it disappears with its last key. When a
 //!   file and a folder share a path, the file wins: listings leave the folder
 //!   out.
@@ -122,8 +126,8 @@ mod paths;
 mod streams;
 
 use self::defaults::{
-    BufferedWriter, BytesReader, Target, append_by_rewrite, copy_by_rewrite, put_creating_folders,
-    rename_by_copy, walk_by_list,
+    BufferedWriter, BytesReader, Target, append_by_rewrite, copy_by_rewrite, get_cut,
+    put_creating_folders, rename_by_copy, walk_by_list,
 };
 #[cfg(any(feature = "minio", feature = "s3"))]
 use self::paths::key_of;
@@ -223,6 +227,16 @@ where
         path: &'call Path,
     ) -> BoxFuture<'call, Result<(Vec<u8>, RevisionToken)>> {
         (**self).get(path)
+    }
+
+    #[inline]
+    fn get_range<'call>(
+        &'call self,
+        path: &'call Path,
+        offset: u64,
+        length: u64,
+    ) -> BoxFuture<'call, Result<Vec<u8>>> {
+        (**self).get_range(path, offset, length)
     }
 
     #[inline]
@@ -659,6 +673,21 @@ impl<B: Bucket> BlockingBucket<B> {
         self.runtime.block_on(self.bucket.get(path))
     }
 
+    /// `length` bytes of the file at `path` from `offset`.
+    ///
+    /// # Errors
+    ///
+    /// The errors of `Bucket::get_range`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from inside a tokio runtime.
+    #[inline]
+    pub fn get_range(&self, path: &Path, offset: u64, length: u64) -> Result<Vec<u8>> {
+        self.runtime
+            .block_on(self.bucket.get_range(path, offset, length))
+    }
+
     /// Kind, size, modification time and token of what is at `path`, without its bytes.
     ///
     /// # Errors
@@ -1051,6 +1080,50 @@ impl SdkBucket {
             .await
             .map_err(|error| StorageError::new(ErrorKind::Other, error))?;
         Ok((collected.into_bytes().to_vec(), RevisionToken::new(etag)))
+    }
+
+    /// `length` bytes of the file at `path` from `offset`, in one `GetObject` for a file that exists.
+    async fn get_range(&self, path: &Path, offset: u64, length: u64) -> Result<Vec<u8>> {
+        let Some(last_offset) = length.checked_sub(1) else {
+            return if self.head(path).await?.is_dir {
+                Err(StorageError::from_kind(ErrorKind::IsADirectory))
+            } else {
+                Ok(Vec::new())
+            };
+        };
+        let key = key_of(&self.prefix, path)?;
+        let range = range_header(offset, last_offset);
+        let output = match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .range(range)
+            .send()
+            .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                let range_not_satisfiable = error
+                    .raw_response()
+                    .is_some_and(|response| response.status().as_u16() == 416);
+                if range_not_satisfiable {
+                    return Ok(Vec::new());
+                }
+                let failure = classify(error);
+                return Err(if failure.kind() == ErrorKind::NotFound {
+                    self.absence(path).await?
+                } else {
+                    failure
+                });
+            }
+        };
+        let collected = output
+            .body
+            .collect()
+            .await
+            .map_err(|error| StorageError::new(ErrorKind::Other, error))?;
+        Ok(collected.into_bytes().to_vec())
     }
 
     /// Whether the folder has a marker or a key below it.
@@ -1623,6 +1696,16 @@ impl Bucket for MinioBucket {
     }
 
     #[inline]
+    fn get_range<'call>(
+        &'call self,
+        path: &'call Path,
+        offset: u64,
+        length: u64,
+    ) -> BoxFuture<'call, Result<Vec<u8>>> {
+        Box::pin(self.0.get_range(path, offset, length))
+    }
+
+    #[inline]
     fn guarantees(&self) -> Guarantees {
         const PROMISED: Guarantees = Guarantees::none()
             // If-Match on PutObject: https://docs.min.io/community/minio-object-store/reference/s3-api-compatibility.html
@@ -1940,6 +2023,16 @@ impl Bucket for S3Bucket {
     }
 
     #[inline]
+    fn get_range<'call>(
+        &'call self,
+        path: &'call Path,
+        offset: u64,
+        length: u64,
+    ) -> BoxFuture<'call, Result<Vec<u8>>> {
+        Box::pin(self.0.get_range(path, offset, length))
+    }
+
+    #[inline]
     fn guarantees(&self) -> Guarantees {
         const PROMISED: Guarantees = Guarantees::none()
             // If-Match on DeleteObject: https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObject.html
@@ -2041,6 +2134,21 @@ impl fmt::Display for SdkFailure {
 impl Error for SdkFailure {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         Some(self.source.as_ref())
+    }
+}
+
+/// The `Range` header for `last_offset + 1` bytes from `offset`. Servers read byte positions as
+/// signed 64-bit, so a position past `i64::MAX` is clamped or sent open-ended, which reads the same
+/// bytes since no object is that large.
+#[cfg(any(feature = "minio", feature = "s3"))]
+fn range_header(offset: u64, last_offset: u64) -> String {
+    let limit = i64::MAX.cast_unsigned();
+    let first = offset.min(limit);
+    let last = offset.saturating_add(last_offset);
+    if last > limit {
+        format!("bytes={first}-")
+    } else {
+        format!("bytes={first}-{last}")
     }
 }
 

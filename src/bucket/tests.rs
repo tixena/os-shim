@@ -605,6 +605,85 @@ fn minio_get_of_a_folder_is_a_directory() {
 
 #[cfg(feature = "minio")]
 #[test]
+fn minio_get_range_of_a_file_sends_one_ranged_get_and_no_head() {
+    let (endpoint, seen) = canned(vec![answer(
+        "206 Partial Content",
+        "ETag: \"t\"\r\n",
+        "234",
+    )]);
+    let bytes = minio(endpoint)
+        .get_range(Path::new("/task.md"), 2, 3)
+        .unwrap();
+    assert_eq!(bytes, b"234");
+    assert_eq!(requests(&seen), ["GET if-match=- range=bytes=2-4"]);
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_get_range_past_what_a_server_reads_is_open_ended() {
+    let (endpoint, seen) = canned(vec![
+        answer("206 Partial Content", "ETag: \"t\"\r\n", "0123456789"),
+        answer("416 Range Not Satisfiable", "", ""),
+    ]);
+    let bucket = minio(endpoint);
+    let whole = bucket
+        .get_range(Path::new("/task.md"), 0, u64::MAX)
+        .unwrap();
+    assert_eq!(whole, b"0123456789");
+    let beyond = bucket
+        .get_range(Path::new("/task.md"), u64::MAX, 5)
+        .unwrap();
+    assert_eq!(beyond, Vec::<u8>::new());
+    assert_eq!(
+        requests(&seen),
+        [
+            "GET if-match=- range=bytes=0-",
+            "GET if-match=- range=bytes=9223372036854775807-"
+        ]
+    );
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_get_range_answered_416_is_empty() {
+    let (endpoint, seen) = canned(vec![answer("416 Range Not Satisfiable", "", "")]);
+    let bytes = minio(endpoint)
+        .get_range(Path::new("/task.md"), 99, 5)
+        .unwrap();
+    assert_eq!(bytes, Vec::<u8>::new());
+    assert_eq!(requests(&seen), ["GET if-match=- range=bytes=99-103"]);
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_get_range_of_a_folder_is_a_directory_and_sends_what_absence_sends() {
+    let (endpoint, seen) = canned(vec![
+        answer("404 Not Found", "", ""),
+        listing(&["d/f.md"], &[]),
+    ]);
+    let error = minio(endpoint)
+        .get_range(Path::new("/d"), 0, 10)
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::IsADirectory);
+    assert_eq!(
+        requests(&seen),
+        ["GET if-match=- range=bytes=0-9", "GET if-match=-"]
+    );
+}
+
+#[cfg(feature = "minio")]
+#[test]
+fn minio_get_range_of_length_0_sends_one_head_and_is_empty_for_a_file() {
+    let (endpoint, seen) = canned(vec![sized(10)]);
+    let bytes = minio(endpoint)
+        .get_range(Path::new("/task.md"), 3, 0)
+        .unwrap();
+    assert_eq!(bytes, Vec::<u8>::new());
+    assert_eq!(requests(&seen), ["HEAD if-match=-"]);
+}
+
+#[cfg(feature = "minio")]
+#[test]
 fn minio_delete_of_a_folder_is_a_directory_and_sends_no_delete() {
     let (endpoint, seen) = canned(vec![
         answer("404 Not Found", "", ""),

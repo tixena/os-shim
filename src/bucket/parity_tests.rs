@@ -609,6 +609,46 @@ where
     transcript
 }
 
+/// Ranges of a file in the middle, cut at its end, empty at and past its end, of length 0, of an empty file, of a folder and of a missing path.
+fn get_range_cases<B>(bucket: &BlockingBucket<B>, base: &str) -> Vec<String>
+where
+    B: Bucket,
+{
+    ensure_folder(bucket, base);
+    let file = at(base, "digits");
+    bucket.put(&file, b"0123456789", &Condition::None).unwrap();
+    let empty = at(base, "empty");
+    bucket.put(&empty, b"", &Condition::None).unwrap();
+    let folder = at(base, "folder");
+    bucket.create_folder(&folder).unwrap();
+    let missing = at(base, "missing");
+    let cases = [
+        (&file, 2, 3),
+        (&file, 8, 10),
+        (&file, 10, 5),
+        (&file, 99, 5),
+        (&file, 3, 0),
+        (&file, 0, u64::MAX),
+        (&file, u64::MAX, 5),
+        (&empty, 0, 0),
+        (&empty, 0, 10),
+        (&folder, 0, 0),
+        (&folder, 0, 10),
+        (&missing, 0, 0),
+        (&missing, 0, 10),
+    ];
+    let transcript = cases
+        .into_iter()
+        .map(|(path, offset, length)| {
+            shape(&bucket.get_range(path, offset, length), |bytes| {
+                format!("bytes {bytes:?}")
+            })
+        })
+        .collect();
+    drop(bucket.remove_folder(Path::new(base)));
+    transcript
+}
+
 /// Relative paths and `..` above the root are refused before any request.
 fn refused_paths<B>(bucket: &BlockingBucket<B>) -> Vec<String>
 where
@@ -821,6 +861,16 @@ fn put_with_folders_agrees_with_the_server() {
         "put with folders",
         &put_with_folders_cases(&memory(), "/a"),
         &put_with_folders_cases(&server(), "/put-with-folders"),
+    );
+}
+
+#[cfg(minio_tests)]
+#[test]
+fn get_range_agrees_with_the_server() {
+    assert_agree(
+        "get range",
+        &get_range_cases(&memory(), "/a"),
+        &get_range_cases(&server(), "/get-range"),
     );
 }
 
@@ -1446,6 +1496,16 @@ fn put_with_folders_agrees_with_aws() {
         "put with folders",
         &put_with_folders_cases(&memory(), "/a"),
         &aws_transcript("put-with-folders", put_with_folders_cases),
+    );
+}
+
+#[cfg(s3_tests)]
+#[test]
+fn get_range_agrees_with_aws() {
+    assert_agree(
+        "get range",
+        &get_range_cases(&memory(), "/a"),
+        &aws_transcript("get-range", get_range_cases),
     );
 }
 

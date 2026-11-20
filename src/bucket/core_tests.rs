@@ -50,6 +50,23 @@ Box::pin(self.0.put(path, bytes, condition))
     };
 }
 
+/// What `get_range_rules` sees, line by line.
+const RANGE_LINES: [&str; 13] = [
+    "\"234\"",
+    "\"89\"",
+    "\"\"",
+    "\"\"",
+    "\"\"",
+    "\"\"",
+    "\"0123456789\"",
+    "\"\"",
+    "\"\"",
+    "IsADirectory",
+    "IsADirectory",
+    "NotFound",
+    "NotFound",
+];
+
 /// What a scenario saw, line by line, or why it could not go on.
 pub(super) type Observed = result::Result<Vec<String>, Box<dyn Error>>;
 
@@ -505,6 +522,48 @@ where
     Ok(lines)
 }
 
+/// What a range's answer looks like: its bytes as text, or the kind of its error.
+fn range_line(outcome: &Result<Vec<u8>>) -> String {
+    match outcome.as_ref() {
+        Ok(bytes) => format!("{:?}", String::from_utf8_lossy(bytes)),
+        Err(error) => format!("{:?}", error.kind()),
+    }
+}
+
+/// Ranges of a file in the middle, cut at its end, empty at and past its end, of length 0, of an empty file, of a folder and of a missing path.
+pub(super) async fn get_range_rules<B>(bucket: &B, root: &Path) -> Observed
+where
+    B: Bucket,
+{
+    let file = root.join("digits");
+    bucket.put(&file, b"0123456789", &Condition::None).await?;
+    let empty = root.join("empty");
+    bucket.put(&empty, b"", &Condition::None).await?;
+    let folder = root.join("folder");
+    bucket.create_folder(&folder).await?;
+    let missing = root.join("missing");
+    let cases = [
+        (&file, 2, 3),
+        (&file, 8, 10),
+        (&file, 10, 5),
+        (&file, 99, 5),
+        (&file, u64::MAX, 5),
+        (&file, 3, 0),
+        (&file, 0, u64::MAX),
+        (&empty, 0, 0),
+        (&empty, 0, 10),
+        (&folder, 0, 0),
+        (&folder, 0, 10),
+        (&missing, 0, 0),
+        (&missing, 0, 10),
+    ];
+    let mut lines = Vec::new();
+    for (path, offset, length) in cases {
+        lines.push(range_line(&bucket.get_range(path, offset, length).await));
+    }
+    Ok(lines)
+}
+
 /// Two writes with the clock moved by 60 seconds between them.
 async fn clock_stamps() -> Observed {
     let (clock, seconds) = moving_clock();
@@ -847,6 +906,28 @@ async fn a_put_with_folders_by_default_needs_create_folder_only_for_a_missing_pa
         .put_with_folders(Path::new("/f.md"), b"x", &Condition::None)
         .await;
     assert_eq!([shape(&missing), shape(&present)], ["Unsupported", "ok"]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_range_is_cut_from_the_file_and_checks_the_file_in_every_case() {
+    assert_observed(
+        get_range_rules(&MemoryBucket::default(), Path::new("/")).await,
+        &RANGE_LINES,
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_range_by_default_gives_the_memory_buckets_results() {
+    assert_observed(
+        get_range_rules(&WithFolders(MemoryBucket::default()), Path::new("/")).await,
+        &RANGE_LINES,
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_arc_forwards_a_range() {
+    let bucket = Arc::new(MemoryBucket::default());
+    assert_observed(get_range_rules(&bucket, Path::new("/")).await, &RANGE_LINES);
 }
 
 #[tokio::test(flavor = "current_thread")]
