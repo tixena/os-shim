@@ -28,6 +28,7 @@ async fn writes_and_reads(store: &dyn Bucket, folder: &Path) -> Result<()> {
         .put_with_folders(&deep, b"%PDF-1.4", &Condition::None)
         .await?;
     assert_eq!(store.get(&deep).await?, (b"%PDF-1.4".to_vec(), token));
+    assert_eq!(store.get_range(&file, 1, 3).await?, b"PDF");
     store.remove_folder(&folder.join("anio")).await?;
     Ok(())
 }

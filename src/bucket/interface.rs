@@ -147,6 +147,26 @@ macro_rules! declare_bucket {
                 path: &'call Path,
             ) -> BoxFuture<'call, Result<(Vec<u8>, RevisionToken)>>;
 
+            /// `length` bytes of the file at `path` from `offset`: fewer when the file ends first,
+            /// none when `offset` is at or past its end or `length` is 0. The file is checked in every
+            /// case, so a missing path or a folder answers the error `get` gives, whatever `offset`
+            /// and `length`.
+            ///
+            /// Default: `get`, then the range cut from the bytes.
+            ///
+            /// # Errors
+            ///
+            /// The errors of `get`.
+            #[inline]
+            fn get_range<'call>(
+                &'call self,
+                path: &'call Path,
+                offset: u64,
+                length: u64,
+            ) -> BoxFuture<'call, Result<Vec<u8>>> {
+                Box::pin(get_cut(self, path, offset, length))
+            }
+
             /// What this backend promises.
             fn guarantees(&self) -> Guarantees;
 

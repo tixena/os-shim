@@ -166,6 +166,17 @@ where
     Ok(u64::try_from(bytes.len()).map_err(io::Error::other)?)
 }
 
+/// Read the file, then cut `length` bytes from `offset` out of its bytes.
+pub async fn get_cut<B>(bucket: &B, path: &Path, offset: u64, length: u64) -> Result<Vec<u8>>
+where
+    B: Bucket + ?Sized,
+{
+    let (bytes, _token) = bucket.get(path).await?;
+    let start = usize::try_from(offset).unwrap_or(usize::MAX);
+    let count = usize::try_from(length).unwrap_or(usize::MAX);
+    Ok(bytes.iter().skip(start).take(count).copied().collect())
+}
+
 /// Put the file; on `NotFound` without a `Matches` condition, create its parent folder and put once more.
 pub async fn put_creating_folders<B>(
     bucket: &B,
