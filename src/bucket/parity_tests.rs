@@ -573,6 +573,42 @@ where
     transcript
 }
 
+/// A put with folders under missing folders, under a file, over a file and under a missing parent with a token.
+fn put_with_folders_cases<B>(bucket: &BlockingBucket<B>, base: &str) -> Vec<String>
+where
+    B: Bucket,
+{
+    ensure_folder(bucket, base);
+    let deep = at(base, "a/b/f.md");
+    let token = bucket
+        .put_with_folders(&deep, b"x", &Condition::None)
+        .unwrap();
+    let mut transcript = vec![get_line(&bucket.get(&deep))];
+    transcript.push(put_line(&bucket.put(
+        &at(base, "file"),
+        b"x",
+        &Condition::None,
+    )));
+    transcript.push(put_line(&bucket.put_with_folders(
+        &at(base, "file/g.md"),
+        b"y",
+        &Condition::None,
+    )));
+    transcript.push(put_line(&bucket.put_with_folders(
+        &deep,
+        b"y",
+        &Condition::Absent,
+    )));
+    transcript.push(put_line(&bucket.put_with_folders(
+        &at(base, "m/n/g.md"),
+        b"y",
+        &Condition::Matches(token),
+    )));
+    transcript.push(head_line(&bucket.head(&at(base, "m"))));
+    drop(bucket.remove_folder(Path::new(base)));
+    transcript
+}
+
 /// Relative paths and `..` above the root are refused before any request.
 fn refused_paths<B>(bucket: &BlockingBucket<B>) -> Vec<String>
 where
@@ -775,6 +811,16 @@ fn parent_check_agrees_with_the_server() {
         "parent check",
         &parent_check(&memory(), "/a"),
         &parent_check(&server(), "/parent-check"),
+    );
+}
+
+#[cfg(minio_tests)]
+#[test]
+fn put_with_folders_agrees_with_the_server() {
+    assert_agree(
+        "put with folders",
+        &put_with_folders_cases(&memory(), "/a"),
+        &put_with_folders_cases(&server(), "/put-with-folders"),
     );
 }
 
@@ -1390,6 +1436,16 @@ fn parent_check_agrees_with_aws() {
         "parent check",
         &parent_check(&memory(), "/a"),
         &aws_transcript("parent-check", parent_check),
+    );
+}
+
+#[cfg(s3_tests)]
+#[test]
+fn put_with_folders_agrees_with_aws() {
+    assert_agree(
+        "put with folders",
+        &put_with_folders_cases(&memory(), "/a"),
+        &aws_transcript("put-with-folders", put_with_folders_cases),
     );
 }
 

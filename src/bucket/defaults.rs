@@ -166,6 +166,33 @@ where
     Ok(u64::try_from(bytes.len()).map_err(io::Error::other)?)
 }
 
+/// Put the file; on `NotFound` without a `Matches` condition, create its parent folder and put once more.
+pub async fn put_creating_folders<B>(
+    bucket: &B,
+    path: &Path,
+    bytes: &[u8],
+    condition: &Condition,
+) -> Result<RevisionToken>
+where
+    B: Bucket + ?Sized,
+{
+    match bucket.put(path, bytes, condition).await {
+        Err(error)
+            if error.kind() == ErrorKind::NotFound
+                && !matches!(condition, Condition::Matches(_)) =>
+        {
+            match path.parent() {
+                Some(parent) => {
+                    bucket.create_folder(parent).await?;
+                    bucket.put(path, bytes, condition).await
+                }
+                None => Err(error),
+            }
+        }
+        other => other,
+    }
+}
+
 /// Move a file or, when `from` is a folder, everything in it.
 pub async fn rename_by_copy<B>(bucket: &B, from: &Path, to: &Path) -> Result<()>
 where

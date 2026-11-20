@@ -23,6 +23,12 @@ async fn writes_and_reads(store: &dyn Bucket, folder: &Path) -> Result<()> {
     assert_eq!(store.get(&file).await?, (b"%PDF-1.7".to_vec(), first));
     store.append(&file, b"+").await?;
     assert_eq!(store.head(&file).await?.len, 9);
+    let deep = folder.join("anio").join("mes").join("recibo.pdf");
+    let token = store
+        .put_with_folders(&deep, b"%PDF-1.4", &Condition::None)
+        .await?;
+    assert_eq!(store.get(&deep).await?, (b"%PDF-1.4".to_vec(), token));
+    store.remove_folder(&folder.join("anio")).await?;
     Ok(())
 }
 

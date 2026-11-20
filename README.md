@@ -89,7 +89,7 @@ The clients reach a server through AWS's SDK, `aws-sdk-s3`, and send each reques
 - `MinioBucket` (`minio`) talks to a server that speaks MinIO's API, such as MinIO or RustFS, with path-style addressing. Some of these servers ignore `If-Match` on a delete, so a conditional delete reads the object's tag first and sends `If-Match` as well.
 - `S3Bucket` (`s3`) talks to AWS S3, which checks `If-Match` on a delete itself.
 
-On both, a folder is an empty object whose key ends in `/`. `create_folder` writes one for each missing level, and a put needs its parent folder, so every put also sends list requests. A folder another program made only by writing keys below it disappears with its last key. When a file and a folder share a path, the file wins: listings leave the folder out.
+On both, a folder is an empty object whose key ends in `/`. `create_folder` writes one for each missing level, and a put needs its parent folder, so every put also sends list requests. `put_with_folders` puts a file under folders that do not exist, for a caller that does not create its folders; when the parent is missing it costs the first put's listing, `create_folder`'s listing of each level and one marker per missing level, then the second put's listing. A folder another program made only by writing keys below it disappears with its last key. When a file and a folder share a path, the file wins: listings leave the folder out.
 
 `read_stream`, `write_stream` and `append_stream` move a file in parts of 8 MiB, holding one part in memory at a time. A written file appears when its writer closes; a writer dropped without `close` logs an error and stores nothing. `copy` and `rename` run on the server.
 
