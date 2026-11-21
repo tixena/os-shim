@@ -35,7 +35,7 @@ time = { version = "0.3.47", optional = true }
 futures-io = "0.3.34"
 
 # Process operations (optional)
-libc = { version = "0.2.183", optional = true }
+libc = { version = "0.2.186", optional = true }
 
 # Bucket clients (optional): BlockingBucket's runtime
 tokio = { version = "1.51.6", features = ["rt"], optional = true }
