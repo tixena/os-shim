@@ -744,3 +744,16 @@ async fn renaming_out_of_a_temporary_directory_moves_the_file_into_the_bucket() 
     );
     assert!(!system.exists(&scratch).await.unwrap());
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn read_dir_on_a_relative_path_lists_entries_under_that_path() {
+    let system = MemorySystem::new()
+        .with_current_dir("/")
+        .unwrap()
+        .with_file("/proj/a.txt", b"a")
+        .unwrap();
+
+    let entries = system.read_dir(Path::new("proj")).await.unwrap();
+
+    assert_eq!(entries, vec![Path::new("proj/a.txt").to_path_buf()]);
+}
