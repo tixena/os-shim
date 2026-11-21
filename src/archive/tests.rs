@@ -12,7 +12,7 @@ use crate::{BoxFuture, FileMetadata, System, TempDirHandle, WalkEntry};
 use core::result;
 use core::time::Duration;
 use futures_io::{AsyncRead, AsyncWrite};
-use std::env::VarError;
+use std::env::{self, VarError};
 #[cfg(unix)]
 use std::ffi::OsStr;
 #[cfg(slow_tests)]
@@ -20,7 +20,7 @@ use std::fs::File;
 use std::io::{self, Cursor, Read as _, Write, pipe};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt as _;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 #[cfg(slow_tests)]
 use std::process::Stdio;
@@ -639,6 +639,47 @@ async fn the_three_zip_shapes_agree_byte_for_byte() {
     assert_eq!(from_writer, from_vec);
     assert_eq!(from_vec, from_stream);
     assert!(entry_names(&from_vec).contains(&"README.md".to_owned()));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_relative_source_zips_the_same_entries_as_its_absolute_path_in_memory() {
+    let system = memory_project().with_current_dir("/").unwrap();
+
+    let absolute = system.to_zip_vec(Path::new("/proj")).await.unwrap();
+    let relative = system.to_zip_vec(Path::new("proj")).await.unwrap();
+
+    assert_eq!(entry_names(&relative), entry_names(&absolute));
+    assert!(entry_names(&relative).contains(&"README.md".to_owned()));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_relative_source_zips_the_same_entries_as_its_absolute_path_on_disk() {
+    let system = RealSystem::new();
+    let temp = system.create_temp_dir().await.unwrap();
+    let root = temp.path().join("root");
+    system.create_dir_all(&root.join("src")).await.unwrap();
+    system
+        .write(&root.join("README.md"), b"hi\n", Condition::None)
+        .await
+        .unwrap();
+    system
+        .write(
+            &root.join("src/main.rs"),
+            b"fn main() {}\n",
+            Condition::None,
+        )
+        .await
+        .unwrap();
+    let relative = relative_to_the_working_dir(&root);
+
+    let absolute_archive = system.to_zip_vec(&root).await.unwrap();
+    let relative_archive = system.to_zip_vec(&relative).await.unwrap();
+
+    assert_eq!(
+        entry_names(&relative_archive),
+        entry_names(&absolute_archive)
+    );
+    assert!(entry_names(&relative_archive).contains(&"README.md".to_owned()));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1876,4 +1917,16 @@ async fn an_archive_past_four_gibibytes_of_files_under_the_line_extracts() {
             sha256_of_file(&root.join(name))
         );
     }
+}
+
+fn relative_to_the_working_dir(target: &Path) -> PathBuf {
+    let working = env::current_dir().unwrap();
+    let climb = working
+        .components()
+        .filter(|part| matches!(part, Component::Normal(_)))
+        .map(|_| Component::ParentDir);
+    let below = target
+        .components()
+        .filter(|part| matches!(part, Component::Normal(_)));
+    climb.chain(below).collect()
 }

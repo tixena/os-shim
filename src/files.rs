@@ -445,7 +445,7 @@ where
     storage.get(&resolved).await
 }
 
-/// The full paths of the direct children of the folder at `path`.
+/// The paths of the direct children of the folder at `path`, each under `path` as given.
 pub async fn read_dir<M>(machine: &M, path: &Path) -> Result<Vec<PathBuf>>
 where
     M: Machine,
@@ -455,7 +455,13 @@ where
         return Err(StorageError::from_kind(ErrorKind::NotADirectory));
     }
     let entries = storage.list(&resolved, Depth::Children).await?;
-    Ok(entries.into_iter().map(|entry| entry.path).collect())
+    if path.is_absolute() {
+        return Ok(entries.into_iter().map(|entry| entry.path).collect());
+    }
+    Ok(entries
+        .iter()
+        .filter_map(|entry| entry.path.file_name().map(|name| path.join(name)))
+        .collect())
 }
 
 /// The contents of the file at `path` as text.

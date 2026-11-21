@@ -647,6 +647,18 @@ async fn a_writer_on_a_relative_path_dropped_without_close_keeps_its_bytes() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn read_dir_on_a_relative_path_lists_entries_under_that_path() {
+    let system = RealSystem::new();
+    let dir = system.create_temp_dir().await.unwrap();
+    fs::write(dir.path().join("a.txt"), b"a").unwrap();
+    let relative = relative_to_the_working_dir(dir.path());
+
+    let entries = system.read_dir(&relative).await.unwrap();
+
+    assert_eq!(entries, vec![relative.join("a.txt")]);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn a_temporary_directory_stays_on_the_machine() {
     let bucket = MemoryBucket::default();
     let system = RealSystem::with_bucket(bucket.clone());
