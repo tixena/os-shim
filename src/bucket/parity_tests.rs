@@ -678,9 +678,10 @@ fn status<T, E>(answer: &result::Result<T, SdkError<E>>) -> String {
 async fn dyn_bucket_answers_on_the_server() {
     let store = MinioBucket::new(ready_config());
     let as_dyn: &dyn Bucket = &store;
-    super::dyn_tests::every_method(as_dyn, Path::new("/dyn-bucket"))
-        .await
-        .unwrap();
+    let prefix = run_prefix("dyn-bucket");
+    let answer = super::dyn_tests::every_method(as_dyn, Path::new(&prefix)).await;
+    drop(store.remove_folder(Path::new(&prefix)).await);
+    answer.unwrap();
 }
 
 #[cfg(minio_tests)]
@@ -700,7 +701,7 @@ fn put_and_get_agrees_with_the_server() {
     assert_agree(
         "put and get",
         &put_and_get(&memory(), "/a"),
-        &put_and_get(&server(), "/put-and-get"),
+        &server_transcript("put-and-get", put_and_get),
     );
 }
 
@@ -710,7 +711,7 @@ fn head_after_put_agrees_with_the_server() {
     assert_agree(
         "head after put",
         &head_after_put(&memory(), "/a"),
-        &head_after_put(&server(), "/head-after-put"),
+        &server_transcript("head-after-put", head_after_put),
     );
 }
 
@@ -720,7 +721,7 @@ fn conditional_writes_agrees_with_the_server() {
     assert_agree(
         "conditional writes",
         &conditional_writes(&memory(), "/a"),
-        &conditional_writes(&server(), "/conditional-writes"),
+        &server_transcript("conditional-writes", conditional_writes),
     );
 }
 
@@ -730,7 +731,7 @@ fn missing_path_deletes_agrees_with_the_server() {
     assert_agree(
         "missing path deletes",
         &missing_path_deletes(&memory(), "/a"),
-        &missing_path_deletes(&server(), "/missing-path-deletes"),
+        &server_transcript("missing-path-deletes", missing_path_deletes),
     );
 }
 
@@ -740,7 +741,7 @@ fn absent_delete_over_a_file_agrees_with_the_server() {
     assert_agree(
         "absent delete over a file",
         &absent_delete_over_a_file(&memory(), "/a"),
-        &absent_delete_over_a_file(&server(), "/absent-delete-over-a-file"),
+        &server_transcript("absent-delete-over-a-file", absent_delete_over_a_file),
     );
 }
 
@@ -750,7 +751,7 @@ fn missing_path_tokened_put_agrees_with_the_server() {
     assert_agree(
         "missing path tokened put",
         &missing_path_tokened_put(&memory(), "/a"),
-        &missing_path_tokened_put(&server(), "/missing-path-tokened-put"),
+        &server_transcript("missing-path-tokened-put", missing_path_tokened_put),
     );
 }
 
@@ -760,7 +761,7 @@ fn rewritten_tokens_agrees_with_the_server() {
     assert_agree(
         "rewritten tokens",
         &rewritten_tokens(&memory(), "/a"),
-        &rewritten_tokens(&server(), "/rewritten-tokens"),
+        &server_transcript("rewritten-tokens", rewritten_tokens),
     );
 }
 
@@ -770,7 +771,7 @@ fn long_listing_agrees_with_the_server() {
     assert_agree(
         "long listing",
         &long_listing(&memory(), "/a"),
-        &long_listing(&server(), "/long-listing"),
+        &server_transcript("long-listing", long_listing),
     );
 }
 
@@ -780,7 +781,7 @@ fn empty_listing_agrees_with_the_server() {
     assert_agree(
         "empty listing",
         &empty_listing(&memory(), "/a"),
-        &empty_listing(&server(), "/empty-listing"),
+        &server_transcript("empty-listing", empty_listing),
     );
 }
 
@@ -790,7 +791,7 @@ fn children_listing_agrees_with_the_server() {
     assert_agree(
         "children listing",
         &children_listing(&memory(), "/a"),
-        &children_listing(&server(), "/children-listing"),
+        &server_transcript("children-listing", children_listing),
     );
 }
 
@@ -800,7 +801,7 @@ fn folders_agrees_with_the_server() {
     assert_agree(
         "folders",
         &folders(&memory(), "/a"),
-        &folders(&server(), "/folders"),
+        &server_transcript("folders", folders),
     );
 }
 
@@ -810,7 +811,7 @@ fn file_and_folder_conflict_agrees_with_the_server() {
     assert_agree(
         "file and folder conflict",
         &file_and_folder_conflict(&memory(), "/a"),
-        &file_and_folder_conflict(&server(), "/file-and-folder-conflict"),
+        &server_transcript("file-and-folder-conflict", file_and_folder_conflict),
     );
 }
 
@@ -820,7 +821,7 @@ fn copies_agrees_with_the_server() {
     assert_agree(
         "copies",
         &copies(&memory(), "/a"),
-        &copies(&server(), "/copies"),
+        &server_transcript("copies", copies),
     );
 }
 
@@ -830,7 +831,7 @@ fn file_renames_agrees_with_the_server() {
     assert_agree(
         "file renames",
         &file_renames(&memory(), "/a"),
-        &file_renames(&server(), "/file-renames"),
+        &server_transcript("file-renames", file_renames),
     );
 }
 
@@ -840,7 +841,7 @@ fn folder_rename_agrees_with_the_server() {
     assert_agree(
         "folder rename",
         &folder_rename(&memory(), "/a"),
-        &folder_rename(&server(), "/folder-rename"),
+        &server_transcript("folder-rename", folder_rename),
     );
 }
 
@@ -850,7 +851,7 @@ fn parent_check_agrees_with_the_server() {
     assert_agree(
         "parent check",
         &parent_check(&memory(), "/a"),
-        &parent_check(&server(), "/parent-check"),
+        &server_transcript("parent-check", parent_check),
     );
 }
 
@@ -860,7 +861,7 @@ fn put_with_folders_agrees_with_the_server() {
     assert_agree(
         "put with folders",
         &put_with_folders_cases(&memory(), "/a"),
-        &put_with_folders_cases(&server(), "/put-with-folders"),
+        &server_transcript("put-with-folders", put_with_folders_cases),
     );
 }
 
@@ -870,7 +871,7 @@ fn get_range_agrees_with_the_server() {
     assert_agree(
         "get range",
         &get_range_cases(&memory(), "/a"),
-        &get_range_cases(&server(), "/get-range"),
+        &server_transcript("get-range", get_range_cases),
     );
 }
 
@@ -889,10 +890,11 @@ fn refused_paths_agree_with_the_server() {
 fn observe_a_raw_delete_with_a_wrong_if_match() {
     let config = ready_config();
     let bucket = server();
-    let key = "observe-raw-delete/note.md";
-    let path = Path::new("/observe-raw-delete/note.md");
-    ensure_folder(&bucket, "/observe-raw-delete");
-    bucket.put(path, b"kept", &Condition::None).unwrap();
+    let prefix = run_prefix("observe-raw-delete");
+    let path = at(&prefix, "note.md");
+    let key = path.to_str().unwrap().trim_start_matches('/');
+    ensure_folder(&bucket, &prefix);
+    bucket.put(&path, b"kept", &Condition::None).unwrap();
     let answer = runtime().block_on(
         client(&config)
             .delete_object()
@@ -902,30 +904,47 @@ fn observe_a_raw_delete_with_a_wrong_if_match() {
             .send(),
     );
     eprintln!("raw delete with a wrong If-Match: {}", status(&answer));
-    eprintln!("object afterwards: {}", get_line(&bucket.get(path)));
+    eprintln!("object afterwards: {}", get_line(&bucket.get(&path)));
+    drop(bucket.remove_folder(Path::new(&prefix)));
 }
 
 #[cfg(minio_tests)]
 #[test]
 fn observe_a_put_with_the_tag_stripped_of_its_quotes() {
     let bucket = server();
-    let path = Path::new("/observe-unquoted-tag/note.md");
-    ensure_folder(&bucket, "/observe-unquoted-tag");
-    let tag = bucket.put(path, b"first", &Condition::None).unwrap();
+    let prefix = run_prefix("observe-unquoted-tag");
+    let path = at(&prefix, "note.md");
+    ensure_folder(&bucket, &prefix);
+    let tag = bucket.put(&path, b"first", &Condition::None).unwrap();
     let answer = bucket.put(
-        path,
+        &path,
         b"second",
         &Condition::Matches(RevisionToken::new(tag.as_str().trim_matches('"'))),
     );
     eprintln!("put with an unquoted tag: {}", put_line(&answer));
-    eprintln!("object afterwards: {}", get_line(&bucket.get(path)));
+    eprintln!("object afterwards: {}", get_line(&bucket.get(&path)));
+    drop(bucket.remove_folder(Path::new(&prefix)));
 }
 
-/// A server bucket whose folder `name` exists and holds nothing.
+/// The transcript of `sequence` on the server under a prefix of its own, removed before this
+/// returns.
+#[cfg(minio_tests)]
+fn server_transcript(
+    name: &str,
+    sequence: impl Fn(&BlockingBucket<MinioBucket>, &str) -> Vec<String>,
+) -> Vec<String> {
+    let bucket = server();
+    let prefix = run_prefix(name);
+    let transcript = sequence(&bucket, &prefix);
+    drop(bucket.remove_folder(Path::new(&prefix)));
+    transcript
+}
+
+/// A server bucket whose folder under the run prefix of `name` exists and holds nothing.
 #[cfg(minio_tests)]
 async fn empty_folder(name: &str) -> (MinioBucket, PathBuf) {
     let bucket = MinioBucket::new(ready_config());
-    let folder = PathBuf::from(format!("/{name}"));
+    let folder = PathBuf::from(run_prefix(name));
     drop(bucket.remove_folder(&folder).await);
     bucket.create_folder(&folder).await.unwrap();
     (bucket, folder)
@@ -967,6 +986,7 @@ fn a_20_mib_stream_is_written_and_read_back_on_the_server() {
                 "{index}"
             );
         }
+        drop(bucket.remove_folder(&folder).await);
     });
 }
 
@@ -988,6 +1008,7 @@ fn a_stream_write_under_absent_on_an_existing_key_is_already_exists_on_the_serve
         let refused_large = StorageError::from(large.close().await.unwrap_err());
         assert_eq!(refused_large.kind(), ErrorKind::AlreadyExists);
         assert_eq!(bucket.get(&path).await.unwrap().0, b"first");
+        drop(bucket.remove_folder(&folder).await);
     });
 }
 
@@ -1019,6 +1040,7 @@ fn a_stream_write_under_a_stale_tag_is_precondition_failed_on_the_server() {
         let refused_large = StorageError::from(large.close().await.unwrap_err());
         assert_eq!(refused_large.kind(), ErrorKind::PreconditionFailed);
         assert_eq!(bucket.get(&path).await.unwrap().0, b"second");
+        drop(bucket.remove_folder(&folder).await);
     });
 }
 
@@ -1046,6 +1068,7 @@ fn an_append_stream_keeps_the_old_bytes_first_on_the_server() {
         writer.write_all(b"new").await.unwrap();
         writer.close().await.unwrap();
         assert_eq!(bucket.get(&missing).await.unwrap().0, b"new");
+        drop(bucket.remove_folder(&folder).await);
     });
 }
 
@@ -1072,6 +1095,7 @@ fn a_write_stream_dropped_without_close_stores_nothing_on_the_server() {
                 ErrorKind::NotFound
             );
         }
+        drop(bucket.remove_folder(&folder).await);
     });
 }
 
@@ -1083,8 +1107,10 @@ fn a_file_and_a_folder_made_by_keys_show_the_file_on_the_server() {
     let config = ready_config();
     let bucket = server();
     let sdk = client(&config);
-    ensure_folder(&bucket, "/conflict-made");
-    for key in ["conflict-made/a", "conflict-made/a/b"] {
+    let prefix = run_prefix("conflict-made");
+    ensure_folder(&bucket, &prefix);
+    for name in ["a", "a/b"] {
+        let key = format!("{}/{name}", prefix.trim_start_matches('/'));
         runtime()
             .block_on(
                 sdk.put_object()
@@ -1095,15 +1121,15 @@ fn a_file_and_a_folder_made_by_keys_show_the_file_on_the_server() {
             )
             .unwrap();
     }
-    let folder = Path::new("/conflict-made");
+    let folder = Path::new(&prefix);
     let transcript = vec![
-        kind_line(&bucket.head(&at("/conflict-made", "a"))),
-        list_line(&bucket.list(folder, Depth::Children), "/conflict-made"),
-        list_line(&bucket.list(folder, Depth::All), "/conflict-made"),
+        kind_line(&bucket.head(&at(&prefix, "a"))),
+        list_line(&bucket.list(folder, Depth::Children), &prefix),
+        list_line(&bucket.list(folder, Depth::All), &prefix),
         shape(&bucket.walk(folder, false, true), |entries| {
             format!("walked {}", entries.len())
         }),
-        get_line(&bucket.get(&at("/conflict-made", "a/b"))),
+        get_line(&bucket.get(&at(&prefix, "a/b"))),
     ];
     drop(bucket.remove_folder(folder));
     eprintln!(
@@ -1129,21 +1155,22 @@ fn a_file_and_a_folder_made_by_keys_show_the_file_on_the_server() {
 fn a_made_folder_has_a_time_and_an_implied_folder_has_none_on_the_server() {
     let config = ready_config();
     let bucket = server();
-    ensure_folder(&bucket, "/folder-times/made");
+    let prefix = run_prefix("folder-times");
+    ensure_folder(&bucket, &at(&prefix, "made").to_string_lossy());
     runtime()
         .block_on(
             client(&config)
                 .put_object()
                 .bucket(&config.bucket)
-                .key("folder-times/implied/z")
+                .key(format!("{}/implied/z", prefix.trim_start_matches('/')))
                 .body(ByteStream::from_static(b"x"))
                 .send(),
         )
         .unwrap();
-    let made = bucket.head(Path::new("/folder-times/made"));
-    let implied = bucket.head(Path::new("/folder-times/implied"));
+    let made = bucket.head(&at(&prefix, "made"));
+    let implied = bucket.head(&at(&prefix, "implied"));
     let transcript = vec![head_line(&made), head_line(&implied)];
-    drop(bucket.remove_folder(Path::new("/folder-times")));
+    drop(bucket.remove_folder(Path::new(&prefix)));
     eprintln!("folder times on the server:\n{}", transcript.join("\n"));
     assert_eq!(
         transcript,
@@ -1305,7 +1332,7 @@ fn aws_client_in(region: &str) -> Client {
 }
 
 /// A key prefix no other run or sequence shares.
-#[cfg(s3_tests)]
+#[cfg(any(minio_tests, s3_tests))]
 fn run_prefix(name: &str) -> String {
     format!("/os-shim-tests/{}-{name}", process::id())
 }
